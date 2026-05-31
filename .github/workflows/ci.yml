@@ -1,0 +1,49 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+jobs:
+  repo-health:
+    name: Repo health
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+
+      - name: Check JSON files
+        run: |
+          files=$(find . -path ./.git -prune -o -name '*.json' -print)
+          if [ -n "$files" ]; then
+            printf '%s\n' "$files" | xargs -n 1 jq empty
+          fi
+
+      - name: Check widget manifests
+        run: |
+          manifests=$(find . -path ./.git -prune -o -path '*/client/your-extensions/widgets/*/manifest.json' -print)
+          if [ -z "$manifests" ]; then
+            echo "No widget manifests found yet."
+            exit 0
+          fi
+
+          failed=0
+          for manifest in $manifests; do
+            widget_dir=$(basename "$(dirname "$manifest")")
+            manifest_name=$(jq -r '.name // empty' "$manifest")
+            if [ "$manifest_name" != "$widget_dir" ]; then
+              echo "$manifest name '$manifest_name' must match widget folder '$widget_dir'"
+              failed=1
+            fi
+          done
+          exit "$failed"
+
+      - name: Check ignored generated files
+        run: |
+          if find . -path ./.git -prune -o \( -path '*/node_modules/*' -o -path '*/dist/*' -o -path '*/build/*' \) -print -quit | grep -q .; then
+            echo "Generated files or dependencies are present in the repo."
+            exit 1
+          fi
+
