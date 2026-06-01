@@ -1,6 +1,6 @@
 {
-  "name": "aim-integration",
-  "label": "AiM Integration",
+  "name": "aim-create-package",
+  "label": "AiM Create Package",
   "type": "widget",
   "version": "1.0.0",
   "exbVersion": "1.20.0",

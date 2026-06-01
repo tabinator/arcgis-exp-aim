@@ -38,21 +38,21 @@ git push -u origin feature/aim-work-orders-initial
 
 ## Current Widgets
 
-- `widgets/aim-integration`
+- `widgets/aim-create-package`
 
 ### Local Development (Experience Builder Developer Edition 1.20)
 
 1. Copy or sync this widget into Experience Builder:
-   - Source: `widgets/aim-integration`
-   - Target: `/Users/gisdev/arcgis-experience-builder/client/your-extensions/widgets/aim-integration`
+   - Source: `widgets/aim-create-package`
+   - Target: `/Users/gisdev/arcgis-experience-builder/client/your-extensions/widgets/aim-create-package`
 2. In Experience Builder, start the developer server from:
    - `/Users/gisdev/arcgis-experience-builder`
-3. Open the builder UI and add the `AiM Integration` widget.
+3. Open the builder UI and add the `AiM Create Package` widget.
 4. Configure `AiM endpoint URL` in widget settings.
 
 ## Notes
 
-- Widget folder name and `manifest.json` `name` are both `aim-integration`.
+- Widget folder name and `manifest.json` `name` are both `aim-create-package`.
 - This starter is intentionally minimal and ready for incremental AiM API integration.
 - `basic-test` remains your canonical scaffold template.
 
