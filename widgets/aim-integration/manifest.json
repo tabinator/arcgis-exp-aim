@@ -1,0 +1,18 @@
+{
+  "name": "aim-integration",
+  "label": "AiM Integration",
+  "type": "widget",
+  "version": "1.0.0",
+  "exbVersion": "1.20.0",
+  "author": "tabinator",
+  "description": "Starter ArcGIS Experience Builder widget for AiM integration.",
+  "translatedLocales": [
+    "en"
+  ],
+  "properties": {},
+  "defaultSize": {
+    "width": 360,
+    "height": 240
+  }
+}
+

@@ -7,6 +7,7 @@ npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
 pnpm-debug.log*
+*.log
 
 # Environment
 .env
@@ -28,4 +29,3 @@ client/your-extensions/widgets/**/build/
 .vscode/*
 !.vscode/extensions.json
 !.vscode/settings.json
-

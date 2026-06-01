@@ -1,49 +1,28 @@
-# arcgis-exp-aim-create-package
+# arcgis-exp-aim
 
-ArcGIS Experience Builder custom widget work for creating AiM packages.
+ArcGIS Experience Builder custom widgets for AiM integration.
 
-## Repo Status
+## Getting Started
 
-This repository is initialized for managed development. Widget source can be added under an Experience Builder-compatible extension structure.
+This repository currently includes one starter widget:
 
-Recommended layout:
+- `widgets/aim-integration`
 
-```text
-client/
-  your-extensions/
-    widgets/
-      aim-create-package/
-        manifest.json
-        src/
-          runtime/
-          setting/
-          config.ts
-```
+### Local Development (Experience Builder Developer Edition 1.20)
 
-## Local Development
+1. Copy or sync this widget into Experience Builder:
+   - Source: `widgets/aim-integration`
+   - Target: `/Users/gisdev/arcgis-experience-builder/client/your-extensions/widgets/aim-integration`
+2. In Experience Builder, start the developer server from:
+   - `/Users/gisdev/arcgis-experience-builder`
+3. Open the builder UI and add the `AiM Integration` widget.
+4. Configure `AiM endpoint URL` in widget settings.
 
-Sean's local ArcGIS Experience Builder Developer Edition install is expected at:
+## Notes
 
-```bash
-/Users/gisdev/arcgis-experience-builder
-```
-
-For active widget development, place or sync the widget folder into:
-
-```bash
-/Users/gisdev/arcgis-experience-builder/client/your-extensions/widgets
-```
-
-Then run the Experience Builder client watcher from the Developer Edition install.
-
-## Workflow
-
-- Create a feature branch from `main`.
-- Keep changes scoped to the widget, docs, or workflow being updated.
-- Run available validation before pushing.
-- Open a PR with a short test summary and deployment notes.
+- Widget folder name and `manifest.json` `name` are both `aim-integration`.
+- This starter is intentionally minimal and ready for incremental AiM API integration.
 
 ## Managed By Tabs
 
-This repo includes agent instructions in `AGENTS.md` so Tabs can help manage issues, branches, commits, pull requests, CI, and ArcGIS Experience Builder development tasks consistently.
-
+This repo includes agent instructions in `AGENTS.md` so Tabs can help with issue triage, branch workflows, PR prep, and ArcGIS Experience Builder development tasks.
