@@ -23,7 +23,7 @@ jobs:
 
       - name: Check widget manifests
         run: |
-          manifests=$(find . -path ./.git -prune -o -path '*/client/your-extensions/widgets/*/manifest.json' -print)
+          manifests=$(find ./widgets -mindepth 2 -maxdepth 2 -name 'manifest.json' -print 2>/dev/null || true)
           if [ -z "$manifests" ]; then
             echo "No widget manifests found yet."
             exit 0
@@ -46,4 +46,3 @@ jobs:
             echo "Generated files or dependencies are present in the repo."
             exit 1
           fi
-
