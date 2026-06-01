@@ -1,4 +1,5 @@
-import { React, type AllWidgetProps } from 'jimu-core'
+/** @jsx jsx */
+import { React, jsx, type AllWidgetProps } from 'jimu-core'
 import type { IMConfig } from '../config'
 
 const Widget = (props: AllWidgetProps<IMConfig>) => {

@@ -1,5 +1,20 @@
 export default {
   widgetTitle: 'AiM Create Package',
-  missingEndpoint: 'Set an AiM endpoint URL in widget settings to continue.'
+  openPackageList: 'Open Package List',
+  hidePackageList: 'Hide Package List',
+  refreshList: 'Refresh',
+  loadingPackages: 'Loading packages...',
+  loadError: 'Unable to load package list from one or more target layers.',
+  noTargetLayers: 'Configure at least one target layer URL in widget settings.',
+  noPackages: 'No packages found.',
+  openFolder: 'Open Folder',
+  createPackage: 'Create Package',
+  deletePackage: 'Delete Package',
+  selectedPrefix: 'Selected package:',
+  noneSelected: 'None selected',
+  deleteNeedsSelection: 'Select one package to delete.',
+  createPending: 'Create package flow will be connected next.',
+  deletePending: 'Delete package flow will be connected next.',
+  layerPrefix: 'Layer',
+  packageFieldPrefix: 'Package field'
 }
-

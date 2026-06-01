@@ -1,4 +1,5 @@
-import { React } from 'jimu-core'
+/** @jsx jsx */
+import { React, jsx } from 'jimu-core'
 import type { AllWidgetSettingProps } from 'jimu-for-builder'
 import { TextInput } from 'jimu-ui'
 import { SettingSection, SettingRow } from 'jimu-ui/advanced/setting-components'

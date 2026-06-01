@@ -9,10 +9,10 @@
   "translatedLocales": [
     "en"
   ],
+  "supportDataSource": true,
   "properties": {},
   "defaultSize": {
     "width": 360,
     "height": 240
   }
 }
-
