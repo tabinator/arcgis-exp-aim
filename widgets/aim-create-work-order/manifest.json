@@ -1,0 +1,19 @@
+{
+  "name": "aim-create-work-order",
+  "label": "AiM Create Work Order",
+  "type": "widget",
+  "version": "1.20.0",
+  "exbVersion": "1.20.0",
+  "author": "Sean",
+  "description": "A minimal custom widget scaffold for validating ArcGIS Experience Builder deployment structure.",
+  "copyright": "",
+  "license": "http://www.apache.org/licenses/LICENSE-2.0",
+  "properties": {},
+  "translatedLocales": [
+    "en"
+  ],
+  "defaultSize": {
+    "width": 360,
+    "height": 220
+  }
+}
