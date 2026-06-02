@@ -16,5 +16,13 @@ export default {
   createPending: 'Create package flow will be connected next.',
   deletePending: 'Delete package flow will be connected next.',
   layerPrefix: 'Layer',
-  packageFieldPrefix: 'Package field'
+  packageFieldPrefix: 'Package field',
+  mapNotConfigured: 'Select a map widget in this widget settings before highlighting package features.',
+  loadingPackageFeatures: 'Loading package features for the selected package...',
+  mapSelectionApplied: 'Highlighted package features on the map:',
+  mapSelectionAppliedAndZoomed: 'Highlighted and zoomed to package features:',
+  mapSelectionCleared: 'Package feature highlight cleared.',
+  mapSelectionError: 'Unable to highlight package features on the map.',
+  mapZoomError: 'Unable to zoom to package features.',
+  noPackageFeatures: 'No mappable package features were found for the selected package.'
 }

@@ -1,4 +1,5 @@
 export default {
+  mapWidgetLabel: 'Map widget for package highlights',
   packageFieldLabel: 'Package field name',
   packageFieldPlaceholder: 'PCKGID',
   folderBaseUrlLabel: 'Box folder base URL (optional)',

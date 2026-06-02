@@ -1,9 +1,9 @@
 import { React } from 'jimu-core'
 import type { AllWidgetSettingProps } from 'jimu-for-builder'
-import { SettingSection, SettingRow } from 'jimu-ui/advanced/setting-components'
+import { MapWidgetSelector, SettingSection, SettingRow } from 'jimu-ui/advanced/setting-components'
 import { TextInput } from 'jimu-ui'
 import defaultMessages from './translations/default'
-import { type IMConfig } from '../config'
+import type { IMConfig } from '../config'
 
 const Setting = (props: AllWidgetSettingProps<IMConfig>) => {
   const m = defaultMessages
@@ -16,24 +16,39 @@ const Setting = (props: AllWidgetSettingProps<IMConfig>) => {
     props.onSettingChange({ id: props.id, config: config.set(key, value) })
   }
 
+  const onMapWidgetSelected = (useMapWidgetIds: string[]) => {
+    props.onSettingChange({ id: props.id, useMapWidgetIds })
+  }
+
   const row = (label: string, key: string, placeholder?: string) =>
     h(SettingRow, null,
       h('div', { className: 'mb-1', style: { fontWeight: 600 } }, label),
       h(TextInput, {
         value: cfg[key] || '',
         placeholder: placeholder || m.targetLayerPlaceholder,
-        onChange: (evt) => onConfigChange(key, evt.target.value)
+        onChange: (evt) => {
+          onConfigChange(key, evt.target.value)
+        }
       })
     )
 
   return h('div', { className: 'p-2' },
     h(SettingSection, { title: 'AiM' },
       h(SettingRow, null,
+        h('div', { className: 'mb-1', style: { fontWeight: 600 } }, m.mapWidgetLabel),
+        h(MapWidgetSelector, {
+          useMapWidgetIds: props.useMapWidgetIds,
+          onSelect: onMapWidgetSelected
+        })
+      ),
+      h(SettingRow, null,
         h('div', { className: 'mb-1', style: { fontWeight: 600 } }, m.packageFieldLabel),
         h(TextInput, {
           value: cfg.packageField || '',
           placeholder: m.packageFieldPlaceholder,
-          onChange: (evt) => onConfigChange('packageField', evt.target.value)
+          onChange: (evt) => {
+            onConfigChange('packageField', evt.target.value)
+          }
         })
       ),
       h(SettingRow, null,
@@ -41,7 +56,9 @@ const Setting = (props: AllWidgetSettingProps<IMConfig>) => {
         h(TextInput, {
           value: cfg.folderBaseUrl || '',
           placeholder: m.folderBaseUrlPlaceholder,
-          onChange: (evt) => onConfigChange('folderBaseUrl', evt.target.value)
+          onChange: (evt) => {
+            onConfigChange('folderBaseUrl', evt.target.value)
+          }
         })
       ),
       row(m.targetLayerName1Label, 'targetLayerName1', m.targetLayerNamePlaceholder),

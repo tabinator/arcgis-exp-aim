@@ -9,6 +9,7 @@
   "translatedLocales": [
     "en"
   ],
+  "dependency": "jimu-arcgis",
   "supportDataSource": true,
   "properties": {},
   "defaultSize": {
