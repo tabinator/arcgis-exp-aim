@@ -12,10 +12,17 @@ interface QueryResponse {
   error?: { message?: string }
   geometryType?: string
   spatialReference?: any
+  objectIdFieldName?: string
+}
+interface CartLayerQueryResult {
+  layerUrl: string
+  results: QueryResponse[]
 }
 
 const QUERY_PAGE_SIZE = 2000
 const OBJECT_ID_QUERY_CHUNK_SIZE = 200
+const WORK_CODE_FIELD = 'WorkCode'
+const CREATED_DATE_FIELD = 'created_date'
 
 interface TargetLayer { name: string, url: string }
 interface SelectionSource {
@@ -130,10 +137,39 @@ const hasPackageValue = (item: PackageCartItem, packageField: string) => {
 
 const hasEmptyPackageValue = (item: PackageCartItem, packageField: string) => {
   const value = item.attributes?.[packageField]
-  return value === null || value === ''
+  return value === null || value === undefined || String(value).trim() === ''
 }
 
 const getUniqueLayerKeys = (items: PackageCartItem[]) => Array.from(new Set(items.map((item) => item.layerKey)))
+
+const getAttributeValue = (attributes: { [key: string]: any }, fieldName: string) => {
+  if (Object.prototype.hasOwnProperty.call(attributes, fieldName)) return attributes[fieldName]
+  const matchingField = Object.keys(attributes).find((key) => key.toLowerCase() === fieldName.toLowerCase())
+  return matchingField ? attributes[matchingField] : undefined
+}
+
+const getFeatureObjectId = (attributes: { [key: string]: any }, objectIdFieldName?: string) =>
+  getAttributeValue(attributes, objectIdFieldName || 'OBJECTID') ??
+  getAttributeValue(attributes, 'OBJECTID') ??
+  getAttributeValue(attributes, 'FID')
+
+const getWorkCodeKeyFromAttributes = (attributes: { [key: string]: any }) => {
+  const value = getAttributeValue(attributes, WORK_CODE_FIELD)
+  return value === null || value === undefined ? 'null:' : `${typeof value}:${String(value)}`
+}
+
+const getWorkCodeKey = (item: PackageCartItem) => getWorkCodeKeyFromAttributes(item.attributes || {})
+
+const filterByWorkCode = (items: PackageCartItem[], workCodeKey: string) =>
+  items.filter((item) => getWorkCodeKey(item) === workCodeKey)
+
+const formatDateValue = (value: any) => {
+  if (value === null || value === undefined || String(value).trim() === '') return '-'
+  const date = new Date(value)
+  return Number.isNaN(date.getTime())
+    ? String(value)
+    : new Intl.DateTimeFormat('en-US', { month: 'numeric', day: 'numeric', year: 'numeric' }).format(date)
+}
 
 const Widget = (props: AllWidgetProps<IMConfig>) => {
   const h = React.createElement
@@ -151,7 +187,10 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
   const [isCreateMode, setIsCreateMode] = React.useState(false)
   const [draftPackageId, setDraftPackageId] = React.useState('')
   const [skipPackagedAssets, setSkipPackagedAssets] = React.useState(true)
+  const [uniqueWorkCodes, setUniqueWorkCodes] = React.useState(false)
   const [cartItems, setCartItems] = React.useState<PackageCartItem[]>([])
+  const [cartQueryResults, setCartQueryResults] = React.useState<CartLayerQueryResult[]>([])
+  const [pendingSelectionRemovalKeys, setPendingSelectionRemovalKeys] = React.useState<string[]>([])
   const [submittingPackage, setSubmittingPackage] = React.useState(false)
   const [mapSelectionSources, setMapSelectionSources] = React.useState<SelectionSource[]>([])
   const [selectedMapFeatures, setSelectedMapFeatures] = React.useState<any[]>([])
@@ -369,15 +408,19 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
     }
     setCartItems((current) => {
       const known = new Set(current.map((item) => item.key))
-      const additions = items.filter((item) => !known.has(item.key))
+      const newItems = items.filter((item) => !known.has(item.key))
+      const lockedWorkCodeKey = current[0] ? getWorkCodeKey(current[0]) : newItems[0] ? getWorkCodeKey(newItems[0]) : null
+      const additions = uniqueWorkCodes && lockedWorkCodeKey
+        ? filterByWorkCode(newItems, lockedWorkCodeKey)
+        : newItems
       if (additions.length === 0) {
-        setStatus(m.selectionAlreadyInCart)
+        setStatus(newItems.length > 0 && uniqueWorkCodes ? m.selectionWorkCodeMismatch : m.selectionAlreadyInCart)
         return current
       }
       setStatus(`${m.addedSelectionToCart} ${additions.length}`)
       return [...current, ...additions]
     })
-  }, [cartItems, m.addedSelectionToCart, m.selectionAlreadyInCart, m.selectionLayerMismatch, m.selectionMustBeSingleLayer, m.targetLayer])
+  }, [cartItems, m.addedSelectionToCart, m.selectionAlreadyInCart, m.selectionLayerMismatch, m.selectionMustBeSingleLayer, m.selectionWorkCodeMismatch, m.targetLayer, uniqueWorkCodes])
 
   React.useEffect(() => {
     if (isCreateMode && skipPackagedAssets) {
@@ -386,7 +429,13 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
   }, [isCreateMode, packageField, skipPackagedAssets])
 
   React.useEffect(() => {
-    if (isCreateMode) {
+    if (isCreateMode && uniqueWorkCodes) {
+      setCartItems((current) => current[0] ? filterByWorkCode(current, getWorkCodeKey(current[0])) : current)
+    }
+  }, [isCreateMode, uniqueWorkCodes])
+
+  React.useEffect(() => {
+    if (isCreateMode && pendingSelectionRemovalKeys.length === 0) {
       const eligibleItems = skipPackagedAssets
         ? currentSelectionItems.filter((item) => hasEmptyPackageValue(item, packageField))
         : currentSelectionItems
@@ -399,16 +448,70 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
         addItemsToCart(newSelectionItems)
       }
     }
-  }, [addItemsToCart, cartKeys, cartLayerKey, currentSelectionItems, isCreateMode, packageField, skipPackagedAssets])
+  }, [addItemsToCart, cartKeys, cartLayerKey, currentSelectionItems, isCreateMode, packageField, pendingSelectionRemovalKeys, skipPackagedAssets])
 
-  const removeCartItem = (key: string) => {
-    setCartItems((current) => current.filter((item) => item.key !== key))
+  React.useEffect(() => {
+    if (pendingSelectionRemovalKeys.length > 0) {
+      const selectedKeys = new Set(currentSelectionItems.map((item) => item.key))
+      if (pendingSelectionRemovalKeys.every((key) => !selectedKeys.has(key))) {
+        setPendingSelectionRemovalKeys([])
+      }
+    }
+  }, [currentSelectionItems, pendingSelectionRemovalKeys])
+
+  const removeCartItemsFromSelection = (items: PackageCartItem[]) => {
+    if (items.length === 0) return
+    setPendingSelectionRemovalKeys(items.map((item) => item.key))
+    const dsManager = DataSourceManager.getInstance()
+    const itemsByDataSource = items.reduce((groups, item) => {
+      const dataSourceItems = groups.get(item.dataSourceId) || []
+      dataSourceItems.push(item)
+      groups.set(item.dataSourceId, dataSourceItems)
+      return groups
+    }, new Map<string, PackageCartItem[]>())
+    itemsByDataSource.forEach((dataSourceItems, dataSourceId) => {
+      const ds: any = dsManager.getDataSource(dataSourceId)
+      const removedIds = new Set(dataSourceItems.map((item) => String(item.objectId)))
+      const remainingSelectedIds = (ds?.getSelectedRecordIds?.() || [])
+        .filter((id: string | number) => !removedIds.has(String(id)))
+      ds?.selectRecordsByIds?.(remainingSelectedIds)
+    })
+    setSelectedMapFeatures((current) => current.filter((feature) => {
+      const objectId = getGraphicObjectId(feature)
+      const layer = feature?.layer || feature?.sourceLayer || {}
+      const layerId = layer.layerId ?? layer.sourceJSON?.id
+      const candidates = [layer.url, layer.parsedUrl?.path, layer.sourceJSON?.url].filter(Boolean).map(String)
+      if (layerId !== undefined) candidates.push(...candidates.map((url) => `${url.replace(/\/+$/, '')}/${layerId}`))
+      return !items.some((item) =>
+        String(objectId) === String(item.objectId) && urlCandidatesMatch(item.layerUrl, candidates)
+      )
+    }))
+  }
+
+  const removeCartItem = (item: PackageCartItem) => {
+    removeCartItemsFromSelection([item])
+    setCartItems((current) => current.filter((cartItem) => cartItem.key !== item.key))
+  }
+
+  const clearPackageCart = () => {
+    setPendingSelectionRemovalKeys(currentSelectionItems.map((item) => item.key))
+    jimuMapView?.clearSelectedFeatures?.()
+    const dsManager = DataSourceManager.getInstance()
+    selectionSources.forEach((source) => {
+      dsManager.getDataSource(source.dataSourceId)?.clearSelection?.()
+    })
+    setSelectedMapFeatures([])
+    setCartItems([])
+    setStatus(m.cartCleared)
   }
 
   const clearCreateDraft = () => {
     setDraftPackageId('')
     setSkipPackagedAssets(true)
+    setUniqueWorkCodes(false)
+    setPendingSelectionRemovalKeys([])
     setCartItems([])
+    setCartQueryResults([])
   }
 
   const cancelCreateMode = () => {
@@ -600,6 +703,76 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
     return results
   }, [jimuMapView])
 
+  React.useEffect(() => {
+    let cancelled = false
+
+    const loadCartQueryResults = async () => {
+      if (!isCreateMode || cartItems.length === 0) {
+        setCartQueryResults([])
+        return
+      }
+
+      setCartQueryResults([])
+      const itemsByLayer = cartItems.reduce((groups, item) => {
+        const items = groups.get(item.layerUrl) || []
+        items.push(item)
+        groups.set(item.layerUrl, items)
+        return groups
+      }, new Map<string, PackageCartItem[]>())
+      const queryResults: CartLayerQueryResult[] = await Promise.all(Array.from(itemsByLayer.entries()).map(async ([layerUrl, items]) => ({
+        layerUrl,
+        results: await queryCartFeatures(layerUrl, items.map((item) => item.objectId))
+      })))
+      if (cancelled) return
+      setCartQueryResults(queryResults)
+    }
+
+    loadCartQueryResults().catch(() => {
+      if (!cancelled) {
+        setCartQueryResults([])
+        setStatus(m.cartGraphicsError)
+      }
+    })
+
+    return () => {
+      cancelled = true
+    }
+  }, [cartItems, isCreateMode, m.cartGraphicsError, queryCartFeatures])
+
+  const cartRestAttributes = React.useMemo(() => {
+    const attributesByKey: { [key: string]: { [key: string]: any } } = {}
+    cartQueryResults.forEach(({ layerUrl, results }) => {
+      const layerKey = getServiceLayerKey(layerUrl)
+      results.forEach((result) => {
+        ;(result.features || []).forEach((feature) => {
+          const attributes = feature.attributes || {}
+          const objectId = getFeatureObjectId(attributes, result.objectIdFieldName)
+          if (objectId !== null && objectId !== undefined) {
+            attributesByKey[`${layerKey}::${objectId}`] = attributes
+          }
+        })
+      })
+    })
+    return attributesByKey
+  }, [cartQueryResults])
+
+  React.useEffect(() => {
+    if (!uniqueWorkCodes || cartItems.length === 0) return
+    const firstItemAttributes = cartRestAttributes[cartItems[0].key]
+    if (!firstItemAttributes) return
+
+    const lockedWorkCodeKey = getWorkCodeKeyFromAttributes(firstItemAttributes)
+    const rejectedItems = cartItems.filter((item) => {
+      const restAttributes = cartRestAttributes[item.key]
+      return restAttributes && getWorkCodeKeyFromAttributes(restAttributes) !== lockedWorkCodeKey
+    })
+    if (rejectedItems.length === 0) return
+
+    removeCartItemsFromSelection(rejectedItems)
+    const rejectedKeys = new Set(rejectedItems.map((item) => item.key))
+    setCartItems((current) => current.filter((item) => !rejectedKeys.has(item.key)))
+  }, [cartItems, cartRestAttributes, uniqueWorkCodes])
+
   const ensureHighlightLayer = async () => {
     if (!jimuMapView?.view?.map) throw new Error(m.mapNotConfigured)
     if (highlightLayerRef.current && highlightMapRef.current !== jimuMapView.view.map) {
@@ -747,20 +920,8 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
       ])
       if (cancelled) return
 
-      const itemsByLayer = cartItems.reduce((groups, item) => {
-        const items = groups.get(item.layerUrl) || []
-        items.push(item)
-        groups.set(item.layerUrl, items)
-        return groups
-      }, new Map<string, PackageCartItem[]>())
-      const queryResults = await Promise.all(Array.from(itemsByLayer.entries()).map(async ([layerUrl, items]) => ({
-        layerUrl,
-        results: await queryCartFeatures(layerUrl, items.map((item) => item.objectId))
-      })))
-      if (cancelled) return
-
       const graphics: any[] = []
-      queryResults.forEach(({ results }) => {
+      cartQueryResults.forEach(({ results }) => {
         results.forEach((result) => {
           const features = result.features || []
           features.forEach((feature) => {
@@ -790,7 +951,7 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
     return () => {
       cancelled = true
     }
-  }, [cartItems, ensureCartGraphicsLayer, isCreateMode, m.cartGraphicsError, queryCartFeatures])
+  }, [cartItems, cartQueryResults, ensureCartGraphicsLayer, isCreateMode, m.cartGraphicsError])
 
   React.useEffect(() => () => {
     highlightLayerRef.current?.removeAll?.()
@@ -918,11 +1079,24 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
     )
   }
 
-  const itemRow = (item: PackageCartItem, removable: boolean) =>
-    h('div', { key: item.key, className: 'd-flex align-items-center justify-content-between py-1', style: { gap: '0.5rem' } },
-      h('div', { style: { minWidth: 0 } },
+  const itemRow = (item: PackageCartItem, removable: boolean) => {
+    const restAttributes = cartRestAttributes[item.key] || {}
+    const workCodeValue = getAttributeValue(restAttributes, WORK_CODE_FIELD) ?? getAttributeValue(item.attributes || {}, WORK_CODE_FIELD)
+    const workCode = workCodeValue === null || workCodeValue === undefined || String(workCodeValue).trim() === ''
+      ? '-'
+      : String(workCodeValue)
+    const dateInspected = formatDateValue(
+      getAttributeValue(restAttributes, CREATED_DATE_FIELD) ?? getAttributeValue(item.attributes || {}, CREATED_DATE_FIELD)
+    )
+    const metadata = `${m.objectIdPrefix} ${item.objectId} | ${m.workCodePrefix} ${workCode} | ${m.dateInspectedPrefix} ${dateInspected}`
+
+    return h('div', { key: item.key, className: 'd-flex align-items-center justify-content-between py-1', style: { gap: '0.5rem' } },
+      h('div', { style: { minWidth: 0, overflow: 'hidden' } },
         h('div', { style: { fontSize: 12, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, getRecordLabel(item.attributes, item.objectId)),
-        h('div', { style: { fontSize: 10, opacity: 0.7 } }, `${m.objectIdPrefix} ${item.objectId}`)
+        h('div', {
+          title: metadata,
+          style: { fontSize: 10, opacity: 0.7, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }
+        }, metadata)
       ),
       removable
         ? h(Button, {
@@ -930,12 +1104,13 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
           type: 'tertiary',
           title: m.removeFromCart,
           onClick: () => {
-            removeCartItem(item.key)
+            removeCartItem(item)
           },
           style: { width: 28, minWidth: 28, height: 28, padding: 0 }
         }, 'x')
         : null
     )
+  }
 
   const groupedItemsPanel = (items: PackageCartItem[], emptyMessage: string, removable: boolean) => {
     const itemGroups = groupItemsByLayer(items)
@@ -982,6 +1157,15 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
             }
           }),
           h('span', null, m.skipPackagedAssets)
+        ),
+        h('label', { className: 'd-flex align-items-center mb-0', style: { gap: '0.5rem', fontSize: 12 } },
+          h(Checkbox, {
+            checked: uniqueWorkCodes,
+            onChange: (_evt, checked) => {
+              setUniqueWorkCodes(Boolean(checked))
+            }
+          }),
+          h('span', null, m.uniqueWorkCodes)
         )
       ),
       h('div', { className: 'border rounded p-2 d-flex flex-column flex-grow-1', style: { minHeight: 0 } },
@@ -1000,10 +1184,7 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
       h('div', { className: 'd-flex', style: { gap: '0.5rem' } },
         h(Button, {
           type: 'default',
-          onClick: () => {
-            setCartItems([])
-            setStatus(m.cartCleared)
-          },
+          onClick: clearPackageCart,
           disabled: cartItems.length === 0
         }, m.clearCart),
         h(Button, {
