@@ -36,6 +36,11 @@ interface PackageSummary {
   id: string
   featureCount: number
 }
+interface SelectedPackage {
+  key: string
+  layerUrl: string
+  id: string
+}
 
 const normalizeUrl = (url?: string) => {
   const rawUrl = (url || '').trim()
@@ -115,6 +120,8 @@ const getGraphicObjectId = (graphic: any) => {
   return graphic?.attributes?.[objectIdField] ?? graphic?.attributes?.OBJECTID ?? graphic?.attributes?.ObjectID ?? graphic?.attributes?.objectid
 }
 
+const getPackageKey = (layerUrl: string, packageId: string) => `${layerUrl}::${packageId}`
+
 const getUniqueLayerKeys = (items: PackageCartItem[]) => Array.from(new Set(items.map((item) => item.layerKey)))
 
 const Widget = (props: AllWidgetProps<IMConfig>) => {
@@ -125,7 +132,7 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
 
   const [loading, setLoading] = React.useState(false)
   const [error, setError] = React.useState<string | null>(null)
-  const [selectedKey, setSelectedKey] = React.useState<string | null>(null)
+  const [selectedPackage, setSelectedPackage] = React.useState<SelectedPackage | null>(null)
   const [status, setStatus] = React.useState<string | null>(null)
   const [groups, setGroups] = React.useState<Array<{ layerUrl: string, layerName: string, packages: PackageSummary[] }>>([])
   const [activeLayerUrl, setActiveLayerUrl] = React.useState<string | null>(null)
@@ -395,7 +402,7 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
 
   const startCreateMode = () => {
     clearHighlightedFeatures()
-    setSelectedKey(null)
+    setSelectedPackage(null)
     setIsCreateMode(true)
     setStatus(m.createModeStarted)
   }
@@ -568,7 +575,7 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
       const [GraphicsLayer] = await loadArcGISJSAPIModules(['esri/layers/GraphicsLayer'])
       highlightLayerRef.current = new GraphicsLayer({
         id: `${props.id}-package-highlight`,
-        title: 'AiM package selection',
+        title: 'AiM Manager selection',
         listMode: 'hide'
       })
       jimuMapView.view.map.add(highlightLayerRef.current)
@@ -647,14 +654,14 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
   }, [])
 
   const selectPackage = async (layerUrl: string, pkg: string) => {
-    const key = `${layerUrl}::${pkg}`
-    if (key === selectedKey) {
-      setSelectedKey(null)
+    const key = getPackageKey(layerUrl, pkg)
+    if (selectedPackage?.key === key) {
+      setSelectedPackage(null)
       clearHighlightedFeatures()
       setStatus(m.mapSelectionCleared)
       return
     }
-    setSelectedKey(key)
+    setSelectedPackage({ key, layerUrl, id: pkg })
     setStatus(m.loadingPackageFeatures)
     try {
       const layer = await ensureHighlightLayer()
@@ -728,8 +735,8 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
   }, [isCreateMode, refresh])
 
   const row = (layerUrl: string, pkg: PackageSummary) => {
-    const key = `${layerUrl}::${pkg.id}`
-    const isSelected = key === selectedKey
+    const key = getPackageKey(layerUrl, pkg.id)
+    const isSelected = key === selectedPackage?.key
     return h('div', { key, className: 'd-flex align-items-center justify-content-between py-1', style: { gap: '0.5rem' } },
       h('div', { className: 'd-flex align-items-center', style: { gap: '0.5rem', minWidth: 0 } },
         h(Checkbox, {
@@ -956,7 +963,7 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
                 size: 'sm',
                 style: compactActionButtonStyle,
                 onClick: () => {
-                  setStatus(selectedKey ? m.viewPending : m.viewNeedsSelection)
+                  setStatus(selectedPackage ? m.viewPending : m.viewNeedsSelection)
                 }
               }, m.viewPackage),
               h(Button, {
@@ -964,7 +971,7 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
                 size: 'sm',
                 style: compactActionButtonStyle,
                 onClick: () => {
-                  setStatus(selectedKey ? m.deletePending : m.deleteNeedsSelection)
+                  setStatus(selectedPackage ? m.deletePending : m.deleteNeedsSelection)
                 }
               }, m.deletePackage)
             )

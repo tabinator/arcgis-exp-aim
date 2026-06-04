@@ -48,7 +48,7 @@ git push -u origin feature/aim-work-orders-initial
 2. In Experience Builder, start the developer server from:
    - `/Users/gisdev/arcgis-experience-builder`
 3. Open the builder UI and add the `AiM Manager` widget.
-4. Configure `AiM endpoint URL` in widget settings.
+4. Configure target layer URLs, package field, and optional folder base URL in widget settings.
 
 ## Notes
 
