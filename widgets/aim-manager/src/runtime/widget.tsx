@@ -15,6 +15,7 @@ interface QueryResponse {
 }
 
 const QUERY_PAGE_SIZE = 2000
+const OBJECT_ID_QUERY_CHUNK_SIZE = 200
 
 interface TargetLayer { name: string, url: string }
 interface SelectionSource {
@@ -122,6 +123,16 @@ const getGraphicObjectId = (graphic: any) => {
 
 const getPackageKey = (layerUrl: string, packageId: string) => `${layerUrl}::${packageId}`
 
+const hasPackageValue = (item: PackageCartItem, packageField: string) => {
+  const value = item.attributes?.[packageField]
+  return value !== null && value !== undefined && String(value).trim() !== ''
+}
+
+const hasEmptyPackageValue = (item: PackageCartItem, packageField: string) => {
+  const value = item.attributes?.[packageField]
+  return value === null || value === ''
+}
+
 const getUniqueLayerKeys = (items: PackageCartItem[]) => Array.from(new Set(items.map((item) => item.layerKey)))
 
 const Widget = (props: AllWidgetProps<IMConfig>) => {
@@ -139,13 +150,15 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
   const [jimuMapView, setJimuMapView] = React.useState<any>(null)
   const [isCreateMode, setIsCreateMode] = React.useState(false)
   const [draftPackageId, setDraftPackageId] = React.useState('')
-  const [autoAddSelection, setAutoAddSelection] = React.useState(false)
+  const [skipPackagedAssets, setSkipPackagedAssets] = React.useState(true)
   const [cartItems, setCartItems] = React.useState<PackageCartItem[]>([])
   const [submittingPackage, setSubmittingPackage] = React.useState(false)
   const [mapSelectionSources, setMapSelectionSources] = React.useState<SelectionSource[]>([])
   const [selectedMapFeatures, setSelectedMapFeatures] = React.useState<any[]>([])
   const highlightLayerRef = React.useRef<any>(null)
   const highlightMapRef = React.useRef<any>(null)
+  const cartGraphicsLayerRef = React.useRef<any>(null)
+  const cartGraphicsMapRef = React.useRef<any>(null)
 
   const targetLayers: TargetLayer[] = React.useMemo(() => [
     { name: props.config?.targetLayerName1?.trim() || '', url: props.config?.targetLayerUrl1?.trim() || '' },
@@ -334,18 +347,12 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
     return [...dataSourceItems, ...mapFeatureItems]
   }, [selectedMapFeatures, selectionInfos, selectionSources])
 
-  const currentSelectionCount = Math.max(
-    selectionInfos.reduce((total, info) => total + info.selectedIds.length, 0),
-    selectedMapFeatures.length
-  )
   const cartKeys = React.useMemo(() => new Set(cartItems.map((item) => item.key)), [cartItems])
   const cartLayerKey = cartItems[0]?.layerKey || null
   const cartLayerName = cartItems[0]?.layerName || null
-  const currentSelectionLayerKeys = React.useMemo(() => getUniqueLayerKeys(currentSelectionItems), [currentSelectionItems])
 
   const addItemsToCart = React.useCallback((items: PackageCartItem[]) => {
     if (items.length === 0) {
-      setStatus(m.noCurrentSelection)
       return
     }
     const layerKeys = getUniqueLayerKeys(items)
@@ -370,19 +377,29 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
       setStatus(`${m.addedSelectionToCart} ${additions.length}`)
       return [...current, ...additions]
     })
-  }, [cartItems, m.addedSelectionToCart, m.noCurrentSelection, m.selectionAlreadyInCart, m.selectionLayerMismatch, m.selectionMustBeSingleLayer, m.targetLayer])
+  }, [cartItems, m.addedSelectionToCart, m.selectionAlreadyInCart, m.selectionLayerMismatch, m.selectionMustBeSingleLayer, m.targetLayer])
 
   React.useEffect(() => {
-    if (isCreateMode && autoAddSelection) {
+    if (isCreateMode && skipPackagedAssets) {
+      setCartItems((current) => current.filter((item) => hasEmptyPackageValue(item, packageField)))
+    }
+  }, [isCreateMode, packageField, skipPackagedAssets])
+
+  React.useEffect(() => {
+    if (isCreateMode) {
+      const eligibleItems = skipPackagedAssets
+        ? currentSelectionItems.filter((item) => hasEmptyPackageValue(item, packageField))
+        : currentSelectionItems
+      const eligibleLayerKeys = getUniqueLayerKeys(eligibleItems)
       const candidateItems = cartLayerKey
-        ? currentSelectionItems.filter((item) => item.layerKey === cartLayerKey)
-        : currentSelectionLayerKeys.length === 1 ? currentSelectionItems : []
+        ? eligibleItems.filter((item) => item.layerKey === cartLayerKey)
+        : eligibleLayerKeys.length === 1 ? eligibleItems : []
       const newSelectionItems = candidateItems.filter((item) => !cartKeys.has(item.key))
       if (newSelectionItems.length > 0) {
         addItemsToCart(newSelectionItems)
       }
     }
-  }, [addItemsToCart, autoAddSelection, cartKeys, cartLayerKey, currentSelectionItems, currentSelectionLayerKeys.length, isCreateMode])
+  }, [addItemsToCart, cartKeys, cartLayerKey, currentSelectionItems, isCreateMode, packageField, skipPackagedAssets])
 
   const removeCartItem = (key: string) => {
     setCartItems((current) => current.filter((item) => item.key !== key))
@@ -390,7 +407,7 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
 
   const clearCreateDraft = () => {
     setDraftPackageId('')
-    setAutoAddSelection(false)
+    setSkipPackagedAssets(true)
     setCartItems([])
   }
 
@@ -412,10 +429,7 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
     if (draftPackageId.trim() === '') warnings.push(m.packageIdRequired)
     if (cartItems.length === 0) warnings.push(m.cartRequiresItems)
     if (getUniqueLayerKeys(cartItems).length > 1) warnings.push(m.cartMustBeSingleLayer)
-    const alreadyPackagedCount = cartItems.filter((item) => {
-      const value = item.attributes?.[packageField]
-      return value !== null && value !== undefined && String(value).trim() !== ''
-    }).length
+    const alreadyPackagedCount = cartItems.filter((item) => hasPackageValue(item, packageField)).length
     if (alreadyPackagedCount > 0) warnings.push(`${alreadyPackagedCount} ${m.assetsAlreadyPackaged}`)
     return warnings
   }
@@ -564,6 +578,28 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
     return { features: allFeatures, geometryType: geometryType || undefined, spatialReference }
   }
 
+  const queryCartFeatures = React.useCallback(async (layerUrl: string, objectIds: Array<string | number>): Promise<QueryResponse[]> => {
+    const results: QueryResponse[] = []
+    for (let offset = 0; offset < objectIds.length; offset += OBJECT_ID_QUERY_CHUNK_SIZE) {
+      const params: { [key: string]: string } = {
+        objectIds: objectIds.slice(offset, offset + OBJECT_ID_QUERY_CHUNK_SIZE).join(','),
+        outFields: '*',
+        returnGeometry: 'true',
+        f: 'json'
+      }
+      const outWkid = jimuMapView?.view?.spatialReference?.wkid
+      if (outWkid) params.outSR = String(outWkid)
+
+      const q = new URL(layerUrl + '/query')
+      q.search = new URLSearchParams(params).toString()
+      const r = await fetch(q.toString())
+      const d = await r.json() as QueryResponse
+      if (!r.ok || d.error) throw new Error(d.error?.message || r.statusText)
+      results.push(d)
+    }
+    return results
+  }, [jimuMapView])
+
   const ensureHighlightLayer = async () => {
     if (!jimuMapView?.view?.map) throw new Error(m.mapNotConfigured)
     if (highlightLayerRef.current && highlightMapRef.current !== jimuMapView.view.map) {
@@ -583,6 +619,26 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
     }
     return highlightLayerRef.current
   }
+
+  const ensureCartGraphicsLayer = React.useCallback(async () => {
+    if (!jimuMapView?.view?.map) return null
+    if (cartGraphicsLayerRef.current && cartGraphicsMapRef.current !== jimuMapView.view.map) {
+      cartGraphicsMapRef.current?.remove?.(cartGraphicsLayerRef.current)
+      cartGraphicsLayerRef.current = null
+      cartGraphicsMapRef.current = null
+    }
+    if (!cartGraphicsLayerRef.current) {
+      const [GraphicsLayer] = await loadArcGISJSAPIModules(['esri/layers/GraphicsLayer'])
+      cartGraphicsLayerRef.current = new GraphicsLayer({
+        id: `${props.id}-package-cart`,
+        title: 'AiM Manager package cart',
+        listMode: 'hide'
+      })
+      jimuMapView.view.map.add(cartGraphicsLayerRef.current)
+      cartGraphicsMapRef.current = jimuMapView.view.map
+    }
+    return cartGraphicsLayerRef.current
+  }, [jimuMapView, props.id])
 
   const getGeometryJson = (geometry: any, geometryType?: string, spatialReference?: any) => {
     const geometryJson = { ...geometry }
@@ -620,6 +676,31 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
     }
   }
 
+  const getCartGraphicSymbol = (geometry: any) => {
+    const type = geometry?.type
+    if (type === 'point' || type === 'multipoint') {
+      return {
+        type: 'simple-marker',
+        style: 'circle',
+        color: [255, 170, 0, 0.9],
+        size: 11,
+        outline: { color: [255, 255, 255, 1], width: 2 }
+      }
+    }
+    if (type === 'polyline') {
+      return {
+        type: 'simple-line',
+        color: [255, 170, 0, 1],
+        width: 4
+      }
+    }
+    return {
+      type: 'simple-fill',
+      color: [255, 170, 0, 0.18],
+      outline: { color: [255, 170, 0, 1], width: 2 }
+    }
+  }
+
   const clearHighlightedFeatures = () => {
     highlightLayerRef.current?.removeAll?.()
   }
@@ -648,9 +729,74 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
     return true
   }
 
+  React.useEffect(() => {
+    let cancelled = false
+
+    const syncCartGraphics = async () => {
+      const layer = await ensureCartGraphicsLayer()
+      if (!layer || cancelled) return
+
+      if (!isCreateMode || cartItems.length === 0) {
+        layer.removeAll()
+        return
+      }
+
+      const [Graphic, geometryJsonUtils] = await loadArcGISJSAPIModules([
+        'esri/Graphic',
+        'esri/geometry/support/jsonUtils'
+      ])
+      if (cancelled) return
+
+      const itemsByLayer = cartItems.reduce((groups, item) => {
+        const items = groups.get(item.layerUrl) || []
+        items.push(item)
+        groups.set(item.layerUrl, items)
+        return groups
+      }, new Map<string, PackageCartItem[]>())
+      const queryResults = await Promise.all(Array.from(itemsByLayer.entries()).map(async ([layerUrl, items]) => ({
+        layerUrl,
+        results: await queryCartFeatures(layerUrl, items.map((item) => item.objectId))
+      })))
+      if (cancelled) return
+
+      const graphics: any[] = []
+      queryResults.forEach(({ results }) => {
+        results.forEach((result) => {
+          const features = result.features || []
+          features.forEach((feature) => {
+            if (!feature.geometry) return
+            const geometry = geometryJsonUtils.fromJSON(getGeometryJson(
+              feature.geometry,
+              result.geometryType,
+              result.spatialReference
+            ))
+            graphics.push(new Graphic({
+              geometry,
+              attributes: feature.attributes || {},
+              symbol: getCartGraphicSymbol(geometry)
+            }))
+          })
+        })
+      })
+
+      layer.removeAll()
+      if (graphics.length > 0) layer.addMany(graphics)
+    }
+
+    syncCartGraphics().catch(() => {
+      if (!cancelled) setStatus(m.cartGraphicsError)
+    })
+
+    return () => {
+      cancelled = true
+    }
+  }, [cartItems, ensureCartGraphicsLayer, isCreateMode, m.cartGraphicsError, queryCartFeatures])
+
   React.useEffect(() => () => {
     highlightLayerRef.current?.removeAll?.()
     highlightMapRef.current?.remove?.(highlightLayerRef.current)
+    cartGraphicsLayerRef.current?.removeAll?.()
+    cartGraphicsMapRef.current?.remove?.(cartGraphicsLayerRef.current)
   }, [])
 
   const selectPackage = async (layerUrl: string, pkg: string) => {
@@ -827,46 +973,16 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
           }
         })
       ),
-      h('label', { className: 'd-flex align-items-center', style: { gap: '0.5rem', fontSize: 12 } },
-        h(Checkbox, {
-          checked: autoAddSelection,
-          onChange: (_evt, checked) => {
-            setAutoAddSelection(Boolean(checked))
-          }
-        }),
-        h('span', null, m.autoAddSelection)
-      ),
-      h('div', { className: 'border rounded p-2' },
-        h('div', { className: 'd-flex align-items-center justify-content-between mb-2', style: { gap: '0.5rem' } },
-          h('div', { className: 'font-weight-bold', style: { fontSize: 12 } }, m.currentMapSelection),
-          h('div', { style: { fontSize: 11, opacity: 0.75 } }, `${currentSelectionCount} ${m.selectedCountSuffix}`)
-        ),
-        h('div', { className: 'mb-2', style: { fontSize: 10, opacity: 0.72 } },
-          `${m.selectionSourcesPrefix} ${selectionSources.length} | ${m.selectedGraphicsPrefix} ${selectedMapFeatures.length}`
-        ),
-        cartLayerName && h('div', { className: 'mb-2', style: { fontSize: 11, opacity: 0.82 } },
-          `${m.packageLayerLocked} ${cartLayerName}`
-        ),
-        !cartLayerKey && currentSelectionLayerKeys.length > 1 && h(Alert, {
-          form: 'basic',
-          type: 'warning',
-          text: m.selectionMustBeSingleLayer
-        }),
-        cartLayerKey && currentSelectionItems.some((item) => item.layerKey !== cartLayerKey) && h(Alert, {
-          form: 'basic',
-          type: 'warning',
-          text: `${m.selectionLayerMismatch} ${cartLayerName || m.targetLayer}`
-        }),
-        groupedItemsPanel(currentSelectionItems, m.noCurrentSelection, false),
-        h(Button, {
-          className: 'mt-2',
-          size: 'sm',
-          type: 'primary',
-          disabled: currentSelectionItems.length === 0 || (!cartLayerKey && currentSelectionLayerKeys.length > 1) || Boolean(cartLayerKey && currentSelectionItems.some((item) => item.layerKey !== cartLayerKey)),
-          onClick: () => {
-            addItemsToCart(currentSelectionItems)
-          }
-        }, m.addSelectionToPackage)
+      h('div', { className: 'd-flex flex-column', style: { gap: '0.35rem' } },
+        h('label', { className: 'd-flex align-items-center mb-0', style: { gap: '0.5rem', fontSize: 12 } },
+          h(Checkbox, {
+            checked: skipPackagedAssets,
+            onChange: (_evt, checked) => {
+              setSkipPackagedAssets(Boolean(checked))
+            }
+          }),
+          h('span', null, m.skipPackagedAssets)
+        )
       ),
       h('div', { className: 'border rounded p-2 d-flex flex-column flex-grow-1', style: { minHeight: 0 } },
         h('div', { className: 'd-flex align-items-center justify-content-between mb-2', style: { gap: '0.5rem' } },
