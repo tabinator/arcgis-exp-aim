@@ -32,6 +32,10 @@ interface PackageCartItem {
   attributes: { [key: string]: any }
   record?: any
 }
+interface PackageSummary {
+  id: string
+  featureCount: number
+}
 
 const normalizeUrl = (url?: string) => {
   const rawUrl = (url || '').trim()
@@ -119,12 +123,11 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
   const packageField = props.config?.packageField?.trim() || 'PCKGID'
   const folderBaseUrl = props.config?.folderBaseUrl?.trim()
 
-  const [isOpen, setIsOpen] = React.useState(false)
   const [loading, setLoading] = React.useState(false)
   const [error, setError] = React.useState<string | null>(null)
   const [selectedKey, setSelectedKey] = React.useState<string | null>(null)
   const [status, setStatus] = React.useState<string | null>(null)
-  const [groups, setGroups] = React.useState<Array<{ layerUrl: string, layerName: string, packages: string[] }>>([])
+  const [groups, setGroups] = React.useState<Array<{ layerUrl: string, layerName: string, packages: PackageSummary[] }>>([])
   const [activeLayerUrl, setActiveLayerUrl] = React.useState<string | null>(null)
   const [jimuMapView, setJimuMapView] = React.useState<any>(null)
   const [isCreateMode, setIsCreateMode] = React.useState(false)
@@ -394,7 +397,6 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
     clearHighlightedFeatures()
     setSelectedKey(null)
     setIsCreateMode(true)
-    setIsOpen(false)
     setStatus(m.createModeStarted)
   }
 
@@ -422,6 +424,17 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
       group.items.push(item)
     })
     return layerGroups
+  }
+
+  const compactActionButtonStyle = {
+    flex: '1 1 0',
+    minWidth: 0,
+    height: 30,
+    padding: '0 6px',
+    fontSize: 11,
+    lineHeight: '14px',
+    whiteSpace: 'normal',
+    textAlign: 'center'
   }
 
   const submitCreatePackage = async () => {
@@ -462,7 +475,6 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
       const createdCount = cartItems.length
       clearCreateDraft()
       setIsCreateMode(false)
-      setIsOpen(true)
       setStatus(`${m.packageCreated} ${packageId} (${createdCount})`)
       refresh().catch(() => undefined)
     } catch (e) {
@@ -472,8 +484,8 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
     }
   }
 
-  const loadLayerPackages = React.useCallback(async (layerUrl: string): Promise<string[]> => {
-    const ids = new Set<string>()
+  const loadLayerPackages = React.useCallback(async (layerUrl: string): Promise<PackageSummary[]> => {
+    const packageCounts = new Map<string, number>()
     let offset = 0
     let hasMore = true
     while (hasMore) {
@@ -493,14 +505,19 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
       const feats = d.features || []
       feats.forEach((f) => {
         const v = f.attributes?.[packageField]
-        if (v !== null && v !== undefined && String(v).trim() !== '') ids.add(String(v))
+        if (v !== null && v !== undefined && String(v).trim() !== '') {
+          const packageId = String(v)
+          packageCounts.set(packageId, (packageCounts.get(packageId) || 0) + 1)
+        }
       })
       const fullPage = feats.length === QUERY_PAGE_SIZE
       hasMore = Boolean(d.exceededTransferLimit) || fullPage
       offset += feats.length
       if (feats.length === 0) hasMore = false
     }
-    return Array.from(ids).sort((a, b) => a.localeCompare(b))
+    return Array.from(packageCounts.entries())
+      .map(([id, featureCount]) => ({ id, featureCount }))
+      .sort((a, b) => a.id.localeCompare(b.id))
   }, [packageField])
 
   const escapeSqlString = (value: string) => value.replace(/'/g, "''")
@@ -705,29 +722,42 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
   }, [loadLayerPackages, m.layerPrefix, m.loadError, m.noTargetLayers, targetLayers])
 
   React.useEffect(() => {
-    if (isOpen) {
+    if (!isCreateMode) {
       refresh().catch(() => undefined)
     }
-  }, [isOpen, refresh])
+  }, [isCreateMode, refresh])
 
-  const row = (layerUrl: string, pkg: string) => {
-    const key = `${layerUrl}::${pkg}`
+  const row = (layerUrl: string, pkg: PackageSummary) => {
+    const key = `${layerUrl}::${pkg.id}`
     const isSelected = key === selectedKey
     return h('div', { key, className: 'd-flex align-items-center justify-content-between py-1', style: { gap: '0.5rem' } },
-      h('div', { className: 'd-flex align-items-center', style: { gap: '0.5rem' } },
+      h('div', { className: 'd-flex align-items-center', style: { gap: '0.5rem', minWidth: 0 } },
         h(Checkbox, {
           checked: isSelected,
           onChange: () => {
-            selectPackage(layerUrl, pkg).catch(() => undefined)
+            selectPackage(layerUrl, pkg.id).catch(() => undefined)
           }
         }),
-        h('span', null, pkg)
+        h('span', { style: { minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, pkg.id),
+        h('span', {
+          title: `${pkg.featureCount} ${m.featureCountLabel}`,
+          style: {
+            flex: '0 0 auto',
+            borderRadius: 999,
+            padding: '2px 8px',
+            fontSize: 11,
+            fontWeight: 700,
+            lineHeight: '16px',
+            color: 'var(--info-600, #0077ac)',
+            backgroundColor: 'transparent'
+          }
+        }, String(pkg.featureCount))
       ),
       h(Button, {
         size: 'sm', type: 'default', title: m.openFolder, disabled: !folderBaseUrl,
         onClick: () => {
           if (folderBaseUrl) {
-            window.open(`${folderBaseUrl}/${pkg}`, '_blank', 'noopener,noreferrer')
+            window.open(`${folderBaseUrl}/${pkg.id}`, '_blank', 'noopener,noreferrer')
           }
         },
         style: { width: 32, minWidth: 32, height: 32, padding: 0, display: 'inline-flex', alignItems: 'center', justifyContent: 'center' }
@@ -873,13 +903,7 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
       h(CardHeader, null, m.widgetTitle),
       h(CardBody, { className: 'd-flex flex-column', style: { minHeight: 0 } },
         isCreateMode ? createModeView() : h('div', { className: 'd-flex flex-column flex-grow-1', style: { gap: '0.75rem', minHeight: 0 } },
-          h(Button, {
-            type: 'primary',
-            onClick: () => {
-              setIsOpen(!isOpen)
-            }
-          }, isOpen ? m.hidePackageList : m.openPackageList),
-          isOpen && h('div', { className: 'border rounded p-2 d-flex flex-column flex-grow-1', style: { minHeight: 0 } },
+          h('div', { className: 'border rounded p-2 d-flex flex-column flex-grow-1', style: { minHeight: 0 } },
             h('div', { className: 'd-flex align-items-center justify-content-between mb-2', style: { gap: '0.5rem' } },
               h('div', { className: 'font-weight-bold' }, m.widgetTitle),
               h(Button, {
@@ -920,21 +944,32 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
                 )
               })
             ),
-            h('div', { className: 'mt-2', style: { fontSize: 12 } }, `${m.selectedPrefix} ${selectedKey || m.noneSelected} (${m.packageFieldPrefix}: ${packageField})`),
-            h('div', { className: 'd-flex mt-2', style: { gap: '0.5rem' } },
+            h('div', { className: 'd-flex mt-2', style: { gap: '0.35rem' } },
               h(Button, {
                 type: 'primary',
+                size: 'sm',
+                style: compactActionButtonStyle,
                 onClick: startCreateMode
               }, m.createPackage),
               h(Button, {
                 type: 'default',
+                size: 'sm',
+                style: compactActionButtonStyle,
+                onClick: () => {
+                  setStatus(selectedKey ? m.viewPending : m.viewNeedsSelection)
+                }
+              }, m.viewPackage),
+              h(Button, {
+                type: 'default',
+                size: 'sm',
+                style: compactActionButtonStyle,
                 onClick: () => {
                   setStatus(selectedKey ? m.deletePending : m.deleteNeedsSelection)
                 }
               }, m.deletePackage)
             )
           ),
-          status && h(Alert, { form: 'basic', type: 'info', text: status })
+          h(Alert, { form: 'basic', type: 'info', text: status || m.packageListReady })
         )
       )
     )
