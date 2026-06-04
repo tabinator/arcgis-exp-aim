@@ -1,5 +1,5 @@
 export default {
-  widgetTitle: 'AiM Create Package',
+  widgetTitle: 'AiM Manager',
   refreshList: 'Refresh',
   loadingPackages: 'Loading packages...',
   loadError: 'Unable to load package list from one or more target layers.',

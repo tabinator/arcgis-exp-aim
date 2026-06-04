@@ -1,6 +1,6 @@
-# AGENTS.md - arcgis-exp-aim-create-package
+# AGENTS.md - arcgis-exp-aim-manager
 
-This repo contains ArcGIS Experience Builder work for the AiM create-package workflow.
+This repo contains ArcGIS Experience Builder work for the AiM Manager workflow.
 
 ## Operating Rules
 
@@ -26,4 +26,3 @@ This repo contains ArcGIS Experience Builder work for the AiM create-package wor
 - Settings code does not perform runtime-only side effects.
 - Any `jimu-arcgis` or ArcGIS Maps SDK imports are declared in `manifest.json` dependencies.
 - CI passes before merge.
-
