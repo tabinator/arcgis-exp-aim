@@ -1,7 +1,7 @@
 import { DataSourceManager, React, ReactRedux } from 'jimu-core'
 import type { AllWidgetProps, IMState } from 'jimu-core'
 import { JimuMapViewComponent, loadArcGISJSAPIModules } from 'jimu-arcgis'
-import { Alert, Button, Card, CardBody, CardHeader, Checkbox, Modal, ModalBody, ModalFooter, ModalHeader, TextInput } from 'jimu-ui'
+import { Alert, Button, Card, CardBody, CardHeader, Checkbox, TextInput } from 'jimu-ui'
 import defaultMessages from './translations/default'
 import type { IMConfig } from '../config'
 
@@ -180,8 +180,6 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
   const [loading, setLoading] = React.useState(false)
   const [error, setError] = React.useState<string | null>(null)
   const [selectedPackage, setSelectedPackage] = React.useState<SelectedPackage | null>(null)
-  const [isDeleteConfirmationOpen, setIsDeleteConfirmationOpen] = React.useState(false)
-  const [phasePendingRemoval, setPhasePendingRemoval] = React.useState<PackageCartItem | null>(null)
   const [status, setStatus] = React.useState<string | null>(null)
   const [groups, setGroups] = React.useState<Array<{ layerUrl: string, layerName: string, packages: PackageSummary[] }>>([])
   const [activeLayerUrl, setActiveLayerUrl] = React.useState<string | null>(null)
@@ -550,7 +548,7 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
   }
 
   const requestRemovePackagePhase = (item: PackageCartItem) => {
-    setPhasePendingRemoval(item)
+    setStatus(`${m.removePackagePhasePending} ${item.objectId}`)
   }
 
   const clearCreateDraft = () => {
@@ -845,33 +843,6 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
     clearModifyDraft()
     setIsModifyMode(false)
     setStatus(m.modifyModeCancelled)
-  }
-
-  const openDeleteConfirmation = () => {
-    if (!selectedPackage) {
-      setStatus(m.deleteNeedsSelection)
-      return
-    }
-    setIsDeleteConfirmationOpen(true)
-  }
-
-  const closeDeleteConfirmation = () => {
-    setIsDeleteConfirmationOpen(false)
-  }
-
-  const confirmDeletePackage = () => {
-    setIsDeleteConfirmationOpen(false)
-    setStatus(m.deletePending)
-  }
-
-  const closeRemovePhaseConfirmation = () => {
-    setPhasePendingRemoval(null)
-  }
-
-  const confirmRemovePackagePhase = () => {
-    const objectId = phasePendingRemoval?.objectId
-    setPhasePendingRemoval(null)
-    setStatus(`${m.removePackagePhasePending} ${objectId || ''}`)
   }
 
   const queryCartFeatures = React.useCallback(async (layerUrl: string, objectIds: Array<string | number>): Promise<QueryResponse[]> => {
@@ -1678,53 +1649,16 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
                 type: 'default',
                 size: 'sm',
                 style: compactActionButtonStyle,
-                onClick: openDeleteConfirmation
+                onClick: () => {
+                  setStatus(selectedPackage ? m.deletePending : m.deleteNeedsSelection)
+                }
               }, m.deletePackage)
             )
           ),
           h(Alert, { form: 'basic', type: 'info', text: status || m.packageListReady })
         )
       )
-    ),
-    h(Modal, {
-      isOpen: isDeleteConfirmationOpen,
-      toggle: closeDeleteConfirmation,
-      centered: true,
-      backdrop: 'static'
-    },
-    h(ModalHeader, { toggle: closeDeleteConfirmation }, m.deleteConfirmationTitle),
-    h(ModalBody, null,
-      h(Alert, { form: 'basic', type: 'warning', text: m.deleteConfirmationWarning }),
-      h('div', { className: 'mt-2', style: { fontSize: 13 } },
-        `${m.deleteConfirmationPackageLabel} ${selectedPackage?.id || ''}`
-      ),
-      h('div', { className: 'mt-2', style: { fontSize: 12, opacity: 0.8 } }, m.deleteConfirmationDetail)
-    ),
-    h(ModalFooter, null,
-      h(Button, { type: 'default', onClick: closeDeleteConfirmation }, m.cancel),
-      h(Button, { type: 'danger', onClick: confirmDeletePackage }, m.confirmDeletePackage)
-    )),
-    h(Modal, {
-      isOpen: Boolean(phasePendingRemoval),
-      toggle: closeRemovePhaseConfirmation,
-      centered: true,
-      backdrop: 'static'
-    },
-    h(ModalHeader, { toggle: closeRemovePhaseConfirmation }, m.removePhaseConfirmationTitle),
-    h(ModalBody, null,
-      h(Alert, { form: 'basic', type: 'warning', text: m.removePhaseConfirmationWarning }),
-      h('div', { className: 'mt-2', style: { fontSize: 13 } },
-        `${m.deleteConfirmationPackageLabel} ${selectedPackage?.id || ''}`
-      ),
-      h('div', { className: 'mt-1', style: { fontSize: 13 } },
-        `${m.objectIdPrefix} ${phasePendingRemoval?.objectId || ''}`
-      ),
-      h('div', { className: 'mt-2', style: { fontSize: 12, opacity: 0.8 } }, m.removePhaseConfirmationDetail)
-    ),
-    h(ModalFooter, null,
-      h(Button, { type: 'default', onClick: closeRemovePhaseConfirmation }, m.cancel),
-      h(Button, { type: 'danger', onClick: confirmRemovePackagePhase }, m.confirmRemovePackagePhase)
-    ))
+    )
   )
 }
 
