@@ -1,0 +1,27 @@
+{
+  "created": 1780090745276,
+  "description": "",
+  "id": "0",
+  "modified": 1781042576107,
+  "owner": "OCPW.Sean.Tabin",
+  "tags": [],
+  "thumbnail": null,
+  "title": "AiM Manager Demo",
+  "type": "Web Experience",
+  "snippet": "",
+  "typeKeywords": [
+    "EXB Experience",
+    "Ready To Use",
+    "JavaScript",
+    "status: Published",
+    "version:1.20.0",
+    "template:jewelrybox",
+    "modified: 1781042574174",
+    "publishVersion:1.20.0"
+  ],
+  "portalUrl": "https://OCPW.maps.arcgis.com",
+  "username": "OCPW.Sean.Tabin",
+  "name": "AiM Manager Demo",
+  "isLocalApp": true,
+  "url": null
+}
