@@ -45,6 +45,10 @@ git push -u origin feature/aim-work-orders-initial
 - `widgets/aim-manager`
 - `widgets/aim-create-work-order`
 
+## Workflow Documentation
+
+- [Create Package workflow](docs/create-package-workflow.md)
+
 ## Current Apps
 
 - `apps/aim-manager-demo`

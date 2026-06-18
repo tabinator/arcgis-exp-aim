@@ -3,6 +3,7 @@ import type { AllWidgetProps, IMState } from 'jimu-core'
 import { JimuMapViewComponent, loadArcGISJSAPIModules } from 'jimu-arcgis'
 import { Alert, Button, Card, CardBody, CardHeader, Checkbox, Modal, ModalBody, ModalFooter, ModalHeader, TextInput } from 'jimu-ui'
 import defaultMessages from './translations/default'
+import { DEFAULT_AIM_SUBMIT_URL } from '../config'
 import type { IMConfig } from '../config'
 
 interface QueryFeature { attributes?: { [key: string]: any }, geometry?: any }
@@ -23,6 +24,7 @@ const QUERY_PAGE_SIZE = 2000
 const OBJECT_ID_QUERY_CHUNK_SIZE = 200
 const WORK_CODE_FIELD = 'WorkCode'
 const PROPERTY_ID_FIELD = 'AIMPropertyID'
+const PROPERTY_NAME_FIELD = 'PropertyName'
 const CREATED_DATE_FIELD = 'created_date'
 
 interface TargetLayer { name: string, url: string }
@@ -164,15 +166,68 @@ const getWorkCodeKey = (item: PackageCartItem) => getWorkCodeKeyFromAttributes(i
 const filterByWorkCode = (items: PackageCartItem[], workCodeKey: string) =>
   items.filter((item) => getWorkCodeKey(item) === workCodeKey)
 
-const getPropertyIdKeyFromAttributes = (attributes: { [key: string]: any }) => {
-  const value = getAttributeValue(attributes, PROPERTY_ID_FIELD)
+const getPropertyNameKeyFromAttributes = (attributes: { [key: string]: any }) => {
+  const value = getAttributeValue(attributes, PROPERTY_NAME_FIELD)
   return value === null || value === undefined ? 'null:' : `${typeof value}:${String(value)}`
 }
 
-const getPropertyIdKey = (item: PackageCartItem) => getPropertyIdKeyFromAttributes(item.attributes || {})
+const getPropertyNameKey = (item: PackageCartItem) => getPropertyNameKeyFromAttributes(item.attributes || {})
 
-const filterByPropertyId = (items: PackageCartItem[], propertyIdKey: string) =>
-  items.filter((item) => getPropertyIdKey(item) === propertyIdKey)
+const filterByPropertyName = (items: PackageCartItem[], propertyNameKey: string) =>
+  items.filter((item) => getPropertyNameKey(item) === propertyNameKey)
+
+const getGeneratedPackageId = (attributes: { [key: string]: any }, date = new Date()) => {
+  const propertyName = getAttributeValue(attributes, PROPERTY_NAME_FIELD)
+  const workCode = getAttributeValue(attributes, WORK_CODE_FIELD)
+  if (
+    propertyName === null ||
+    propertyName === undefined ||
+    String(propertyName).trim() === '' ||
+    workCode === null ||
+    workCode === undefined ||
+    String(workCode).trim() === ''
+  ) return ''
+
+  const pad = (value: number) => String(value).padStart(2, '0')
+  const datePart = `${pad(date.getMonth() + 1)}${pad(date.getDate())}${pad(date.getFullYear() % 100)}`
+  const timePart = `${pad(date.getHours())}${pad(date.getMinutes())}`
+  return `${String(propertyName).trim().toUpperCase()}-${String(workCode).trim()}-${datePart}-${timePart}`
+}
+
+const getNullableAttributeValue = (attributes: { [key: string]: any }, fieldName: string) => {
+  const value = getAttributeValue(attributes, fieldName)
+  return value === undefined ? null : value
+}
+
+const getAimObjectId = (objectId: string | number) => {
+  if (typeof objectId === 'number') return objectId
+  const numericObjectId = Number(objectId)
+  return Number.isNaN(numericObjectId) ? objectId : numericObjectId
+}
+
+const getAimWorkOrderPayload = (items: PackageCartItem[]) => ({
+  department: 'OM',
+  facId: 'ROAD',
+  propertyName: getNullableAttributeValue(items[0]?.attributes || {}, PROPERTY_NAME_FIELD),
+  entClerk: 'Test User',
+  caseNumber: null,
+  features: items.map((item) => {
+    const attributes = item.attributes || {}
+    return {
+      objectId: getAimObjectId(item.objectId),
+      locationCode: getNullableAttributeValue(attributes, 'locationCode'),
+      workCode: getNullableAttributeValue(attributes, WORK_CODE_FIELD),
+      repairRecommendation: getNullableAttributeValue(attributes, 'repairRecommendation'),
+      estimatedWorkQuantity: getNullableAttributeValue(attributes, 'estimatedWorkQuantity'),
+      workUnit: getNullableAttributeValue(attributes, 'workUnit'),
+      deficiencyLocation: getNullableAttributeValue(attributes, 'deficiencyLocation'),
+      latitude: getNullableAttributeValue(attributes, 'latitude'),
+      longitude: getNullableAttributeValue(attributes, 'longitude'),
+      inspector: getNullableAttributeValue(attributes, 'inspector'),
+      dimensions: getNullableAttributeValue(attributes, 'dimensions')
+    }
+  })
+})
 
 const formatDateValue = (value: any) => {
   if (value === null || value === undefined || String(value).trim() === '') return '-'
@@ -187,10 +242,12 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
   const m = defaultMessages
   const packageField = props.config?.packageField?.trim() || 'PCKGID'
   const folderBaseUrl = props.config?.folderBaseUrl?.trim()
+  const aimSubmitUrl = props.config?.aimSubmitUrl?.trim() || DEFAULT_AIM_SUBMIT_URL
 
   const [loading, setLoading] = React.useState(false)
   const [error, setError] = React.useState<string | null>(null)
   const [selectedPackage, setSelectedPackage] = React.useState<SelectedPackage | null>(null)
+  const [isCreateConfirmationOpen, setIsCreateConfirmationOpen] = React.useState(false)
   const [isDeleteConfirmationOpen, setIsDeleteConfirmationOpen] = React.useState(false)
   const [phasePendingRemoval, setPhasePendingRemoval] = React.useState<PackageCartItem | null>(null)
   const [status, setStatus] = React.useState<string | null>(null)
@@ -217,6 +274,9 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
   const [submittingPackage, setSubmittingPackage] = React.useState(false)
   const [mapSelectionSources, setMapSelectionSources] = React.useState<SelectionSource[]>([])
   const [selectedMapFeatures, setSelectedMapFeatures] = React.useState<any[]>([])
+  const packageIdWasEditedRef = React.useRef(false)
+  const generatedPackageIdRef = React.useRef('')
+  const generatedPackageSourceKeyRef = React.useRef('')
   const highlightLayerRef = React.useRef<any>(null)
   const highlightMapRef = React.useRef<any>(null)
   const cartGraphicsLayerRef = React.useRef<any>(null)
@@ -438,9 +498,9 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
       const workCodeFilteredItems = uniqueWorkCodes && lockedWorkCodeKey
         ? filterByWorkCode(newItems, lockedWorkCodeKey)
         : newItems
-      const lockedPropertyIdKey = current[0] ? getPropertyIdKey(current[0]) : newItems[0] ? getPropertyIdKey(newItems[0]) : null
+      const lockedPropertyIdKey = current[0] ? getPropertyNameKey(current[0]) : newItems[0] ? getPropertyNameKey(newItems[0]) : null
       const additions = propertyIdsMustMatch && lockedPropertyIdKey
-        ? filterByPropertyId(workCodeFilteredItems, lockedPropertyIdKey)
+        ? filterByPropertyName(workCodeFilteredItems, lockedPropertyIdKey)
         : workCodeFilteredItems
       if (additions.length === 0) {
         setStatus(propertyIdsMustMatch && workCodeFilteredItems.length > 0 ? m.selectionPropertyIdMismatch : newItems.length > 0 && uniqueWorkCodes ? m.selectionWorkCodeMismatch : m.selectionAlreadyInCart)
@@ -465,9 +525,28 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
 
   React.useEffect(() => {
     if (isCreateMode && propertyIdsMustMatch) {
-      setCartItems((current) => current[0] ? filterByPropertyId(current, getPropertyIdKey(current[0])) : current)
+      setCartItems((current) => current[0] ? filterByPropertyName(current, getPropertyNameKey(current[0])) : current)
     }
   }, [isCreateMode, propertyIdsMustMatch])
+
+  React.useEffect(() => {
+    if (!isCreateMode || packageIdWasEditedRef.current) return
+    const firstItem = cartItems[0]
+    if (!firstItem) {
+      if (generatedPackageSourceKeyRef.current) {
+        generatedPackageIdRef.current = ''
+        generatedPackageSourceKeyRef.current = ''
+        setDraftPackageId('')
+      }
+      return
+    }
+    if (firstItem.key === generatedPackageSourceKeyRef.current) return
+    const generatedPackageId = getGeneratedPackageId(firstItem.attributes || {})
+    if (!generatedPackageId || generatedPackageId === generatedPackageIdRef.current) return
+    generatedPackageIdRef.current = generatedPackageId
+    generatedPackageSourceKeyRef.current = firstItem.key
+    setDraftPackageId(generatedPackageId)
+  }, [cartItems, isCreateMode])
 
   React.useEffect(() => {
     if (isCreateMode && pendingSelectionRemovalKeys.length === 0) {
@@ -502,9 +581,9 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
       const workCodeFilteredItems = modifyUniqueWorkCodes && lockedWorkCodeKey
         ? filterByWorkCode(newItems, lockedWorkCodeKey)
         : newItems
-      const lockedPropertyIdKey = current[0] ? getPropertyIdKey(current[0]) : newItems[0] ? getPropertyIdKey(newItems[0]) : null
+      const lockedPropertyIdKey = current[0] ? getPropertyNameKey(current[0]) : newItems[0] ? getPropertyNameKey(newItems[0]) : null
       const additions = modifyPropertyIdsMustMatch && lockedPropertyIdKey
-        ? filterByPropertyId(workCodeFilteredItems, lockedPropertyIdKey)
+        ? filterByPropertyName(workCodeFilteredItems, lockedPropertyIdKey)
         : workCodeFilteredItems
       return additions.length > 0 ? [...current, ...additions] : current
     })
@@ -581,6 +660,10 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
   }
 
   const clearCreateDraft = () => {
+    setIsCreateConfirmationOpen(false)
+    packageIdWasEditedRef.current = false
+    generatedPackageIdRef.current = ''
+    generatedPackageSourceKeyRef.current = ''
     setDraftPackageId('')
     setSkipPackagedAssets(true)
     setUniqueWorkCodes(true)
@@ -624,6 +707,24 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
     const alreadyPackagedCount = cartItems.filter((item) => hasPackageValue(item, packageField)).length
     if (alreadyPackagedCount > 0) warnings.push(`${alreadyPackagedCount} ${m.assetsAlreadyPackaged}`)
     return warnings
+  }
+
+  const openCreateConfirmation = () => {
+    const validationWarnings = getValidationWarnings()
+    if (validationWarnings.length > 0) {
+      setStatus(`${m.validationPrefix} ${validationWarnings.join(' ')}`)
+      return
+    }
+    setIsCreateConfirmationOpen(true)
+  }
+
+  const closeCreateConfirmation = () => {
+    if (!submittingPackage) setIsCreateConfirmationOpen(false)
+  }
+
+  const confirmCreatePackage = () => {
+    setIsCreateConfirmationOpen(false)
+    submitCreatePackage().catch(() => undefined)
   }
 
   const groupItemsByLayer = (items: PackageCartItem[]) => {
@@ -725,6 +826,19 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
         })
         const updated = await ds.updateRecords(records)
         if (!updated) throw new Error(`${m.packageCreateFailedForLayer} ${items[0]?.layerName || dataSourceId}`)
+      }
+
+      const aimResponse = await fetch(aimSubmitUrl, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify(getAimWorkOrderPayload(cartItems)),
+        redirect: 'follow'
+      })
+      const aimResponseText = await aimResponse.text()
+      if (!aimResponse.ok) {
+        throw new Error(`${m.aimSubmitFailed} HTTP ${aimResponse.status}${aimResponseText ? `: ${aimResponseText}` : ''}`)
       }
 
       const createdCount = cartItems.length
@@ -1005,10 +1119,10 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
     const firstItemAttributes = cartRestAttributes[cartItems[0].key]
     if (!firstItemAttributes) return
 
-    const lockedPropertyIdKey = getPropertyIdKeyFromAttributes(firstItemAttributes)
+    const lockedPropertyIdKey = getPropertyNameKeyFromAttributes(firstItemAttributes)
     const rejectedItems = cartItems.filter((item) => {
       const restAttributes = cartRestAttributes[item.key]
-      return restAttributes && getPropertyIdKeyFromAttributes(restAttributes) !== lockedPropertyIdKey
+      return restAttributes && getPropertyNameKeyFromAttributes(restAttributes) !== lockedPropertyIdKey
     })
     if (rejectedItems.length === 0) return
 
@@ -1052,10 +1166,10 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
   React.useEffect(() => {
     if (!isModifyMode || !modifyPropertyIdsMustMatch || modifySelectionItems.length === 0) return
     const firstItemAttributes = cartRestAttributes[modifySelectionItems[0].key] || modifySelectionItems[0].attributes
-    const lockedPropertyIdKey = getPropertyIdKeyFromAttributes(firstItemAttributes)
+    const lockedPropertyIdKey = getPropertyNameKeyFromAttributes(firstItemAttributes)
     const rejectedItems = modifySelectionItems.filter((item) => {
       const attributes = cartRestAttributes[item.key] || item.attributes
-      return getPropertyIdKeyFromAttributes(attributes) !== lockedPropertyIdKey
+      return getPropertyNameKeyFromAttributes(attributes) !== lockedPropertyIdKey
     })
     if (rejectedItems.length === 0) return
 
@@ -1563,6 +1677,9 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
           value: draftPackageId,
           placeholder: m.packageIdPlaceholder,
           onChange: (evt) => {
+            packageIdWasEditedRef.current = true
+            generatedPackageIdRef.current = ''
+            generatedPackageSourceKeyRef.current = ''
             setDraftPackageId(evt.target.value)
           }
         })
@@ -1618,9 +1735,7 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
         h(Button, {
           type: 'primary',
           disabled: !canCreate || submittingPackage,
-          onClick: () => {
-            submitCreatePackage().catch(() => undefined)
-          }
+          onClick: openCreateConfirmation
         }, submittingPackage ? m.creatingPackage : m.createPackage)
       )
     )
@@ -1778,6 +1893,27 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
         )
       )
     ),
+    h(Modal, {
+      isOpen: isCreateConfirmationOpen,
+      toggle: closeCreateConfirmation,
+      centered: true,
+      backdrop: 'static'
+    },
+    h(ModalHeader, { toggle: closeCreateConfirmation }, m.createConfirmationTitle),
+    h(ModalBody, null,
+      h(Alert, { form: 'basic', type: 'warning', text: m.createConfirmationWarning }),
+      h('div', { className: 'mt-2', style: { fontSize: 13 } },
+        `${m.createConfirmationPackageLabel} ${draftPackageId.trim()}`
+      ),
+      h('div', { className: 'mt-1', style: { fontSize: 13 } },
+        `${m.createConfirmationFeatureCountLabel} ${cartItems.length}`
+      ),
+      h('div', { className: 'mt-2', style: { fontSize: 12, opacity: 0.8 } }, m.createConfirmationDetail)
+    ),
+    h(ModalFooter, null,
+      h(Button, { type: 'default', onClick: closeCreateConfirmation, disabled: submittingPackage }, m.cancel),
+      h(Button, { type: 'primary', onClick: confirmCreatePackage, disabled: submittingPackage }, m.confirmCreatePackage)
+    )),
     h(Modal, {
       isOpen: isDeleteConfirmationOpen,
       toggle: closeDeleteConfirmation,

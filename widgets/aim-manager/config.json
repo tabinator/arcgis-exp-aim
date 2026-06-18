@@ -1,5 +1,6 @@
 {
   "packageField": "PCKGID",
+  "aimSubmitUrl": "https://ocpw-intigration-hub-staging.azurewebsites.net/api/aim/workorders/submit",
   "folderBaseUrl": "",
   "targetLayerUrl1": "",
   "targetLayerUrl2": "",

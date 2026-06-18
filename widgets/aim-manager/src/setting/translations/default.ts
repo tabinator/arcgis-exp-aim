@@ -4,6 +4,7 @@ export default {
   packageFieldPlaceholder: 'PCKGID',
   folderBaseUrlLabel: 'Box folder base URL (optional)',
   folderBaseUrlPlaceholder: 'https://app.box.com/folder',
+  aimSubmitUrlLabel: 'AiM Submit API URL',
   targetLayerName1Label: 'Target layer name 1',
   targetLayerName2Label: 'Target layer name 2',
   targetLayerName3Label: 'Target layer name 3',

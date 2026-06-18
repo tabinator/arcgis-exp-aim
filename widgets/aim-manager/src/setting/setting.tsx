@@ -3,6 +3,7 @@ import type { AllWidgetSettingProps } from 'jimu-for-builder'
 import { MapWidgetSelector, SettingSection, SettingRow } from 'jimu-ui/advanced/setting-components'
 import { TextInput } from 'jimu-ui'
 import defaultMessages from './translations/default'
+import { DEFAULT_AIM_SUBMIT_URL } from '../config'
 import type { IMConfig } from '../config'
 
 const Setting = (props: AllWidgetSettingProps<IMConfig>) => {
@@ -58,6 +59,16 @@ const Setting = (props: AllWidgetSettingProps<IMConfig>) => {
           placeholder: m.folderBaseUrlPlaceholder,
           onChange: (evt) => {
             onConfigChange('folderBaseUrl', evt.target.value)
+          }
+        })
+      ),
+      h(SettingRow, null,
+        h('div', { className: 'mb-1', style: { fontWeight: 600 } }, m.aimSubmitUrlLabel),
+        h(TextInput, {
+          value: cfg.aimSubmitUrl || DEFAULT_AIM_SUBMIT_URL,
+          placeholder: DEFAULT_AIM_SUBMIT_URL,
+          onChange: (evt) => {
+            onConfigChange('aimSubmitUrl', evt.target.value)
           }
         })
       ),
