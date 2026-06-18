@@ -60,9 +60,9 @@ This document defines the agreed target workflow for the AiM Manager V2
 ## Integration boundaries
 
 - The AiM work-order submission API is **not** part of package creation. It
-  belongs to a separate workflow.
+  belongs to the **Create Work Order** action in Modifying Existing Package
+  mode.
 - Box folder creation and the compensating ArcGIS rollback remain pending until
   the Box API contract is available.
-- The current V2 implementation must not be considered complete until its
-  interim AiM submission is removed from package creation and the Box sequence
-  above is implemented.
+- The Create Package implementation is not complete until the Box sequence and
+  compensating ArcGIS rollback above are implemented.

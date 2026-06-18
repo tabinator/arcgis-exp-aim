@@ -3,239 +3,46 @@ import type { AllWidgetProps, IMState } from 'jimu-core'
 import { JimuMapViewComponent, loadArcGISJSAPIModules } from 'jimu-arcgis'
 import { Alert, Button, Card, CardBody, CardHeader, Checkbox, Modal, ModalBody, ModalFooter, ModalHeader, TextInput } from 'jimu-ui'
 import defaultMessages from './translations/default'
+import { submitAimWorkOrder } from './aim-api'
+import {
+  CREATED_DATE_FIELD,
+  filterByPropertyName,
+  filterByWorkCode,
+  formatDateValue,
+  getAttributeValue,
+  getFeatureObjectId,
+  getGeneratedPackageId,
+  getGraphicObjectId,
+  getLayerDataSourceMatches,
+  getPackageKey,
+  getPropertyNameKey,
+  getPropertyNameKeyFromAttributes,
+  getRecordLabel,
+  getServiceLayerKey,
+  getUniqueLayerKeys,
+  getWorkCodeKey,
+  getWorkCodeKeyFromAttributes,
+  hasEmptyPackageValue,
+  hasPackageValue,
+  INSPECTOR_FIELD,
+  OBJECT_ID_QUERY_CHUNK_SIZE,
+  PROPERTY_NAME_FIELD,
+  QUERY_PAGE_SIZE,
+  urlCandidatesMatch,
+  WORK_CODE_FIELD
+} from './utils'
+import type {
+  CartLayerQueryResult,
+  PackageCartItem,
+  PackageSummary,
+  QueryResponse,
+  SelectedPackage,
+  SelectionSource,
+  TargetLayer,
+  WorkOrderApiResponse
+} from './types'
 import { DEFAULT_AIM_SUBMIT_URL } from '../config'
 import type { IMConfig } from '../config'
-
-interface QueryFeature { attributes?: { [key: string]: any }, geometry?: any }
-interface QueryResponse {
-  features?: QueryFeature[]
-  exceededTransferLimit?: boolean
-  error?: { message?: string }
-  geometryType?: string
-  spatialReference?: any
-  objectIdFieldName?: string
-}
-interface CartLayerQueryResult {
-  layerUrl: string
-  results: QueryResponse[]
-}
-
-const QUERY_PAGE_SIZE = 2000
-const OBJECT_ID_QUERY_CHUNK_SIZE = 200
-const WORK_CODE_FIELD = 'WorkCode'
-const PROPERTY_ID_FIELD = 'AIMPropertyID'
-const PROPERTY_NAME_FIELD = 'PropertyName'
-const CREATED_DATE_FIELD = 'created_date'
-
-interface TargetLayer { name: string, url: string }
-interface SelectionSource {
-  dataSourceId: string
-  layerName: string
-  layerUrl: string
-}
-interface PackageCartItem {
-  key: string
-  dataSourceId: string
-  layerName: string
-  layerUrl: string
-  layerKey: string
-  objectId: string | number
-  attributes: { [key: string]: any }
-  record?: any
-}
-interface PackageSummary {
-  id: string
-  featureCount: number
-}
-interface SelectedPackage {
-  key: string
-  layerUrl: string
-  id: string
-}
-
-const normalizeUrl = (url?: string) => {
-  const rawUrl = (url || '').trim()
-  if (!rawUrl) return ''
-  try {
-    const parsed = new URL(rawUrl)
-    return `${parsed.origin}${parsed.pathname}`.replace(/\/query$/i, '').replace(/\/+$/, '').toLowerCase()
-  } catch {
-    return rawUrl.split('?')[0].split('#')[0].replace(/\/query$/i, '').replace(/\/+$/, '').toLowerCase()
-  }
-}
-
-const getServiceLayerKey = (url?: string) => {
-  const normalized = normalizeUrl(url)
-  const match = normalized.match(/\/rest\/services\/(.+)\/(featureserver|mapserver)\/(\d+)$/i)
-  return match ? `${match[1]}/${match[2]}/${match[3]}`.toLowerCase() : normalized
-}
-
-const getRecordLabel = (attributes: { [key: string]: any }, objectId: string | number) => {
-  const labelFields = ['ASSET_ID', 'ASSETID', 'asset_id', 'assetid', 'NAME', 'Name', 'name', 'FACILITYID', 'facilityid']
-  const label = labelFields
-    .map((field) => attributes?.[field])
-    .find((value) => value !== null && value !== undefined && String(value).trim() !== '')
-  return label === undefined ? String(objectId) : String(label)
-}
-
-const getLayerDataSourceMatches = (state: IMState, targetLayers: TargetLayer[]): SelectionSource[] => {
-  const appConfig: any = (state as any).appConfig || (state as any).appStateInBuilder?.appConfig
-  const dataSources: { [id: string]: any } = appConfig?.dataSources || {}
-  const configuredLayers = targetLayers.map((layer) => ({
-    ...layer,
-    normalizedUrl: normalizeUrl(layer.url)
-  }))
-  const matches: SelectionSource[] = []
-
-  const visit = (dsJson: any) => {
-    if (!dsJson?.id) return
-    const dsUrl = normalizeUrl(dsJson.url)
-    const dsLayerUrl = dsJson.url && dsJson.layerId !== undefined
-      ? normalizeUrl(`${dsJson.url}/${dsJson.layerId}`)
-      : dsUrl
-    const match = configuredLayers.find((layer) =>
-      layer.normalizedUrl === dsUrl || layer.normalizedUrl === dsLayerUrl
-    )
-    if (match) {
-      matches.push({
-        dataSourceId: dsJson.id,
-        layerName: match.name,
-        layerUrl: match.url
-      })
-    }
-    Object.keys(dsJson.childDataSourceJsons || {}).forEach((childId) => {
-      visit(dsJson.childDataSourceJsons[childId])
-    })
-  }
-
-  Object.keys(dataSources).forEach((id) => {
-    visit(dataSources[id])
-  })
-
-  return matches
-}
-
-const urlCandidatesMatch = (targetUrl: string, candidates: string[]) => {
-  const normalizedTarget = normalizeUrl(targetUrl)
-  const targetServiceKey = getServiceLayerKey(targetUrl)
-  return candidates.some((candidate) => {
-    const normalizedCandidate = normalizeUrl(candidate)
-    const candidateServiceKey = getServiceLayerKey(candidate)
-    return normalizedCandidate === normalizedTarget || candidateServiceKey === targetServiceKey
-  })
-}
-
-const getGraphicObjectId = (graphic: any) => {
-  const layer = graphic?.layer || graphic?.sourceLayer
-  const objectIdField = layer?.objectIdField || 'OBJECTID'
-  return graphic?.attributes?.[objectIdField] ?? graphic?.attributes?.OBJECTID ?? graphic?.attributes?.ObjectID ?? graphic?.attributes?.objectid
-}
-
-const getPackageKey = (layerUrl: string, packageId: string) => `${layerUrl}::${packageId}`
-
-const hasPackageValue = (item: PackageCartItem, packageField: string) => {
-  const value = item.attributes?.[packageField]
-  return value !== null && value !== undefined && String(value).trim() !== ''
-}
-
-const hasEmptyPackageValue = (item: PackageCartItem, packageField: string) => {
-  const value = item.attributes?.[packageField]
-  return value === null || value === undefined || String(value).trim() === ''
-}
-
-const getUniqueLayerKeys = (items: PackageCartItem[]) => Array.from(new Set(items.map((item) => item.layerKey)))
-
-const getAttributeValue = (attributes: { [key: string]: any }, fieldName: string) => {
-  if (Object.prototype.hasOwnProperty.call(attributes, fieldName)) return attributes[fieldName]
-  const matchingField = Object.keys(attributes).find((key) => key.toLowerCase() === fieldName.toLowerCase())
-  return matchingField ? attributes[matchingField] : undefined
-}
-
-const getFeatureObjectId = (attributes: { [key: string]: any }, objectIdFieldName?: string) =>
-  getAttributeValue(attributes, objectIdFieldName || 'OBJECTID') ??
-  getAttributeValue(attributes, 'OBJECTID') ??
-  getAttributeValue(attributes, 'FID')
-
-const getWorkCodeKeyFromAttributes = (attributes: { [key: string]: any }) => {
-  const value = getAttributeValue(attributes, WORK_CODE_FIELD)
-  return value === null || value === undefined ? 'null:' : `${typeof value}:${String(value)}`
-}
-
-const getWorkCodeKey = (item: PackageCartItem) => getWorkCodeKeyFromAttributes(item.attributes || {})
-
-const filterByWorkCode = (items: PackageCartItem[], workCodeKey: string) =>
-  items.filter((item) => getWorkCodeKey(item) === workCodeKey)
-
-const getPropertyNameKeyFromAttributes = (attributes: { [key: string]: any }) => {
-  const value = getAttributeValue(attributes, PROPERTY_NAME_FIELD)
-  return value === null || value === undefined ? 'null:' : `${typeof value}:${String(value)}`
-}
-
-const getPropertyNameKey = (item: PackageCartItem) => getPropertyNameKeyFromAttributes(item.attributes || {})
-
-const filterByPropertyName = (items: PackageCartItem[], propertyNameKey: string) =>
-  items.filter((item) => getPropertyNameKey(item) === propertyNameKey)
-
-const getGeneratedPackageId = (attributes: { [key: string]: any }, date = new Date()) => {
-  const propertyName = getAttributeValue(attributes, PROPERTY_NAME_FIELD)
-  const workCode = getAttributeValue(attributes, WORK_CODE_FIELD)
-  if (
-    propertyName === null ||
-    propertyName === undefined ||
-    String(propertyName).trim() === '' ||
-    workCode === null ||
-    workCode === undefined ||
-    String(workCode).trim() === ''
-  ) return ''
-
-  const pad = (value: number) => String(value).padStart(2, '0')
-  const datePart = `${pad(date.getMonth() + 1)}${pad(date.getDate())}${pad(date.getFullYear() % 100)}`
-  const timePart = `${pad(date.getHours())}${pad(date.getMinutes())}`
-  return `${String(propertyName).trim().toUpperCase()}-${String(workCode).trim()}-${datePart}-${timePart}`
-}
-
-const getNullableAttributeValue = (attributes: { [key: string]: any }, fieldName: string) => {
-  const value = getAttributeValue(attributes, fieldName)
-  return value === undefined ? null : value
-}
-
-const getAimObjectId = (objectId: string | number) => {
-  if (typeof objectId === 'number') return objectId
-  const numericObjectId = Number(objectId)
-  return Number.isNaN(numericObjectId) ? objectId : numericObjectId
-}
-
-const getAimWorkOrderPayload = (items: PackageCartItem[]) => ({
-  department: 'OM',
-  facId: 'ROAD',
-  propertyName: getNullableAttributeValue(items[0]?.attributes || {}, PROPERTY_NAME_FIELD),
-  entClerk: 'Test User',
-  caseNumber: null,
-  features: items.map((item) => {
-    const attributes = item.attributes || {}
-    return {
-      objectId: getAimObjectId(item.objectId),
-      locationCode: getNullableAttributeValue(attributes, 'locationCode'),
-      workCode: getNullableAttributeValue(attributes, WORK_CODE_FIELD),
-      repairRecommendation: getNullableAttributeValue(attributes, 'repairRecommendation'),
-      estimatedWorkQuantity: getNullableAttributeValue(attributes, 'estimatedWorkQuantity'),
-      workUnit: getNullableAttributeValue(attributes, 'workUnit'),
-      deficiencyLocation: getNullableAttributeValue(attributes, 'deficiencyLocation'),
-      latitude: getNullableAttributeValue(attributes, 'latitude'),
-      longitude: getNullableAttributeValue(attributes, 'longitude'),
-      inspector: getNullableAttributeValue(attributes, 'inspector'),
-      dimensions: getNullableAttributeValue(attributes, 'dimensions')
-    }
-  })
-})
-
-const formatDateValue = (value: any) => {
-  if (value === null || value === undefined || String(value).trim() === '') return '-'
-  const date = new Date(value)
-  return Number.isNaN(date.getTime())
-    ? String(value)
-    : new Intl.DateTimeFormat('en-US', { month: 'numeric', day: 'numeric', year: 'numeric' }).format(date)
-}
 
 const Widget = (props: AllWidgetProps<IMConfig>) => {
   const h = React.createElement
@@ -248,6 +55,7 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
   const [error, setError] = React.useState<string | null>(null)
   const [selectedPackage, setSelectedPackage] = React.useState<SelectedPackage | null>(null)
   const [isCreateConfirmationOpen, setIsCreateConfirmationOpen] = React.useState(false)
+  const [isCreateWorkOrderConfirmationOpen, setIsCreateWorkOrderConfirmationOpen] = React.useState(false)
   const [isDeleteConfirmationOpen, setIsDeleteConfirmationOpen] = React.useState(false)
   const [phasePendingRemoval, setPhasePendingRemoval] = React.useState<PackageCartItem | null>(null)
   const [status, setStatus] = React.useState<string | null>(null)
@@ -259,16 +67,19 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
   const [draftPackageId, setDraftPackageId] = React.useState('')
   const [skipPackagedAssets, setSkipPackagedAssets] = React.useState(true)
   const [uniqueWorkCodes, setUniqueWorkCodes] = React.useState(true)
-  const [propertyIdsMustMatch, setPropertyIdsMustMatch] = React.useState(true)
+  const [propertyNamesMustMatch, setPropertyNamesMustMatch] = React.useState(true)
   const [cartItems, setCartItems] = React.useState<PackageCartItem[]>([])
   const [packagePhaseItems, setPackagePhaseItems] = React.useState<PackageCartItem[]>([])
   const [selectedPackagePhaseKey, setSelectedPackagePhaseKey] = React.useState<string | null>(null)
   const [modifySelectionItems, setModifySelectionItems] = React.useState<PackageCartItem[]>([])
   const [modifySkipPackagedAssets, setModifySkipPackagedAssets] = React.useState(true)
   const [modifyUniqueWorkCodes, setModifyUniqueWorkCodes] = React.useState(true)
-  const [modifyPropertyIdsMustMatch, setModifyPropertyIdsMustMatch] = React.useState(true)
+  const [modifyPropertyNamesMustMatch, setModifyPropertyNamesMustMatch] = React.useState(true)
+  const [stagedWorkOrderFile, setStagedWorkOrderFile] = React.useState<File | null>(null)
+  const [workOrderApiResponse, setWorkOrderApiResponse] = React.useState<WorkOrderApiResponse | null>(null)
   const [loadingPackagePhases, setLoadingPackagePhases] = React.useState(false)
   const [submittingPackagePhases, setSubmittingPackagePhases] = React.useState(false)
+  const [submittingWorkOrder, setSubmittingWorkOrder] = React.useState(false)
   const [cartQueryResults, setCartQueryResults] = React.useState<CartLayerQueryResult[]>([])
   const [pendingSelectionRemovalKeys, setPendingSelectionRemovalKeys] = React.useState<string[]>([])
   const [submittingPackage, setSubmittingPackage] = React.useState(false)
@@ -277,6 +88,7 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
   const packageIdWasEditedRef = React.useRef(false)
   const generatedPackageIdRef = React.useRef('')
   const generatedPackageSourceKeyRef = React.useRef('')
+  const workOrderFileInputRef = React.useRef<HTMLInputElement>(null)
   const highlightLayerRef = React.useRef<any>(null)
   const highlightMapRef = React.useRef<any>(null)
   const cartGraphicsLayerRef = React.useRef<any>(null)
@@ -474,6 +286,18 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
   const cartKeys = React.useMemo(() => new Set(cartItems.map((item) => item.key)), [cartItems])
   const cartLayerKey = cartItems[0]?.layerKey || null
   const cartLayerName = cartItems[0]?.layerName || null
+  const packageWorkCodeKeys = React.useMemo(
+    () => Array.from(new Set(packagePhaseItems.map((item) => getWorkCodeKey(item)))),
+    [packagePhaseItems]
+  )
+  const packagePropertyNameKeys = React.useMemo(
+    () => Array.from(new Set(packagePhaseItems.map((item) => getPropertyNameKey(item)))),
+    [packagePhaseItems]
+  )
+  const packageWorkCodeConflict = packageWorkCodeKeys.length > 1
+  const packagePropertyNameConflict = packagePropertyNameKeys.length > 1
+  const packageWorkCodeKey = packageWorkCodeKeys.length === 1 ? packageWorkCodeKeys[0] : null
+  const packagePropertyNameKey = packagePropertyNameKeys.length === 1 ? packagePropertyNameKeys[0] : null
 
   const addItemsToCart = React.useCallback((items: PackageCartItem[]) => {
     if (items.length === 0) {
@@ -498,18 +322,18 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
       const workCodeFilteredItems = uniqueWorkCodes && lockedWorkCodeKey
         ? filterByWorkCode(newItems, lockedWorkCodeKey)
         : newItems
-      const lockedPropertyIdKey = current[0] ? getPropertyNameKey(current[0]) : newItems[0] ? getPropertyNameKey(newItems[0]) : null
-      const additions = propertyIdsMustMatch && lockedPropertyIdKey
-        ? filterByPropertyName(workCodeFilteredItems, lockedPropertyIdKey)
+      const lockedPropertyNameKey = current[0] ? getPropertyNameKey(current[0]) : newItems[0] ? getPropertyNameKey(newItems[0]) : null
+      const additions = propertyNamesMustMatch && lockedPropertyNameKey
+        ? filterByPropertyName(workCodeFilteredItems, lockedPropertyNameKey)
         : workCodeFilteredItems
       if (additions.length === 0) {
-        setStatus(propertyIdsMustMatch && workCodeFilteredItems.length > 0 ? m.selectionPropertyIdMismatch : newItems.length > 0 && uniqueWorkCodes ? m.selectionWorkCodeMismatch : m.selectionAlreadyInCart)
+        setStatus(propertyNamesMustMatch && workCodeFilteredItems.length > 0 ? m.selectionPropertyNameMismatch : newItems.length > 0 && uniqueWorkCodes ? m.selectionWorkCodeMismatch : m.selectionAlreadyInCart)
         return current
       }
       setStatus(`${m.addedSelectionToCart} ${additions.length}`)
       return [...current, ...additions]
     })
-  }, [cartItems, m.addedSelectionToCart, m.selectionAlreadyInCart, m.selectionLayerMismatch, m.selectionMustBeSingleLayer, m.selectionPropertyIdMismatch, m.selectionWorkCodeMismatch, m.targetLayer, propertyIdsMustMatch, uniqueWorkCodes])
+  }, [cartItems, m.addedSelectionToCart, m.selectionAlreadyInCart, m.selectionLayerMismatch, m.selectionMustBeSingleLayer, m.selectionPropertyNameMismatch, m.selectionWorkCodeMismatch, m.targetLayer, propertyNamesMustMatch, uniqueWorkCodes])
 
   React.useEffect(() => {
     if (isCreateMode && skipPackagedAssets) {
@@ -524,10 +348,10 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
   }, [isCreateMode, uniqueWorkCodes])
 
   React.useEffect(() => {
-    if (isCreateMode && propertyIdsMustMatch) {
+    if (isCreateMode && propertyNamesMustMatch) {
       setCartItems((current) => current[0] ? filterByPropertyName(current, getPropertyNameKey(current[0])) : current)
     }
-  }, [isCreateMode, propertyIdsMustMatch])
+  }, [isCreateMode, propertyNamesMustMatch])
 
   React.useEffect(() => {
     if (!isCreateMode || packageIdWasEditedRef.current) return
@@ -565,7 +389,15 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
   }, [addItemsToCart, cartKeys, cartLayerKey, currentSelectionItems, isCreateMode, packageField, pendingSelectionRemovalKeys, skipPackagedAssets])
 
   React.useEffect(() => {
-    if (!isModifyMode || !selectedPackage || pendingSelectionRemovalKeys.length > 0) return
+    if (!isModifyMode || !selectedPackage || loadingPackagePhases || pendingSelectionRemovalKeys.length > 0) return
+    if (modifyUniqueWorkCodes && packageWorkCodeConflict) {
+      setStatus(m.modifyPackageWorkCodeConflict)
+      return
+    }
+    if (modifyPropertyNamesMustMatch && packagePropertyNameConflict) {
+      setStatus(m.modifyPackagePropertyNameConflict)
+      return
+    }
     const packageLayerKey = getServiceLayerKey(selectedPackage.layerUrl)
     const phaseKeys = new Set(packagePhaseItems.map((item) => item.key))
     setModifySelectionItems((current) => {
@@ -577,17 +409,43 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
         item.layerKey === packageLayerKey &&
         !knownKeys.has(item.key)
       )
-      const lockedWorkCodeKey = current[0] ? getWorkCodeKey(current[0]) : newItems[0] ? getWorkCodeKey(newItems[0]) : null
+      const lockedWorkCodeKey = packageWorkCodeKey || (current[0] ? getWorkCodeKey(current[0]) : newItems[0] ? getWorkCodeKey(newItems[0]) : null)
       const workCodeFilteredItems = modifyUniqueWorkCodes && lockedWorkCodeKey
         ? filterByWorkCode(newItems, lockedWorkCodeKey)
         : newItems
-      const lockedPropertyIdKey = current[0] ? getPropertyNameKey(current[0]) : newItems[0] ? getPropertyNameKey(newItems[0]) : null
-      const additions = modifyPropertyIdsMustMatch && lockedPropertyIdKey
-        ? filterByPropertyName(workCodeFilteredItems, lockedPropertyIdKey)
+      const lockedPropertyNameKey = packagePropertyNameKey || (current[0] ? getPropertyNameKey(current[0]) : newItems[0] ? getPropertyNameKey(newItems[0]) : null)
+      const additions = modifyPropertyNamesMustMatch && lockedPropertyNameKey
+        ? filterByPropertyName(workCodeFilteredItems, lockedPropertyNameKey)
         : workCodeFilteredItems
+      if (additions.length < newItems.length) {
+        setStatus(
+          workCodeFilteredItems.length < newItems.length
+            ? m.modifySelectionWorkCodeMismatch
+            : m.modifySelectionPropertyNameMismatch
+        )
+      }
       return additions.length > 0 ? [...current, ...additions] : current
     })
-  }, [currentSelectionItems, isModifyMode, modifyPropertyIdsMustMatch, modifySkipPackagedAssets, modifyUniqueWorkCodes, packageField, packagePhaseItems, pendingSelectionRemovalKeys, selectedPackage])
+  }, [
+    currentSelectionItems,
+    isModifyMode,
+    loadingPackagePhases,
+    m.modifyPackagePropertyNameConflict,
+    m.modifyPackageWorkCodeConflict,
+    m.modifySelectionPropertyNameMismatch,
+    m.modifySelectionWorkCodeMismatch,
+    modifyPropertyNamesMustMatch,
+    modifySkipPackagedAssets,
+    modifyUniqueWorkCodes,
+    packageField,
+    packagePhaseItems,
+    packagePropertyNameConflict,
+    packagePropertyNameKey,
+    packageWorkCodeConflict,
+    packageWorkCodeKey,
+    pendingSelectionRemovalKeys,
+    selectedPackage
+  ])
 
   React.useEffect(() => {
     if (pendingSelectionRemovalKeys.length > 0) {
@@ -667,19 +525,23 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
     setDraftPackageId('')
     setSkipPackagedAssets(true)
     setUniqueWorkCodes(true)
-    setPropertyIdsMustMatch(true)
+    setPropertyNamesMustMatch(true)
     setPendingSelectionRemovalKeys([])
     setCartItems([])
     setCartQueryResults([])
   }
 
   const clearModifyDraft = () => {
+    setIsCreateWorkOrderConfirmationOpen(false)
+    setStagedWorkOrderFile(null)
+    setWorkOrderApiResponse(null)
+    if (workOrderFileInputRef.current) workOrderFileInputRef.current.value = ''
     setPackagePhaseItems([])
     setSelectedPackagePhaseKey(null)
     setModifySelectionItems([])
     setModifySkipPackagedAssets(true)
     setModifyUniqueWorkCodes(true)
-    setModifyPropertyIdsMustMatch(true)
+    setModifyPropertyNamesMustMatch(true)
     setLoadingPackagePhases(false)
     setSubmittingPackagePhases(false)
     phaseSelectionLayerRef.current?.removeAll?.()
@@ -753,6 +615,34 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
 
   const submitPackagePhases = async () => {
     if (!selectedPackage || modifySelectionItems.length === 0) return
+    if (modifyUniqueWorkCodes && packageWorkCodeConflict) {
+      setStatus(m.modifyPackageWorkCodeConflict)
+      return
+    }
+    if (modifyPropertyNamesMustMatch && packagePropertyNameConflict) {
+      setStatus(m.modifyPackagePropertyNameConflict)
+      return
+    }
+    if (
+      modifyUniqueWorkCodes &&
+      packageWorkCodeKey &&
+      modifySelectionItems.some((item) =>
+        getWorkCodeKeyFromAttributes(cartRestAttributes[item.key] || item.attributes) !== packageWorkCodeKey
+      )
+    ) {
+      setStatus(m.modifySelectionWorkCodeMismatch)
+      return
+    }
+    if (
+      modifyPropertyNamesMustMatch &&
+      packagePropertyNameKey &&
+      modifySelectionItems.some((item) =>
+        getPropertyNameKeyFromAttributes(cartRestAttributes[item.key] || item.attributes) !== packagePropertyNameKey
+      )
+    ) {
+      setStatus(m.modifySelectionPropertyNameMismatch)
+      return
+    }
     setSubmittingPackagePhases(true)
     setStatus(m.addingPackagePhases)
     try {
@@ -826,19 +716,6 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
         })
         const updated = await ds.updateRecords(records)
         if (!updated) throw new Error(`${m.packageCreateFailedForLayer} ${items[0]?.layerName || dataSourceId}`)
-      }
-
-      const aimResponse = await fetch(aimSubmitUrl, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json'
-        },
-        body: JSON.stringify(getAimWorkOrderPayload(cartItems)),
-        redirect: 'follow'
-      })
-      const aimResponseText = await aimResponse.text()
-      if (!aimResponse.ok) {
-        throw new Error(`${m.aimSubmitFailed} HTTP ${aimResponse.status}${aimResponseText ? `: ${aimResponseText}` : ''}`)
       }
 
       const createdCount = cartItems.length
@@ -990,6 +867,52 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
     setStatus(m.modifyModeCancelled)
   }
 
+  const openCreateWorkOrderConfirmation = () => {
+    setWorkOrderApiResponse(null)
+    setIsCreateWorkOrderConfirmationOpen(true)
+  }
+
+  const closeCreateWorkOrderConfirmation = () => {
+    if (submittingWorkOrder) return
+    setIsCreateWorkOrderConfirmationOpen(false)
+    setStagedWorkOrderFile(null)
+    setWorkOrderApiResponse(null)
+    if (workOrderFileInputRef.current) workOrderFileInputRef.current.value = ''
+  }
+
+  const confirmCreateWorkOrder = async () => {
+    if (!stagedWorkOrderFile) {
+      setStatus(m.workOrderFileRequired)
+      return
+    }
+    if (!selectedPackage || packagePhaseItems.length === 0) {
+      setStatus(m.workOrderRequiresFeatures)
+      return
+    }
+
+    setSubmittingWorkOrder(true)
+    setWorkOrderApiResponse(null)
+    setStatus(m.creatingWorkOrder)
+    try {
+      const aimResponse = await submitAimWorkOrder(aimSubmitUrl, packagePhaseItems)
+      setWorkOrderApiResponse({
+        ...aimResponse,
+        text: aimResponse.text || m.emptyApiResponse
+      })
+      if (!aimResponse.ok) {
+        throw new Error(`${m.aimSubmitFailed} HTTP ${aimResponse.status}${aimResponse.text ? `: ${aimResponse.text}` : ''}`)
+      }
+
+      setStatus(`${m.workOrderCreated} ${selectedPackage.id}`)
+    } catch (e) {
+      const message = e instanceof Error ? e.message : m.workOrderCreateFailed
+      setWorkOrderApiResponse((current) => current || { ok: false, text: message })
+      setStatus(message)
+    } finally {
+      setSubmittingWorkOrder(false)
+    }
+  }
+
   const openDeleteConfirmation = () => {
     if (!selectedPackage) {
       setStatus(m.deleteNeedsSelection)
@@ -1115,22 +1038,22 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
   }, [cartItems, cartRestAttributes, uniqueWorkCodes])
 
   React.useEffect(() => {
-    if (!propertyIdsMustMatch || cartItems.length === 0) return
+    if (!propertyNamesMustMatch || cartItems.length === 0) return
     const firstItemAttributes = cartRestAttributes[cartItems[0].key]
     if (!firstItemAttributes) return
 
-    const lockedPropertyIdKey = getPropertyNameKeyFromAttributes(firstItemAttributes)
+    const lockedPropertyNameKey = getPropertyNameKeyFromAttributes(firstItemAttributes)
     const rejectedItems = cartItems.filter((item) => {
       const restAttributes = cartRestAttributes[item.key]
-      return restAttributes && getPropertyNameKeyFromAttributes(restAttributes) !== lockedPropertyIdKey
+      return restAttributes && getPropertyNameKeyFromAttributes(restAttributes) !== lockedPropertyNameKey
     })
     if (rejectedItems.length === 0) return
 
     removeCartItemsFromSelection(rejectedItems)
     const rejectedKeys = new Set(rejectedItems.map((item) => item.key))
     setCartItems((current) => current.filter((item) => !rejectedKeys.has(item.key)))
-    setStatus(m.selectionPropertyIdMismatch)
-  }, [cartItems, cartRestAttributes, m.selectionPropertyIdMismatch, propertyIdsMustMatch])
+    setStatus(m.selectionPropertyNameMismatch)
+  }, [cartItems, cartRestAttributes, m.selectionPropertyNameMismatch, propertyNamesMustMatch])
 
   React.useEffect(() => {
     if (!isModifyMode || !modifySkipPackagedAssets || modifySelectionItems.length === 0) return
@@ -1149,8 +1072,14 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
 
   React.useEffect(() => {
     if (!isModifyMode || !modifyUniqueWorkCodes || modifySelectionItems.length === 0) return
+    if (packageWorkCodeConflict) {
+      removeCartItemsFromSelection(modifySelectionItems)
+      setModifySelectionItems([])
+      setStatus(m.modifyPackageWorkCodeConflict)
+      return
+    }
     const firstItemAttributes = cartRestAttributes[modifySelectionItems[0].key] || modifySelectionItems[0].attributes
-    const lockedWorkCodeKey = getWorkCodeKeyFromAttributes(firstItemAttributes)
+    const lockedWorkCodeKey = packageWorkCodeKey || getWorkCodeKeyFromAttributes(firstItemAttributes)
     const rejectedItems = modifySelectionItems.filter((item) => {
       const attributes = cartRestAttributes[item.key] || item.attributes
       return getWorkCodeKeyFromAttributes(attributes) !== lockedWorkCodeKey
@@ -1160,24 +1089,30 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
     removeCartItemsFromSelection(rejectedItems)
     const rejectedKeys = new Set(rejectedItems.map((item) => item.key))
     setModifySelectionItems((current) => current.filter((item) => !rejectedKeys.has(item.key)))
-    setStatus(m.selectionWorkCodeMismatch)
-  }, [cartRestAttributes, isModifyMode, m.selectionWorkCodeMismatch, modifySelectionItems, modifyUniqueWorkCodes])
+    setStatus(m.modifySelectionWorkCodeMismatch)
+  }, [cartRestAttributes, isModifyMode, m.modifyPackageWorkCodeConflict, m.modifySelectionWorkCodeMismatch, modifySelectionItems, modifyUniqueWorkCodes, packageWorkCodeConflict, packageWorkCodeKey])
 
   React.useEffect(() => {
-    if (!isModifyMode || !modifyPropertyIdsMustMatch || modifySelectionItems.length === 0) return
+    if (!isModifyMode || !modifyPropertyNamesMustMatch || modifySelectionItems.length === 0) return
+    if (packagePropertyNameConflict) {
+      removeCartItemsFromSelection(modifySelectionItems)
+      setModifySelectionItems([])
+      setStatus(m.modifyPackagePropertyNameConflict)
+      return
+    }
     const firstItemAttributes = cartRestAttributes[modifySelectionItems[0].key] || modifySelectionItems[0].attributes
-    const lockedPropertyIdKey = getPropertyNameKeyFromAttributes(firstItemAttributes)
+    const lockedPropertyNameKey = packagePropertyNameKey || getPropertyNameKeyFromAttributes(firstItemAttributes)
     const rejectedItems = modifySelectionItems.filter((item) => {
       const attributes = cartRestAttributes[item.key] || item.attributes
-      return getPropertyNameKeyFromAttributes(attributes) !== lockedPropertyIdKey
+      return getPropertyNameKeyFromAttributes(attributes) !== lockedPropertyNameKey
     })
     if (rejectedItems.length === 0) return
 
     removeCartItemsFromSelection(rejectedItems)
     const rejectedKeys = new Set(rejectedItems.map((item) => item.key))
     setModifySelectionItems((current) => current.filter((item) => !rejectedKeys.has(item.key)))
-    setStatus(m.selectionPropertyIdMismatch)
-  }, [cartRestAttributes, isModifyMode, m.selectionPropertyIdMismatch, modifyPropertyIdsMustMatch, modifySelectionItems])
+    setStatus(m.modifySelectionPropertyNameMismatch)
+  }, [cartRestAttributes, isModifyMode, m.modifyPackagePropertyNameConflict, m.modifySelectionPropertyNameMismatch, modifyPropertyNamesMustMatch, modifySelectionItems, packagePropertyNameConflict, packagePropertyNameKey])
 
   const ensureHighlightLayer = async () => {
     if (!jimuMapView?.view?.map) throw new Error(m.mapNotConfigured)
@@ -1579,18 +1514,22 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
     const workCode = workCodeValue === null || workCodeValue === undefined || String(workCodeValue).trim() === ''
       ? '-'
       : String(workCodeValue)
-    const propertyIdValue = getAttributeValue(restAttributes, PROPERTY_ID_FIELD) ?? getAttributeValue(item.attributes || {}, PROPERTY_ID_FIELD)
-    const propertyId = propertyIdValue === null || propertyIdValue === undefined || String(propertyIdValue).trim() === ''
+    const inspectorValue = getAttributeValue(restAttributes, INSPECTOR_FIELD) ?? getAttributeValue(item.attributes || {}, INSPECTOR_FIELD)
+    const inspector = inspectorValue === null || inspectorValue === undefined || String(inspectorValue).trim() === ''
       ? '-'
-      : String(propertyIdValue)
+      : String(inspectorValue)
     const dateInspected = formatDateValue(
       getAttributeValue(restAttributes, CREATED_DATE_FIELD) ?? getAttributeValue(item.attributes || {}, CREATED_DATE_FIELD)
     )
+    const propertyNameValue = getAttributeValue(restAttributes, PROPERTY_NAME_FIELD) ?? getAttributeValue(item.attributes || {}, PROPERTY_NAME_FIELD)
+    const propertyName = propertyNameValue === null || propertyNameValue === undefined || String(propertyNameValue).trim() === ''
+      ? '-'
+      : String(propertyNameValue)
     const primaryText = showPropertyMetadata
-      ? `${getRecordLabel(item.attributes, item.objectId)} | ${dateInspected}`
+      ? `${getRecordLabel(item.attributes, item.objectId)} | ${dateInspected} | ${propertyName}`
       : getRecordLabel(item.attributes, item.objectId)
     const metadata = showPropertyMetadata
-      ? `${m.objectIdPrefix} ${item.objectId} | ${m.workCodePrefix} ${workCode} | ${m.propertyIdPrefix} ${propertyId}`
+      ? `${m.objectIdPrefix} ${item.objectId} | ${m.workCodePrefix} ${workCode} | ${m.inspectorPrefix} ${inspector}`
       : `${m.objectIdPrefix} ${item.objectId} | ${m.workCodePrefix} ${workCode} | ${m.dateInspectedPrefix} ${dateInspected}`
 
     const isSelectedPhase = item.key === selectedPackagePhaseKey
@@ -1650,8 +1589,7 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
     if (itemGroups.length === 0) return h('div', { style: { fontSize: 12, opacity: 0.75 } }, emptyMessage)
     return h(React.Fragment, null,
       ...itemGroups.map((group) =>
-        h('div', { key: group.layerName, className: 'mb-2' },
-          h('div', { className: 'font-weight-bold mb-1', style: { fontSize: 12 } }, `${group.layerName} (${group.items.length})`),
+        h('div', { key: group.layerName },
           ...group.items.map((item) => itemRow(item, onRemove, onAction, onSelect, showPropertyMetadata))
         )
       )
@@ -1705,12 +1643,12 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
         ),
         h('label', { className: 'd-flex align-items-center mb-0', style: { gap: '0.5rem', fontSize: 12 } },
           h(Checkbox, {
-            checked: propertyIdsMustMatch,
+            checked: propertyNamesMustMatch,
             onChange: (_evt, checked) => {
-              setPropertyIdsMustMatch(Boolean(checked))
+              setPropertyNamesMustMatch(Boolean(checked))
             }
           }),
-          h('span', null, m.propertyIdsMustMatch)
+          h('span', null, m.propertyNamesMustMatch)
         )
       ),
       h('div', { className: 'border rounded p-2 d-flex flex-column flex-grow-1', style: { minHeight: 0 } },
@@ -1772,12 +1710,12 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
         ),
         h('label', { className: 'd-flex align-items-center mb-0', style: { gap: '0.5rem', fontSize: 12 } },
           h(Checkbox, {
-            checked: modifyPropertyIdsMustMatch,
+            checked: modifyPropertyNamesMustMatch,
             onChange: (_evt, checked) => {
-              setModifyPropertyIdsMustMatch(Boolean(checked))
+              setModifyPropertyNamesMustMatch(Boolean(checked))
             }
           }),
-          h('span', null, m.propertyIdsMustMatch)
+          h('span', null, m.propertyNamesMustMatch)
         )
       ),
       h('div', { className: 'border rounded p-2 d-flex flex-column', style: { minHeight: 100, flex: '7 1 0' } },
@@ -1786,7 +1724,24 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
           h('div', { style: { fontSize: 11, opacity: 0.75 } }, `${modifySelectionItems.length} ${m.stagedFeaturesCountSuffix}`)
         ),
         h('div', { className: 'flex-grow-1', style: { minHeight: 0, overflowY: 'auto', overflowX: 'hidden' } },
-          groupedItemsPanel(modifySelectionItems, m.selectFeaturesEmpty, removeModifySelectionItem)
+          groupedItemsPanel(modifySelectionItems, m.selectFeaturesEmpty, removeModifySelectionItem, undefined, undefined, true)
+        ),
+        h('div', { className: 'd-flex mt-2', style: { gap: '0.5rem' } },
+          h(Button, {
+            type: 'default',
+            onClick: clearModifySelection,
+            disabled: modifySelectionItems.length === 0
+          }, m.clearCart),
+          h(Button, {
+            type: 'primary',
+            disabled: modifySelectionItems.length === 0 ||
+              submittingPackagePhases ||
+              (modifyUniqueWorkCodes && packageWorkCodeConflict) ||
+              (modifyPropertyNamesMustMatch && packagePropertyNameConflict),
+            onClick: () => {
+              submitPackagePhases().catch(() => undefined)
+            }
+          }, submittingPackagePhases ? m.addingPackagePhases : m.addPhases)
         )
       ),
       h('div', { className: 'border rounded p-2 d-flex flex-column', style: { minHeight: 100, flex: '13 1 0' } },
@@ -1802,19 +1757,26 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
             }, true)
         )
       ),
+      status && h(Alert, {
+        form: 'basic',
+        type: (modifyUniqueWorkCodes && packageWorkCodeConflict) ||
+          (modifyPropertyNamesMustMatch && packagePropertyNameConflict)
+          ? 'warning'
+          : 'info',
+        text: status
+      }),
       h('div', { className: 'd-flex', style: { gap: '0.5rem' } },
         h(Button, {
           type: 'default',
-          onClick: clearModifySelection,
-          disabled: modifySelectionItems.length === 0
-        }, m.clearCart),
+          onClick: () => {
+            setStatus(m.createReportPending)
+          }
+        }, m.createReport),
         h(Button, {
           type: 'primary',
-          disabled: modifySelectionItems.length === 0 || submittingPackagePhases,
-          onClick: () => {
-            submitPackagePhases().catch(() => undefined)
-          }
-        }, submittingPackagePhases ? m.addingPackagePhases : m.addPhases)
+          onClick: openCreateWorkOrderConfirmation,
+          disabled: loadingPackagePhases || packagePhaseItems.length === 0 || submittingWorkOrder
+        }, m.createWorkOrder)
       )
     )
 
@@ -1913,6 +1875,89 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
     h(ModalFooter, null,
       h(Button, { type: 'default', onClick: closeCreateConfirmation, disabled: submittingPackage }, m.cancel),
       h(Button, { type: 'primary', onClick: confirmCreatePackage, disabled: submittingPackage }, m.confirmCreatePackage)
+    )),
+    h(Modal, {
+      isOpen: isCreateWorkOrderConfirmationOpen,
+      toggle: closeCreateWorkOrderConfirmation,
+      centered: true,
+      backdrop: 'static'
+    },
+    h(ModalHeader, { toggle: closeCreateWorkOrderConfirmation }, m.createWorkOrderConfirmationTitle),
+    h(ModalBody, null,
+      h(Alert, { form: 'basic', type: 'warning', text: m.createWorkOrderConfirmationWarning }),
+      h('div', { className: 'mt-2', style: { fontSize: 13 } },
+        `${m.deleteConfirmationPackageLabel} ${selectedPackage?.id || ''}`
+      ),
+      h('div', { className: 'mt-1', style: { fontSize: 13 } },
+        `${m.createWorkOrderFeatureCountLabel} ${packagePhaseItems.length}`
+      ),
+      h('div', { className: 'mt-3' },
+        h('label', {
+          htmlFor: `${props.id}-work-order-file`,
+          className: 'mb-2',
+          style: { display: 'block', fontSize: 12, fontWeight: 600 }
+        }, m.workOrderFileLabel),
+        h('input', {
+          ref: workOrderFileInputRef,
+          id: `${props.id}-work-order-file`,
+          type: 'file',
+          accept: 'application/pdf,image/*',
+          onChange: (evt: React.ChangeEvent<HTMLInputElement>) => {
+            const file = evt.target.files?.[0] || null
+            const isAccepted = file && (
+              file.type === 'application/pdf' ||
+              file.type.startsWith('image/') ||
+              /\.pdf$/i.test(file.name)
+            )
+            if (file && !isAccepted) {
+              evt.target.value = ''
+              setStagedWorkOrderFile(null)
+              setStatus(m.workOrderFileTypeInvalid)
+              return
+            }
+            setStagedWorkOrderFile(file)
+            setWorkOrderApiResponse(null)
+          },
+          style: { display: 'block', width: '100%', fontSize: 12 }
+        }),
+        !stagedWorkOrderFile && h('div', {
+          className: 'mt-2',
+          style: { fontSize: 12, color: 'var(--sys-color-error-main)' }
+        }, m.workOrderFileRequired)
+      ),
+      h('div', { className: 'mt-3', style: { fontSize: 12, opacity: 0.8, lineHeight: 1.45 } }, m.createWorkOrderConfirmationDetail),
+      workOrderApiResponse && h('div', { className: 'mt-3' },
+        h(Alert, {
+          form: 'basic',
+          type: workOrderApiResponse.ok ? 'success' : 'warning',
+          text: workOrderApiResponse.ok ? m.workOrderApiSuccess : m.workOrderApiFailure
+        }),
+        h('div', { className: 'mt-2', style: { fontSize: 12, fontWeight: 600 } },
+          workOrderApiResponse.status
+            ? `${m.workOrderApiStatus} ${workOrderApiResponse.status}`
+            : m.workOrderApiNetworkError
+        ),
+        h('pre', {
+          className: 'mt-2 mb-0 p-2 border rounded',
+          style: {
+            maxHeight: 180,
+            overflow: 'auto',
+            whiteSpace: 'pre-wrap',
+            overflowWrap: 'anywhere',
+            fontSize: 11
+          }
+        }, workOrderApiResponse.text)
+      )
+    ),
+    h(ModalFooter, null,
+      h(Button, { type: 'default', onClick: closeCreateWorkOrderConfirmation, disabled: submittingWorkOrder }, workOrderApiResponse?.ok ? m.close : m.cancel),
+      !workOrderApiResponse?.ok && h(Button, {
+        type: 'primary',
+        onClick: () => {
+          confirmCreateWorkOrder().catch(() => undefined)
+        },
+        disabled: !stagedWorkOrderFile || submittingWorkOrder
+      }, submittingWorkOrder ? m.creatingWorkOrder : workOrderApiResponse ? m.retryCreateWorkOrder : m.confirmCreateWorkOrder)
     )),
     h(Modal, {
       isOpen: isDeleteConfirmationOpen,
