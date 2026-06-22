@@ -1,7 +1,7 @@
 import { DataSourceManager, React, ReactRedux } from 'jimu-core'
 import type { AllWidgetProps, IMState } from 'jimu-core'
 import { JimuMapViewComponent, loadArcGISJSAPIModules } from 'jimu-arcgis'
-import { Alert, Button, Card, CardBody, CardHeader, Checkbox, Modal, ModalBody, ModalFooter, ModalHeader, TextInput } from 'jimu-ui'
+import { Alert, Button, Card, CardBody, CardHeader, Checkbox, Modal, ModalBody, ModalFooter, ModalHeader, Option, Select, TextInput } from 'jimu-ui'
 import defaultMessages from './translations/default'
 import { submitAimWorkOrder } from './aim-api'
 import { generatePackageReport, renderReportError } from './report-service'
@@ -45,6 +45,25 @@ import type {
 import { DEFAULT_AIM_SUBMIT_URL } from '../config'
 import type { IMConfig } from '../config'
 
+interface LayerFieldInfo {
+  name: string
+  alias?: string
+  type?: string
+  domain?: {
+    codedValues?: Array<{
+      name?: string
+      code?: any
+    }>
+  }
+}
+
+const PACKAGE_ID_SEARCH_FIELD = 'PCKGID'
+const WORK_ORDER_NUMBER_SEARCH_FIELD = 'WorkOrderNumber'
+const REPAIR_COMPLETED_DATE_FIELD = 'RepairCompletedDate'
+const AIM_STATUS_FIELD = 'AIMStatus'
+const PACKAGE_SEARCH_MINIMUM_LENGTH = 3
+const PACKAGE_SEARCH_DEBOUNCE_MS = 450
+
 const Widget = (props: AllWidgetProps<IMConfig>) => {
   const h = React.createElement
   const m = defaultMessages
@@ -62,9 +81,12 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
   const [status, setStatus] = React.useState<string | null>(null)
   const [groups, setGroups] = React.useState<Array<{ layerUrl: string, layerName: string, packages: PackageSummary[] }>>([])
   const [activeLayerUrl, setActiveLayerUrl] = React.useState<string | null>(null)
+  const [packageSearchTerm, setPackageSearchTerm] = React.useState('')
+  const [searchingPackages, setSearchingPackages] = React.useState(false)
   const [jimuMapView, setJimuMapView] = React.useState<any>(null)
   const [isCreateMode, setIsCreateMode] = React.useState(false)
   const [isModifyMode, setIsModifyMode] = React.useState(false)
+  const [isReviewWorkOrderMode, setIsReviewWorkOrderMode] = React.useState(false)
   const [draftPackageId, setDraftPackageId] = React.useState('')
   const [skipPackagedAssets, setSkipPackagedAssets] = React.useState(true)
   const [uniqueWorkCodes, setUniqueWorkCodes] = React.useState(true)
@@ -78,6 +100,11 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
   const [modifyPropertyNamesMustMatch, setModifyPropertyNamesMustMatch] = React.useState(true)
   const [stagedWorkOrderFile, setStagedWorkOrderFile] = React.useState<File | null>(null)
   const [workOrderApiResponse, setWorkOrderApiResponse] = React.useState<WorkOrderApiResponse | null>(null)
+  const [workOrderStatusOptions, setWorkOrderStatusOptions] = React.useState<Array<{ label: string, value: string }>>([])
+  const [selectedWorkOrderStatus, setSelectedWorkOrderStatus] = React.useState('')
+  const [defaultWorkOrderStatus, setDefaultWorkOrderStatus] = React.useState('')
+  const [selectedWorkOrderPhaseKeys, setSelectedWorkOrderPhaseKeys] = React.useState<string[]>([])
+  const [isUpdateStatusConfirmationOpen, setIsUpdateStatusConfirmationOpen] = React.useState(false)
   const [loadingPackagePhases, setLoadingPackagePhases] = React.useState(false)
   const [submittingPackagePhases, setSubmittingPackagePhases] = React.useState(false)
   const [submittingWorkOrder, setSubmittingWorkOrder] = React.useState(false)
@@ -90,6 +117,7 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
   const packageIdWasEditedRef = React.useRef(false)
   const generatedPackageIdRef = React.useRef('')
   const generatedPackageSourceKeyRef = React.useRef('')
+  const packageSearchInitializedRef = React.useRef(false)
   const workOrderFileInputRef = React.useRef<HTMLInputElement>(null)
   const highlightLayerRef = React.useRef<any>(null)
   const highlightMapRef = React.useRef<any>(null)
@@ -535,11 +563,16 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
 
   const clearModifyDraft = () => {
     setIsCreateWorkOrderConfirmationOpen(false)
+    setIsUpdateStatusConfirmationOpen(false)
     setStagedWorkOrderFile(null)
     setWorkOrderApiResponse(null)
     if (workOrderFileInputRef.current) workOrderFileInputRef.current.value = ''
     setPackagePhaseItems([])
     setSelectedPackagePhaseKey(null)
+    setWorkOrderStatusOptions([])
+    setSelectedWorkOrderStatus('')
+    setDefaultWorkOrderStatus('')
+    setSelectedWorkOrderPhaseKeys([])
     setModifySelectionItems([])
     setModifySkipPackagedAssets(true)
     setModifyUniqueWorkCodes(true)
@@ -559,6 +592,7 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
     clearHighlightedFeatures()
     setSelectedPackage(null)
     setIsModifyMode(false)
+    setIsReviewWorkOrderMode(false)
     setIsCreateMode(true)
     setStatus(m.createModeStarted)
   }
@@ -612,6 +646,15 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
     fontSize: 11,
     lineHeight: '14px',
     whiteSpace: 'normal',
+    textAlign: 'center'
+  }
+
+  const modeActionButtonStyle = {
+    height: 30,
+    padding: '0 10px',
+    fontSize: 11,
+    lineHeight: '14px',
+    whiteSpace: 'nowrap',
     textAlign: 'center'
   }
 
@@ -732,15 +775,103 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
     }
   }
 
-  const loadLayerPackages = React.useCallback(async (layerUrl: string): Promise<PackageSummary[]> => {
+  const escapeSqlString = (value: string) => value.replace(/'/g, "''")
+
+  const escapeSqlLikeString = (value: string) => escapeSqlString(value).replace(/[%_]/g, (match) => `\\${match}`)
+
+  const normalizeFieldName = (value?: string) => String(value || '').replace(/[^a-z0-9]/gi, '').toLowerCase()
+
+  const isStringField = (field?: LayerFieldInfo) => {
+    const type = String(field?.type || '').toLowerCase()
+    return !type || type.includes('string') || type.includes('guid') || type.includes('globalid')
+  }
+
+  const isNumericField = (field?: LayerFieldInfo) => {
+    const type = String(field?.type || '').toLowerCase()
+    return type.includes('integer') || type.includes('smallinteger') || type.includes('double') || type.includes('single') || type.includes('oid')
+  }
+
+  const getLayerFields = async (layerUrl: string): Promise<LayerFieldInfo[]> => {
+    const q = new URL(layerUrl)
+    q.search = new URLSearchParams({ f: 'json' }).toString()
+    const r = await fetch(q.toString())
+    const d = await r.json()
+    if (!r.ok || d.error) throw new Error(d.error?.message || r.statusText)
+    return Array.isArray(d.fields) ? d.fields : []
+  }
+
+  const findLayerField = (fields: LayerFieldInfo[], fieldName: string) =>
+    fields.find((field) => normalizeFieldName(field.name) === normalizeFieldName(fieldName))
+
+  const getStatusOptionsFromFields = (fields: LayerFieldInfo[]) => {
+    const statusField = findLayerField(fields, 'Status')
+    return (statusField?.domain?.codedValues || []).map((codedValue) => ({
+      label: displayOptionalValue(codedValue.name ?? codedValue.code),
+      value: String(codedValue.code ?? '')
+    })).filter((option) => option.value.trim() !== '')
+  }
+
+  const resolvePackageStatusValue = (
+    phaseItems: PackageCartItem[],
+    statusOptions: Array<{ label: string, value: string }>
+  ) => {
+    if (phaseItems.length === 0 || statusOptions.length === 0) return ''
+
+    const domainValues = new Set(statusOptions.map((option) => option.value))
+    let resolvedStatus: string | null = null
+
+    for (const phaseItem of phaseItems) {
+      const rawStatus = getAttributeValue(phaseItem.attributes || {}, 'Status')
+      const statusValue = rawStatus === null || rawStatus === undefined ? '' : String(rawStatus)
+      if (statusValue.trim() === '' || !domainValues.has(statusValue)) return ''
+      if (resolvedStatus === null) {
+        resolvedStatus = statusValue
+      } else if (resolvedStatus !== statusValue) {
+        return ''
+      }
+    }
+
+    return resolvedStatus || ''
+  }
+
+  const getSearchWhereClause = (
+    searchText: string,
+    searchFields: LayerFieldInfo[]
+  ) => {
+    const trimmed = searchText.trim()
+    if (trimmed.length < PACKAGE_SEARCH_MINIMUM_LENGTH) return ''
+
+    const escapedLikeValue = `%${escapeSqlLikeString(trimmed).toUpperCase()}%`
+    const exactNumberValue = Number(trimmed)
+    const clauses: string[] = []
+
+    searchFields.forEach((field) => {
+      if (isStringField(field)) {
+        clauses.push(`UPPER(${field.name}) LIKE '${escapedLikeValue}' ESCAPE '\\'`)
+      } else if (isNumericField(field) && !Number.isNaN(exactNumberValue)) {
+        clauses.push(`${field.name} = ${exactNumberValue}`)
+      }
+    })
+
+    return clauses.length ? ` AND (${clauses.join(' OR ')})` : ''
+  }
+
+  const loadLayerPackages = React.useCallback(async (layerUrl: string, searchText = ''): Promise<PackageSummary[]> => {
+    const fields = await getLayerFields(layerUrl)
+    const searchFields = [
+      findLayerField(fields, PACKAGE_ID_SEARCH_FIELD),
+      findLayerField(fields, WORK_ORDER_NUMBER_SEARCH_FIELD)
+    ].filter(Boolean) as LayerFieldInfo[]
+    const searchWhereClause = getSearchWhereClause(searchText, searchFields)
+    const outFieldNames = Array.from(new Set([packageField, ...searchFields.map((field) => field.name)]))
     const packageCounts = new Map<string, number>()
     let offset = 0
     let hasMore = true
     while (hasMore) {
       const q = new URL(layerUrl + '/query')
       q.search = new URLSearchParams({
-        where: `${packageField} IS NOT NULL AND ${packageField} <> ''`,
-        outFields: packageField,
+        where: `${packageField} IS NOT NULL AND ${packageField} <> ''${searchWhereClause}`,
+        outFields: outFieldNames.join(','),
         returnGeometry: 'false',
         f: 'json',
         orderByFields: packageField,
@@ -767,8 +898,6 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
       .map(([id, featureCount]) => ({ id, featureCount }))
       .sort((a, b) => a.id.localeCompare(b.id))
   }, [packageField])
-
-  const escapeSqlString = (value: string) => value.replace(/'/g, "''")
 
   const queryPackageFeatures = async (layerUrl: string, pkg: string): Promise<QueryResponse> => {
     const allFeatures: QueryFeature[] = []
@@ -840,11 +969,25 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
     if (!selectedPackage) return
     setLoadingPackagePhases(true)
     try {
-      const result = await queryPackageFeatures(selectedPackage.layerUrl, selectedPackage.id)
-      setPackagePhaseItems(buildPackagePhaseItems(selectedPackage.layerUrl, result))
+      const [result, fields] = await Promise.all([
+        queryPackageFeatures(selectedPackage.layerUrl, selectedPackage.id),
+        getLayerFields(selectedPackage.layerUrl)
+      ])
+      const phaseItems = buildPackagePhaseItems(selectedPackage.layerUrl, result)
+      const statusOptions = getStatusOptionsFromFields(fields)
+      const resolvedStatus = resolvePackageStatusValue(phaseItems, statusOptions)
+      setPackagePhaseItems(phaseItems)
+      setWorkOrderStatusOptions(statusOptions)
+      setSelectedWorkOrderStatus(resolvedStatus)
+      setDefaultWorkOrderStatus(resolvedStatus)
+      setSelectedWorkOrderPhaseKeys([])
       setStatus(`${m.packagePhasesLoaded} ${result.features?.length || 0}`)
     } catch (e) {
       setPackagePhaseItems([])
+      setWorkOrderStatusOptions([])
+      setSelectedWorkOrderStatus('')
+      setDefaultWorkOrderStatus('')
+      setSelectedWorkOrderPhaseKeys([])
       setStatus(e instanceof Error ? e.message : m.packagePhasesLoadError)
     } finally {
       setLoadingPackagePhases(false)
@@ -858,6 +1001,7 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
     }
     clearModifyDraft()
     setIsCreateMode(false)
+    setIsReviewWorkOrderMode(false)
     setIsModifyMode(true)
     setStatus(m.loadingPackagePhases)
     loadSelectedPackagePhases().catch(() => undefined)
@@ -867,6 +1011,72 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
     clearModifyDraft()
     setIsModifyMode(false)
     setStatus(m.modifyModeCancelled)
+  }
+
+  const startReviewWorkOrderMode = () => {
+    if (!selectedPackage) {
+      setStatus(m.viewNeedsSelection)
+      return
+    }
+    clearModifyDraft()
+    setIsCreateMode(false)
+    setIsModifyMode(false)
+    setIsReviewWorkOrderMode(true)
+    setStatus(m.loadingPackagePhases)
+    loadSelectedPackagePhases().catch(() => undefined)
+  }
+
+  const cancelReviewWorkOrderMode = () => {
+    clearModifyDraft()
+    setIsReviewWorkOrderMode(false)
+    setStatus(m.reviewWorkOrderModeCancelled)
+  }
+
+  const toggleWorkOrderPhaseSelection = (item: PackageCartItem) => {
+    setSelectedWorkOrderPhaseKeys((keys) =>
+      keys.includes(item.key)
+        ? keys.filter((key) => key !== item.key)
+        : [...keys, item.key]
+    )
+  }
+
+  const selectAllWorkOrderPhases = () => {
+    setSelectedWorkOrderPhaseKeys(Array.from(new Set(packagePhaseItems.map((item) => item.key))))
+  }
+
+  const clearWorkOrderPhaseSelection = () => {
+    setSelectedWorkOrderPhaseKeys([])
+  }
+
+  const getWorkOrderStatusUpdateItems = () =>
+    packagePhaseItems.filter((item) => selectedWorkOrderPhaseKeys.includes(item.key))
+
+  const getSelectedWorkOrderStatusLabel = () =>
+    workOrderStatusOptions.find((option) => option.value === selectedWorkOrderStatus)?.label ||
+    selectedWorkOrderStatus ||
+    m.workOrderStatusEmptyOption
+
+  const getWorkOrderStatusLabel = (statusValue: any, emptyLabel = '-') => {
+    const normalizedStatus = statusValue === null || statusValue === undefined ? '' : String(statusValue)
+    if (normalizedStatus.trim() === '') return emptyLabel
+    return workOrderStatusOptions.find((option) => option.value === normalizedStatus)?.label || normalizedStatus
+  }
+
+  const getPhaseStatusLabel = (item: PackageCartItem) =>
+    getWorkOrderStatusLabel(getAttributeValue(item.attributes || {}, 'Status'))
+
+  const openUpdateStatusConfirmation = () => {
+    setIsUpdateStatusConfirmationOpen(true)
+  }
+
+  const closeUpdateStatusConfirmation = () => {
+    setIsUpdateStatusConfirmationOpen(false)
+  }
+
+  const confirmUpdateWorkOrderStatus = () => {
+    const updateItems = getWorkOrderStatusUpdateItems()
+    setIsUpdateStatusConfirmationOpen(false)
+    setStatus(`${m.updateStatusPending} ${updateItems.length} ${m.featureCountLabel}`)
   }
 
   const openCreateWorkOrderConfirmation = () => {
@@ -1492,10 +1702,65 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
   }, [loadLayerPackages, m.layerPrefix, m.loadError, m.noTargetLayers, targetLayers])
 
   React.useEffect(() => {
-    if (!isCreateMode && !isModifyMode) {
+    if (!isCreateMode && !isModifyMode && !isReviewWorkOrderMode) {
       refresh().catch(() => undefined)
     }
-  }, [isCreateMode, isModifyMode, refresh])
+  }, [isCreateMode, isModifyMode, isReviewWorkOrderMode, refresh])
+
+  const runPackageSearch = async (rawSearchText: string) => {
+    const searchText = rawSearchText.trim()
+    if (searchText.length > 0 && searchText.length < PACKAGE_SEARCH_MINIMUM_LENGTH) {
+      setStatus(m.packageSearchMinimum)
+      return
+    }
+
+    if (!targetLayers.length) {
+      setGroups([])
+      setError(m.noTargetLayers)
+      return
+    }
+
+    setSearchingPackages(true)
+    setError(null)
+    try {
+      const data = await Promise.all(targetLayers.map(async (layer, idx) => ({
+        layerUrl: layer.url,
+        layerName: layer.name || `${m.layerPrefix} ${idx + 1}`,
+        packages: await loadLayerPackages(layer.url, searchText)
+      })))
+      setGroups(data)
+      setActiveLayerUrl((current) => {
+        if (!searchText) {
+          return current && data.some((g) => g.layerUrl === current) ? current : (data[0]?.layerUrl || null)
+        }
+        const firstResultGroup = data.find((group) => group.packages.length > 0)
+        return firstResultGroup?.layerUrl || (data[0]?.layerUrl || null)
+      })
+      const resultCount = data.reduce((total, group) => total + group.packages.length, 0)
+      setStatus(searchText
+        ? `${m.packageSearchReady} ${resultCount}`
+        : m.packageListReady)
+    } catch (e) {
+      setStatus(e instanceof Error ? e.message : m.packageSearchFailed)
+    } finally {
+      setSearchingPackages(false)
+    }
+  }
+
+  React.useEffect(() => {
+    if (!packageSearchInitializedRef.current) {
+      packageSearchInitializedRef.current = true
+      return
+    }
+
+    const timer = window.setTimeout(() => {
+      runPackageSearch(packageSearchTerm).catch(() => undefined)
+    }, PACKAGE_SEARCH_DEBOUNCE_MS)
+
+    return () => {
+      window.clearTimeout(timer)
+    }
+  }, [packageSearchTerm])
 
   const row = (layerUrl: string, pkg: PackageSummary) => {
     const key = getPackageKey(layerUrl, pkg.id)
@@ -1540,7 +1805,10 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
     onRemove?: (item: PackageCartItem) => void,
     onAction?: (item: PackageCartItem) => void,
     onSelect?: (item: PackageCartItem) => void,
-    showPropertyMetadata?: boolean
+    showPropertyMetadata?: boolean,
+    showStatusInPrimaryText?: boolean,
+    selectedPhaseKeys?: string[],
+    onPhaseSelectionToggle?: (item: PackageCartItem) => void
   ) => {
     const restAttributes = cartRestAttributes[item.key] || {}
     const workCodeValue = getAttributeValue(restAttributes, WORK_CODE_FIELD) ?? getAttributeValue(item.attributes || {}, WORK_CODE_FIELD)
@@ -1558,31 +1826,60 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
     const propertyName = propertyNameValue === null || propertyNameValue === undefined || String(propertyNameValue).trim() === ''
       ? '-'
       : String(propertyNameValue)
+    const statusValue = getAttributeValue(restAttributes, 'Status') ?? getAttributeValue(item.attributes || {}, 'Status')
+    const status = getWorkOrderStatusLabel(statusValue)
+    const repairCompletedDate = formatDateValue(
+      getAttributeValue(restAttributes, REPAIR_COMPLETED_DATE_FIELD) ?? getAttributeValue(item.attributes || {}, REPAIR_COMPLETED_DATE_FIELD)
+    )
+    const aimStatusValue = getAttributeValue(restAttributes, AIM_STATUS_FIELD) ?? getAttributeValue(item.attributes || {}, AIM_STATUS_FIELD)
+    const aimStatus = aimStatusValue === null || aimStatusValue === undefined || String(aimStatusValue).trim() === ''
+      ? '-'
+      : String(aimStatusValue)
     const primaryText = showPropertyMetadata
-      ? `${getRecordLabel(item.attributes, item.objectId)} | ${dateInspected} | ${propertyName}`
+      ? `${getRecordLabel(item.attributes, item.objectId)} | ${dateInspected} | ${showStatusInPrimaryText ? status : propertyName}`
       : getRecordLabel(item.attributes, item.objectId)
-    const metadata = showPropertyMetadata
+    const metadata = showStatusInPrimaryText
+      ? `${m.workCodePrefix} ${workCode} | ${m.completedDatePrefix} ${repairCompletedDate} | ${m.aimStatusPrefix} ${aimStatus}`
+      : showPropertyMetadata
       ? `${m.objectIdPrefix} ${item.objectId} | ${m.workCodePrefix} ${workCode} | ${m.inspectorPrefix} ${inspector}`
       : `${m.objectIdPrefix} ${item.objectId} | ${m.workCodePrefix} ${workCode} | ${m.dateInspectedPrefix} ${dateInspected}`
 
     const isSelectedPhase = item.key === selectedPackagePhaseKey
+    const isCheckedForStatusUpdate = Boolean(selectedPhaseKeys?.includes(item.key))
 
     return h('div', {
       key: item.key,
       className: 'd-flex align-items-center justify-content-between py-1',
-      onClick: onSelect ? () => { onSelect(item) } : undefined,
+      onClick: onPhaseSelectionToggle
+        ? () => {
+          onPhaseSelectionToggle(item)
+          if (onSelect) onSelect(item)
+        }
+        : onSelect ? () => { onSelect(item) } : undefined,
       style: {
         gap: '0.5rem',
-        cursor: onSelect ? 'pointer' : undefined,
+        cursor: onSelect || onPhaseSelectionToggle ? 'pointer' : undefined,
         backgroundColor: isSelectedPhase ? 'rgba(204, 51, 255, 0.1)' : undefined
       }
     },
-      h('div', { style: { minWidth: 0, overflow: 'hidden' } },
-        h('div', { style: { fontSize: 12, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, primaryText),
-        h('div', {
-          title: metadata,
-          style: { fontSize: 10, opacity: 0.7, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }
-        }, metadata)
+      h('div', { className: 'd-flex align-items-center', style: { gap: '0.5rem', minWidth: 0, overflow: 'hidden' } },
+        onPhaseSelectionToggle && h(Checkbox, {
+          checked: isCheckedForStatusUpdate,
+          onClick: (evt) => {
+            evt.stopPropagation()
+          },
+          onChange: (evt) => {
+            evt.stopPropagation()
+            onPhaseSelectionToggle(item)
+          }
+        }),
+        h('div', { style: { minWidth: 0, overflow: 'hidden' } },
+          h('div', { style: { fontSize: 12, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, primaryText),
+          h('div', {
+            title: metadata,
+            style: { fontSize: 10, opacity: 0.7, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }
+          }, metadata)
+        )
       ),
       onAction
         ? h(Button, {
@@ -1616,18 +1913,33 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
     onRemove?: (item: PackageCartItem) => void,
     onAction?: (item: PackageCartItem) => void,
     onSelect?: (item: PackageCartItem) => void,
-    showPropertyMetadata?: boolean
+    showPropertyMetadata?: boolean,
+    showStatusInPrimaryText?: boolean,
+    selectedPhaseKeys?: string[],
+    onPhaseSelectionToggle?: (item: PackageCartItem) => void
   ) => {
     const itemGroups = groupItemsByLayer(items)
     if (itemGroups.length === 0) return h('div', { style: { fontSize: 12, opacity: 0.75 } }, emptyMessage)
     return h(React.Fragment, null,
       ...itemGroups.map((group) =>
         h('div', { key: group.layerName },
-          ...group.items.map((item) => itemRow(item, onRemove, onAction, onSelect, showPropertyMetadata))
+          ...group.items.map((item) => itemRow(
+            item,
+            onRemove,
+            onAction,
+            onSelect,
+            showPropertyMetadata,
+            showStatusInPrimaryText,
+            selectedPhaseKeys,
+            onPhaseSelectionToggle
+          ))
         )
       )
     )
   }
+
+  const displayOptionalValue = (value: any) =>
+    value === null || value === undefined || String(value).trim() === '' ? '-' : String(value)
 
   const createModeView = () => {
     const validationWarnings = getValidationWarnings()
@@ -1697,14 +2009,18 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
       validationWarnings.length > 0
         ? h(Alert, { form: 'basic', type: 'warning', text: `${m.validationPrefix} ${validationWarnings.join(' ')}` })
         : h(Alert, { form: 'basic', type: 'success', text: m.validationReady }),
-      h('div', { className: 'd-flex', style: { gap: '0.5rem' } },
+      h('div', { className: 'd-flex', style: { gap: '0.35rem' } },
         h(Button, {
           type: 'default',
+          size: 'sm',
+          style: modeActionButtonStyle,
           onClick: clearPackageCart,
           disabled: cartItems.length === 0
         }, m.clearCart),
         h(Button, {
           type: 'primary',
+          size: 'sm',
+          style: modeActionButtonStyle,
           disabled: !canCreate || submittingPackage,
           onClick: openCreateConfirmation
         }, submittingPackage ? m.creatingPackage : m.createPackage)
@@ -1759,14 +2075,18 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
         h('div', { className: 'flex-grow-1', style: { minHeight: 0, overflowY: 'auto', overflowX: 'hidden' } },
           groupedItemsPanel(modifySelectionItems, m.selectFeaturesEmpty, removeModifySelectionItem, undefined, undefined, true)
         ),
-        h('div', { className: 'd-flex mt-2', style: { gap: '0.5rem' } },
+        h('div', { className: 'd-flex mt-2', style: { gap: '0.35rem' } },
           h(Button, {
             type: 'default',
+            size: 'sm',
+            style: modeActionButtonStyle,
             onClick: clearModifySelection,
             disabled: modifySelectionItems.length === 0
           }, m.clearCart),
           h(Button, {
             type: 'primary',
+            size: 'sm',
+            style: modeActionButtonStyle,
             disabled: modifySelectionItems.length === 0 ||
               submittingPackagePhases ||
               (modifyUniqueWorkCodes && packageWorkCodeConflict) ||
@@ -1798,9 +2118,11 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
           : 'info',
         text: status
       }),
-      h('div', { className: 'd-flex', style: { gap: '0.5rem' } },
+      h('div', { className: 'd-flex', style: { gap: '0.35rem' } },
         h(Button, {
           type: 'default',
+          size: 'sm',
+          style: modeActionButtonStyle,
           onClick: () => {
             generateSelectedPackageReport().catch(() => undefined)
           },
@@ -1808,11 +2130,151 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
         }, generatingReport ? m.generatingReport : m.createReport),
         h(Button, {
           type: 'primary',
+          size: 'sm',
+          style: modeActionButtonStyle,
           onClick: openCreateWorkOrderConfirmation,
           disabled: loadingPackagePhases || packagePhaseItems.length === 0 || submittingWorkOrder
         }, m.createWorkOrder)
       )
     )
+
+  const reviewWorkOrderModeView = () => {
+    const firstPhaseAttributes = packagePhaseItems[0]?.attributes || {}
+    const workOrderNumber = displayOptionalValue(getAttributeValue(firstPhaseAttributes, WORK_ORDER_NUMBER_SEARCH_FIELD))
+    const packageLayerName = groups.find((group) => group.layerUrl === selectedPackage?.layerUrl)?.layerName ||
+      targetLayers.find((layer) => layer.url === selectedPackage?.layerUrl)?.name
+    const statusUpdateItems = getWorkOrderStatusUpdateItems()
+    const selectedPhaseCount = statusUpdateItems.length
+    const statusHasChanged = selectedWorkOrderStatus !== defaultWorkOrderStatus
+    const hasConcreteStatus = selectedWorkOrderStatus.trim() !== ''
+    const canUpdateStatus = !loadingPackagePhases &&
+      packagePhaseItems.length > 0 &&
+      statusHasChanged &&
+      hasConcreteStatus &&
+      selectedPhaseCount > 0
+
+    return h('div', { className: 'd-flex flex-column flex-grow-1', style: { gap: '0.75rem', minHeight: 0 } },
+      h('div', { className: 'd-flex align-items-center justify-content-between', style: { gap: '0.5rem' } },
+        h('div', { className: 'font-weight-bold' }, m.reviewingWorkOrder),
+        h(Button, {
+          size: 'sm',
+          type: 'tertiary',
+          onClick: cancelReviewWorkOrderMode
+        }, m.cancel)
+      ),
+      h('div', { className: 'border rounded p-2', style: { backgroundColor: 'rgba(0, 0, 0, 0.02)' } },
+        h('div', { className: 'd-flex flex-wrap', style: { gap: '0.75rem 1rem' } },
+          h('div', { className: 'd-flex align-items-center', style: { minWidth: 120, gap: '0.4rem' } },
+            h('div', { style: { minWidth: 0 } },
+              h('div', { style: { fontSize: 10, opacity: 0.7, fontWeight: 700, textTransform: 'uppercase' } }, m.selectedPackageLabel),
+              h('div', { style: { fontSize: 12, fontWeight: 600, overflowWrap: 'anywhere', minWidth: 0 } }, displayOptionalValue(selectedPackage?.id))
+            ),
+            h(Button, {
+              size: 'sm',
+              type: 'default',
+              title: m.openFolder,
+              disabled: !folderBaseUrl || !selectedPackage?.id,
+              onClick: () => {
+                if (folderBaseUrl && selectedPackage?.id) {
+                  window.open(`${folderBaseUrl}/${selectedPackage.id}`, '_blank', 'noopener,noreferrer')
+                }
+              },
+              style: { width: 28, minWidth: 28, height: 28, padding: 0, display: 'inline-flex', alignItems: 'center', justifyContent: 'center' }
+            }, '📁')
+          ),
+          h('div', { style: { minWidth: 120 } },
+            h('div', { style: { fontSize: 10, opacity: 0.7, fontWeight: 700, textTransform: 'uppercase' } }, m.packageLayerLabel),
+            h('div', { style: { fontSize: 12, fontWeight: 600, overflowWrap: 'anywhere' } }, displayOptionalValue(packageLayerName))
+          ),
+          h('div', { style: { minWidth: 120 } },
+            h('div', { style: { fontSize: 10, opacity: 0.7, fontWeight: 700, textTransform: 'uppercase' } }, m.workOrderNumberLabel),
+            h('div', { style: { fontSize: 12, fontWeight: 600, overflowWrap: 'anywhere' } }, loadingPackagePhases ? m.loadingPackagePhases : workOrderNumber)
+          )
+        )
+      ),
+      h('div', { className: 'border rounded p-2' },
+        h('div', { className: 'font-weight-bold mb-2', style: { fontSize: 12 } }, m.workOrderStatusGroupTitle),
+        h('div', { className: 'd-flex flex-wrap', style: { gap: '0.5rem' } },
+          h('div', { style: { flex: '1 1 170px', minWidth: 0 } },
+            h('div', { className: 'mb-1', style: { fontSize: 10, opacity: 0.7, fontWeight: 700, textTransform: 'uppercase' } }, m.workOrderStatusLabel),
+            h(Select, {
+              className: 'w-100',
+              size: 'sm',
+              'aria-label': m.workOrderStatusGroupTitle,
+              value: selectedWorkOrderStatus,
+              disabled: loadingPackagePhases || workOrderStatusOptions.length === 0,
+              onChange: (evt, value) => {
+                setSelectedWorkOrderStatus(String(value ?? evt?.target?.value ?? ''))
+              }
+            },
+            workOrderStatusOptions.length === 0
+              ? h(Option, { value: '' }, loadingPackagePhases ? m.loadingPackagePhases : m.noStatusValues)
+              : [
+                h(Option, { key: 'empty-status', value: '' }, m.workOrderStatusEmptyOption),
+                ...workOrderStatusOptions.map((option) =>
+                h(Option, { key: option.value, value: option.value }, option.label)
+                )
+              ]
+            )
+          ),
+          h('div', { style: { flex: '0 1 130px', minWidth: 120 } },
+            h('div', { className: 'mb-1', style: { fontSize: 10, opacity: 0.7, fontWeight: 700, textTransform: 'uppercase' } }, m.updateScopeLabel),
+            h(Button, {
+              className: 'w-100',
+              size: 'sm',
+              disabled: loadingPackagePhases || packagePhaseItems.length === 0,
+              onClick: selectAllWorkOrderPhases
+            }, m.updateScopeAll)
+          )
+        ),
+        h('div', { className: 'mt-2', style: { fontSize: 11, opacity: 0.75 } },
+          `${statusUpdateItems.length} ${m.featuresWillBeUpdatedSuffix}`
+        )
+      ),
+      h('div', { className: 'border rounded p-2 d-flex flex-column flex-grow-1', style: { minHeight: 0 } },
+        h('div', { className: 'd-flex align-items-center justify-content-between mb-2', style: { gap: '0.5rem' } },
+          h('div', { className: 'font-weight-bold', style: { fontSize: 12 } }, m.packagePhases),
+          h('div', { className: 'd-flex align-items-center', style: { gap: '0.35rem' } },
+            h('div', { style: { fontSize: 11, opacity: 0.75 } }, `${selectedPhaseCount}/${packagePhaseItems.length} ${m.selectedFeaturesSuffix}`),
+            h(Button, {
+              size: 'sm',
+              type: 'tertiary',
+              onClick: clearWorkOrderPhaseSelection,
+              disabled: loadingPackagePhases || selectedPhaseCount === 0
+            }, m.clearSelection)
+          )
+        ),
+        h('div', { className: 'flex-grow-1', style: { minHeight: 0, overflowY: 'auto', overflowX: 'hidden' } },
+          loadingPackagePhases
+            ? h('div', { style: { fontSize: 12, opacity: 0.75 } }, m.loadingPackagePhases)
+            : groupedItemsPanel(packagePhaseItems, m.packagePhasesEmpty, undefined, undefined, (item) => {
+              selectPackagePhase(item).catch(() => undefined)
+            }, true, true, selectedWorkOrderPhaseKeys, toggleWorkOrderPhaseSelection)
+        )
+      ),
+      status && h(Alert, { form: 'basic', type: 'info', text: status }),
+      h('div', { className: 'd-flex', style: { gap: '0.35rem' } },
+        h(Button, {
+          type: 'default',
+          size: 'sm',
+          style: modeActionButtonStyle,
+          onClick: () => {
+            setStatus(m.completionReportPending)
+          },
+          disabled: loadingPackagePhases || packagePhaseItems.length === 0
+        }, m.completionReport),
+        h(Button, {
+          type: 'primary',
+          size: 'sm',
+          style: modeActionButtonStyle,
+          onClick: () => {
+            openUpdateStatusConfirmation()
+          },
+          disabled: !canUpdateStatus
+        }, m.updateStatus)
+      )
+    )
+  }
 
   return h(React.Fragment, null,
     props.useMapWidgetIds?.[0] && h(JimuMapViewComponent, {
@@ -1822,7 +2284,7 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
     h(Card, { className: 'h-100 w-100' },
       h(CardHeader, null, m.widgetTitle),
       h(CardBody, { className: 'd-flex flex-column', style: { minHeight: 0 } },
-        isCreateMode ? createModeView() : isModifyMode ? modifyModeView() : h('div', { className: 'd-flex flex-column flex-grow-1', style: { gap: '0.75rem', minHeight: 0 } },
+        isCreateMode ? createModeView() : isModifyMode ? modifyModeView() : isReviewWorkOrderMode ? reviewWorkOrderModeView() : h('div', { className: 'd-flex flex-column flex-grow-1', style: { gap: '0.75rem', minHeight: 0 } },
           h('div', { className: 'border rounded p-2 d-flex flex-column flex-grow-1', style: { minHeight: 0 } },
             h('div', { className: 'd-flex align-items-center justify-content-between mb-2', style: { gap: '0.5rem' } },
               h('div', { className: 'font-weight-bold' }, m.packageManagementTitle),
@@ -1830,10 +2292,27 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
                 size: 'sm',
                 type: 'default',
                 onClick: () => {
-                  refresh().catch(() => undefined)
+                  if (packageSearchTerm.trim()) {
+                    runPackageSearch(packageSearchTerm).catch(() => undefined)
+                  } else {
+                    refresh().catch(() => undefined)
+                  }
                 },
-                disabled: loading
+                disabled: loading || searchingPackages
               }, m.refreshList)
+            ),
+            h('div', { className: 'mb-2' },
+              h(TextInput, {
+                value: packageSearchTerm,
+                placeholder: m.packageSearchPlaceholder,
+                onChange: (evt) => {
+                  setPackageSearchTerm(evt.target.value)
+                }
+              }),
+              (searchingPackages || (packageSearchTerm.trim().length > 0 && packageSearchTerm.trim().length < PACKAGE_SEARCH_MINIMUM_LENGTH)) &&
+                h('div', { className: 'mt-1', style: { fontSize: 10, opacity: 0.7 } },
+                  searchingPackages ? m.searchingPackages : m.packageSearchMinimum
+                )
             ),
             loading && h('div', null, m.loadingPackages),
             error && h(Alert, { form: 'basic', type: 'warning', text: `${m.loadError} ${error}` }),
@@ -1881,8 +2360,8 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
                 type: 'default',
                 size: 'sm',
                 style: compactActionButtonStyle,
-                onClick: openDeleteConfirmation
-              }, m.deletePackage)
+                onClick: startReviewWorkOrderMode
+              }, m.viewWorkOrder)
             )
           ),
           h(Alert, { form: 'basic', type: 'info', text: status || m.packageListReady })
@@ -1992,6 +2471,39 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
         },
         disabled: !stagedWorkOrderFile || submittingWorkOrder
       }, submittingWorkOrder ? m.creatingWorkOrder : workOrderApiResponse ? m.retryCreateWorkOrder : m.confirmCreateWorkOrder)
+    )),
+    h(Modal, {
+      isOpen: isUpdateStatusConfirmationOpen,
+      toggle: closeUpdateStatusConfirmation,
+      centered: true,
+      backdrop: 'static'
+    },
+    h(ModalHeader, { toggle: closeUpdateStatusConfirmation }, m.updateStatusConfirmationTitle),
+    h(ModalBody, null,
+      h(Alert, { form: 'basic', type: 'warning', text: m.updateStatusConfirmationWarning }),
+      h('div', { className: 'mt-2', style: { fontSize: 14, fontWeight: 700 } },
+        `${m.targetStatusLabel} ${getSelectedWorkOrderStatusLabel()}`
+      ),
+      h('div', { className: 'mt-1', style: { fontSize: 14, fontWeight: 700 } },
+        `${m.createWorkOrderFeatureCountLabel} ${getWorkOrderStatusUpdateItems().length} of ${packagePhaseItems.length}`
+      ),
+      h('div', { className: 'mt-3', style: { fontSize: 12, fontWeight: 600 } }, m.affectedFeaturesLabel),
+      h('div', {
+        className: 'mt-1 border rounded p-2',
+        style: { maxHeight: 160, overflowY: 'auto', fontSize: 12 }
+      },
+      ...getWorkOrderStatusUpdateItems().slice(0, 10).map((item) =>
+        h('div', { key: item.key }, `${m.objectIdPrefix} ${item.objectId} | ${m.currentStatusPrefix} ${getPhaseStatusLabel(item)}`)
+      ),
+      getWorkOrderStatusUpdateItems().length > 10 &&
+        h('div', { className: 'mt-1', style: { opacity: 0.75 } },
+          `+ ${getWorkOrderStatusUpdateItems().length - 10} ${m.moreFeaturesLabel}`
+        )
+      )
+    ),
+    h(ModalFooter, null,
+      h(Button, { type: 'default', onClick: closeUpdateStatusConfirmation }, m.cancel),
+      h(Button, { type: 'primary', onClick: confirmUpdateWorkOrderStatus }, m.confirmUpdateStatus)
     )),
     h(Modal, {
       isOpen: isDeleteConfirmationOpen,
