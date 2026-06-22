@@ -2276,6 +2276,8 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
     )
   }
 
+  const updateStatusConfirmationItems = getWorkOrderStatusUpdateItems()
+
   return h(React.Fragment, null,
     props.useMapWidgetIds?.[0] && h(JimuMapViewComponent, {
       useMapWidgetId: props.useMapWidgetIds[0],
@@ -2485,19 +2487,19 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
         `${m.targetStatusLabel} ${getSelectedWorkOrderStatusLabel()}`
       ),
       h('div', { className: 'mt-1', style: { fontSize: 14, fontWeight: 700 } },
-        `${m.createWorkOrderFeatureCountLabel} ${getWorkOrderStatusUpdateItems().length} of ${packagePhaseItems.length}`
+        `${m.createWorkOrderFeatureCountLabel} ${updateStatusConfirmationItems.length} of ${packagePhaseItems.length}`
       ),
       h('div', { className: 'mt-3', style: { fontSize: 12, fontWeight: 600 } }, m.affectedFeaturesLabel),
       h('div', {
         className: 'mt-1 border rounded p-2',
         style: { maxHeight: 160, overflowY: 'auto', fontSize: 12 }
       },
-      ...getWorkOrderStatusUpdateItems().slice(0, 10).map((item) =>
+      ...updateStatusConfirmationItems.slice(0, 10).map((item) =>
         h('div', { key: item.key }, `${m.objectIdPrefix} ${item.objectId} | ${m.currentStatusPrefix} ${getPhaseStatusLabel(item)}`)
       ),
-      getWorkOrderStatusUpdateItems().length > 10 &&
+      updateStatusConfirmationItems.length > 10 &&
         h('div', { className: 'mt-1', style: { opacity: 0.75 } },
-          `+ ${getWorkOrderStatusUpdateItems().length - 10} ${m.moreFeaturesLabel}`
+          `+ ${updateStatusConfirmationItems.length - 10} ${m.moreFeaturesLabel}`
         )
       )
     ),
