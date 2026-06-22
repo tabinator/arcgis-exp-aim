@@ -86,29 +86,42 @@ const renderLoading = (reportWindow: Window, packageId: string, current = 0, tot
   <meta charset="utf-8">
   <title>${escapeHtml(packageId)} report</title>
   <style>
-    :root { color-scheme: light; }
+    :root {
+      color-scheme: light;
+      --navy: #0f2340;
+      --blue: #1a3f72;
+      --accent: #2e7fcc;
+      --gold: #c8973a;
+      --light: #f4f6f9;
+      --border: #d6dce6;
+      --text: #1c2b3a;
+      --muted: #6b7c93;
+      --white: #ffffff;
+      --success: #1e7e4e;
+      --radius: 6px;
+    }
     * { box-sizing: border-box; }
     body {
       margin: 0;
       min-height: 100vh;
       display: grid;
       place-items: center;
-      background: #e9edf2;
-      color: #17202a;
+      background: var(--light);
+      color: var(--text);
       font-family: "Aptos", "Segoe UI", Arial, Helvetica, sans-serif;
     }
     .loading {
       width: min(92vw, 680px);
       padding: .36in;
-      border: 1px solid #cbd4dd;
-      border-top: 4px solid #1f6f8b;
+      border: 1px solid var(--border);
+      border-top: 4px solid var(--gold);
       border-radius: 8px;
-      background: #fff;
-      box-shadow: 0 2px 16px rgba(23, 32, 42, .14);
+      background: var(--white);
+      box-shadow: 0 2px 16px rgba(15, 35, 64, .14);
     }
     .eyebrow {
       margin: 0 0 .14rem;
-      color: #657380;
+      color: var(--muted);
       font-size: 8pt;
       font-weight: 800;
       letter-spacing: 0;
@@ -116,14 +129,14 @@ const renderLoading = (reportWindow: Window, packageId: string, current = 0, tot
     }
     h1 {
       margin: 0;
-      color: #17202a;
+      color: var(--navy);
       font-size: 22pt;
       line-height: 1.08;
       overflow-wrap: anywhere;
     }
     .subtitle {
       margin: .45rem 0 1.2rem;
-      color: #516170;
+      color: var(--muted);
       font-size: 10.5pt;
     }
     .progress-row {
@@ -135,8 +148,8 @@ const renderLoading = (reportWindow: Window, packageId: string, current = 0, tot
     .spinner {
       width: 42px;
       height: 42px;
-      border: 4px solid #dce2e8;
-      border-top-color: #1f6f8b;
+      border: 4px solid var(--border);
+      border-top-color: var(--accent);
       border-radius: 50%;
       animation: spin .8s linear infinite;
     }
@@ -146,12 +159,12 @@ const renderLoading = (reportWindow: Window, packageId: string, current = 0, tot
       justify-content: space-between;
       gap: 1rem;
       margin-bottom: .35rem;
-      color: #31414f;
+      color: var(--blue);
       font-size: 9.5pt;
       font-weight: 800;
     }
     .progress-label span:last-child {
-      color: #657380;
+      color: var(--muted);
       font-size: 8.5pt;
     }
     .progress-track {
@@ -159,18 +172,18 @@ const renderLoading = (reportWindow: Window, packageId: string, current = 0, tot
       height: 10px;
       overflow: hidden;
       border-radius: 999px;
-      background: #dce2e8;
+      background: var(--border);
     }
     .progress-bar {
       width: ${percent}%;
       height: 100%;
       border-radius: inherit;
-      background: #1f6f8b;
+      background: var(--accent);
       transition: width .18s ease;
     }
     .footnote {
       margin: 1rem 0 0;
-      color: #657380;
+      color: var(--muted);
       font-size: 8.5pt;
     }
     @keyframes spin {
@@ -211,8 +224,15 @@ export const renderReportError = (reportWindow: Window, message: string) => {
   <meta charset="utf-8">
   <title>Report generation error</title>
   <style>
-    body { font-family: Arial, sans-serif; margin: 2rem; color: #1f2933; }
-    .error { max-width: 720px; margin: 10vh auto; padding: 1.5rem; border: 1px solid #b42318; border-radius: 8px; }
+    :root {
+      --navy: #0f2340;
+      --light: #f4f6f9;
+      --border: #d6dce6;
+      --text: #1c2b3a;
+      --white: #ffffff;
+    }
+    body { font-family: Arial, sans-serif; margin: 2rem; color: var(--text); background: var(--light); }
+    .error { max-width: 720px; margin: 10vh auto; padding: 1.5rem; border: 1px solid #b42318; border-radius: 8px; background: var(--white); }
     h1 { color: #b42318; }
   </style>
 </head>
@@ -341,12 +361,25 @@ const renderReport = (
   <meta charset="utf-8">
   <title>${escapeHtml(packageId)} report</title>
   <style>
-    :root { color-scheme: light; }
+    :root {
+      color-scheme: light;
+      --navy: #0f2340;
+      --blue: #1a3f72;
+      --accent: #2e7fcc;
+      --gold: #c8973a;
+      --light: #f4f6f9;
+      --border: #d6dce6;
+      --text: #1c2b3a;
+      --muted: #6b7c93;
+      --white: #ffffff;
+      --success: #1e7e4e;
+      --radius: 6px;
+    }
     * { box-sizing: border-box; }
     body {
       margin: 0;
-      background: #e9edf2;
-      color: #17202a;
+      background: var(--light);
+      color: var(--text);
       font-family: "Aptos", "Segoe UI", Arial, Helvetica, sans-serif;
       font-size: 9.5pt;
       line-height: 1.3;
@@ -360,36 +393,36 @@ const renderReport = (
       justify-content: space-between;
       gap: .5rem;
       padding: .55rem .75rem;
-      border-bottom: 1px solid #c8d0d8;
+      border-bottom: 1px solid var(--border);
       background: rgba(255, 255, 255, .96);
     }
     .view-controls { display: flex; align-items: center; gap: .4rem; }
-    .view-label { margin-right: .15rem; color: #516170; font-size: 8.5pt; font-weight: 700; text-transform: uppercase; }
+    .view-label { margin-right: .15rem; color: var(--muted); font-size: 8.5pt; font-weight: 700; text-transform: uppercase; }
     button {
-      border: 1px solid #1f6f8b;
+      border: 1px solid var(--blue);
       border-radius: 4px;
       padding: .42rem .7rem;
-      background: #1f6f8b;
-      color: #fff;
+      background: var(--blue);
+      color: var(--white);
       cursor: pointer;
       font: inherit;
       font-weight: 700;
       font-size: 9pt;
     }
     .view-button {
-      background: #fff;
-      color: #1f6f8b;
+      background: var(--white);
+      color: var(--blue);
     }
     .view-button.active {
-      background: #1f6f8b;
-      color: #fff;
+      background: var(--blue);
+      color: var(--white);
     }
     main {
       width: min(100%, 8.5in);
       margin: .65rem auto;
       padding: .32in;
-      background: #fff;
-      box-shadow: 0 2px 16px rgba(23, 32, 42, .14);
+      background: var(--white);
+      box-shadow: 0 2px 16px rgba(15, 35, 64, .14);
     }
     .report-header {
       display: grid;
@@ -398,7 +431,7 @@ const renderReport = (
       align-items: stretch;
       margin-bottom: .52rem;
       padding-bottom: .42rem;
-      border-bottom: 2px solid #1f6f8b;
+      border-bottom: 2px solid var(--gold);
     }
     .title-block {
       min-width: 0;
@@ -408,7 +441,7 @@ const renderReport = (
     }
     .eyebrow {
       margin: 0 0 .08rem;
-      color: #657380;
+      color: var(--muted);
       font-size: 7.2pt;
       font-weight: 800;
       letter-spacing: 0;
@@ -416,7 +449,7 @@ const renderReport = (
     }
     h1 {
       margin: 0;
-      color: #17202a;
+      color: var(--navy);
       font-size: 18pt;
       line-height: 1.05;
       overflow-wrap: anywhere;
@@ -426,18 +459,18 @@ const renderReport = (
       grid-template-columns: .92in minmax(1.55in, 1fr);
       gap: .2rem;
       align-self: end;
-      color: #516170;
+      color: var(--muted);
     }
     .meta-item {
       min-width: 0;
       padding: .18rem .24rem;
-      border: 1px solid #cbd4dd;
+      border: 1px solid var(--border);
       border-radius: 4px;
-      background: #f7f9fb;
+      background: var(--light);
     }
     .meta-item span {
       display: block;
-      color: #657380;
+      color: var(--muted);
       font-size: 6.8pt;
       font-weight: 800;
       line-height: 1.1;
@@ -446,7 +479,7 @@ const renderReport = (
     .meta-item strong {
       display: block;
       margin-top: .06rem;
-      color: #17202a;
+      color: var(--navy);
       font-size: 9pt;
       line-height: 1.15;
       overflow-wrap: anywhere;
@@ -454,10 +487,10 @@ const renderReport = (
     .deficiency {
       margin: 0 0 .42rem;
       padding: .38rem .42rem .42rem;
-      border: 1px solid #c5cdd5;
-      border-left: 4px solid #1f6f8b;
+      border: 1px solid var(--border);
+      border-left: 4px solid var(--blue);
       border-radius: 5px;
-      background: #fff;
+      background: var(--white);
       break-inside: avoid;
       page-break-inside: avoid;
     }
@@ -467,17 +500,17 @@ const renderReport = (
       gap: .2rem;
       margin-bottom: .32rem;
       padding-bottom: .3rem;
-      border-bottom: 1px solid #dce2e8;
+      border-bottom: 1px solid var(--border);
     }
     .summary-item {
       min-width: 0;
       padding: .14rem .22rem;
       border-radius: 3px;
-      background: #f4f7f9;
+      background: var(--light);
     }
     .summary-item span {
       display: block;
-      color: #657380;
+      color: var(--muted);
       font-size: 6.9pt;
       font-weight: 800;
       line-height: 1.1;
@@ -502,7 +535,7 @@ const renderReport = (
     .detail-group.wide { grid-column: auto; }
     h3 {
       margin: 0 0 .12rem;
-      color: #31414f;
+      color: var(--blue);
       font-size: 7.5pt;
       font-weight: 800;
       letter-spacing: 0;
@@ -516,7 +549,7 @@ const renderReport = (
     }
     .field { display: contents; }
     dt {
-      color: #657380;
+      color: var(--muted);
       font-size: 7.3pt;
       font-weight: 800;
       line-height: 1.2;
@@ -524,7 +557,7 @@ const renderReport = (
     }
     dd {
       margin: 0;
-      color: #17202a;
+      color: var(--text);
       font-size: 8.3pt;
       line-height: 1.2;
       white-space: pre-wrap;
@@ -533,7 +566,7 @@ const renderReport = (
     .attachment-section {
       margin-top: .35rem;
       padding-top: .28rem;
-      border-top: 1px solid #dce2e8;
+      border-top: 1px solid var(--border);
     }
     .attachment-heading {
       display: flex;
@@ -551,7 +584,7 @@ const renderReport = (
     .attachment {
       margin: 0;
       padding: .16rem;
-      border: 1px solid #d3dbe3;
+      border: 1px solid var(--border);
       border-radius: 4px;
       break-inside: avoid;
       page-break-inside: avoid;
@@ -565,14 +598,14 @@ const renderReport = (
     }
     figcaption {
       margin-top: .08rem;
-      color: #657380;
+      color: var(--muted);
       font-size: 6.7pt;
       line-height: 1.15;
       overflow-wrap: anywhere;
     }
     .empty, .attachment-summary {
       margin: 0;
-      color: #657380;
+      color: var(--muted);
       font-size: 7.5pt;
     }
     .attachment-error {
@@ -607,7 +640,7 @@ const renderReport = (
     }
     @page { size: letter; margin: .32in; }
     @media print {
-      body { background: #fff; font-size: 8.5pt; print-color-adjust: exact; -webkit-print-color-adjust: exact; }
+      body { background: var(--white); font-size: 8.5pt; print-color-adjust: exact; -webkit-print-color-adjust: exact; }
       .toolbar { display: none; }
       main { width: auto; margin: 0; padding: 0; box-shadow: none; }
       .report-header { margin-bottom: .32rem; padding-bottom: .28rem; }
@@ -619,7 +652,7 @@ const renderReport = (
       .deficiency {
         margin-bottom: .34rem;
         padding: .32rem .36rem .36rem;
-        border-color: #aeb8c2;
+        border-color: var(--border);
         break-inside: avoid-page;
         page-break-inside: avoid;
       }
