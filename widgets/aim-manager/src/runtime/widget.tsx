@@ -4,6 +4,7 @@ import { JimuMapViewComponent, loadArcGISJSAPIModules } from 'jimu-arcgis'
 import { Alert, Button, Card, CardBody, CardHeader, Checkbox, Modal, ModalBody, ModalFooter, ModalHeader, TextInput } from 'jimu-ui'
 import defaultMessages from './translations/default'
 import { submitAimWorkOrder } from './aim-api'
+import { generatePackageReport, renderReportError } from './report-service'
 import {
   CREATED_DATE_FIELD,
   filterByPropertyName,
@@ -80,6 +81,7 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
   const [loadingPackagePhases, setLoadingPackagePhases] = React.useState(false)
   const [submittingPackagePhases, setSubmittingPackagePhases] = React.useState(false)
   const [submittingWorkOrder, setSubmittingWorkOrder] = React.useState(false)
+  const [generatingReport, setGeneratingReport] = React.useState(false)
   const [cartQueryResults, setCartQueryResults] = React.useState<CartLayerQueryResult[]>([])
   const [pendingSelectionRemovalKeys, setPendingSelectionRemovalKeys] = React.useState<string[]>([])
   const [submittingPackage, setSubmittingPackage] = React.useState(false)
@@ -910,6 +912,37 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
       setStatus(message)
     } finally {
       setSubmittingWorkOrder(false)
+    }
+  }
+
+  const generateSelectedPackageReport = async () => {
+    if (!selectedPackage || packagePhaseItems.length === 0) {
+      setStatus(m.reportRequiresFeatures)
+      return
+    }
+
+    const reportWindow = window.open('', '_blank')
+    if (!reportWindow) {
+      setStatus(m.reportPopupBlocked)
+      return
+    }
+
+    setGeneratingReport(true)
+    setStatus(m.generatingReport)
+    try {
+      await generatePackageReport({
+        reportWindow,
+        packageId: selectedPackage.id,
+        layerUrl: selectedPackage.layerUrl,
+        features: packagePhaseItems
+      })
+      setStatus(`${m.reportGenerated} ${selectedPackage.id}`)
+    } catch (error) {
+      const message = error instanceof Error ? error.message : m.reportGenerationFailed
+      renderReportError(reportWindow, message)
+      setStatus(`${m.reportGenerationFailed} ${message}`)
+    } finally {
+      setGeneratingReport(false)
     }
   }
 
@@ -1769,9 +1802,10 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
         h(Button, {
           type: 'default',
           onClick: () => {
-            setStatus(m.createReportPending)
-          }
-        }, m.createReport),
+            generateSelectedPackageReport().catch(() => undefined)
+          },
+          disabled: loadingPackagePhases || packagePhaseItems.length === 0 || generatingReport
+        }, generatingReport ? m.generatingReport : m.createReport),
         h(Button, {
           type: 'primary',
           onClick: openCreateWorkOrderConfirmation,
