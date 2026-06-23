@@ -99,6 +99,7 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
   const [modifyUniqueWorkCodes, setModifyUniqueWorkCodes] = React.useState(true)
   const [modifyPropertyNamesMustMatch, setModifyPropertyNamesMustMatch] = React.useState(true)
   const [stagedWorkOrderFile, setStagedWorkOrderFile] = React.useState<File | null>(null)
+  const [stagedStatusUpdateFile, setStagedStatusUpdateFile] = React.useState<File | null>(null)
   const [workOrderApiResponse, setWorkOrderApiResponse] = React.useState<WorkOrderApiResponse | null>(null)
   const [workOrderStatusOptions, setWorkOrderStatusOptions] = React.useState<Array<{ label: string, value: string }>>([])
   const [selectedWorkOrderStatus, setSelectedWorkOrderStatus] = React.useState('')
@@ -119,6 +120,7 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
   const generatedPackageSourceKeyRef = React.useRef('')
   const packageSearchInitializedRef = React.useRef(false)
   const workOrderFileInputRef = React.useRef<HTMLInputElement>(null)
+  const statusUpdateFileInputRef = React.useRef<HTMLInputElement>(null)
   const highlightLayerRef = React.useRef<any>(null)
   const highlightMapRef = React.useRef<any>(null)
   const cartGraphicsLayerRef = React.useRef<any>(null)
@@ -565,8 +567,10 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
     setIsCreateWorkOrderConfirmationOpen(false)
     setIsUpdateStatusConfirmationOpen(false)
     setStagedWorkOrderFile(null)
+    setStagedStatusUpdateFile(null)
     setWorkOrderApiResponse(null)
     if (workOrderFileInputRef.current) workOrderFileInputRef.current.value = ''
+    if (statusUpdateFileInputRef.current) statusUpdateFileInputRef.current.value = ''
     setPackagePhaseItems([])
     setSelectedPackagePhaseKey(null)
     setWorkOrderStatusOptions([])
@@ -1065,18 +1069,33 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
   const getPhaseStatusLabel = (item: PackageCartItem) =>
     getWorkOrderStatusLabel(getAttributeValue(item.attributes || {}, 'Status'))
 
+  const selectedStatusRequiresCompletionFile = () =>
+    getSelectedWorkOrderStatusLabel().trim().toLowerCase() === 'repairs completed'
+
+  const isAcceptedAttachmentFile = (file: File | null | undefined) =>
+    Boolean(file && (
+      file.type === 'application/pdf' ||
+      file.type.startsWith('image/') ||
+      /\.pdf$/i.test(file.name)
+    ))
+
   const openUpdateStatusConfirmation = () => {
+    setStagedStatusUpdateFile(null)
+    if (statusUpdateFileInputRef.current) statusUpdateFileInputRef.current.value = ''
     setIsUpdateStatusConfirmationOpen(true)
   }
 
   const closeUpdateStatusConfirmation = () => {
     setIsUpdateStatusConfirmationOpen(false)
+    setStagedStatusUpdateFile(null)
+    if (statusUpdateFileInputRef.current) statusUpdateFileInputRef.current.value = ''
   }
 
   const confirmUpdateWorkOrderStatus = () => {
     const updateItems = getWorkOrderStatusUpdateItems()
+    const attachmentNote = stagedStatusUpdateFile ? ` (${stagedStatusUpdateFile.name})` : ''
     setIsUpdateStatusConfirmationOpen(false)
-    setStatus(`${m.updateStatusPending} ${updateItems.length} ${m.featureCountLabel}`)
+    setStatus(`${m.updateStatusPending} ${updateItems.length} ${m.featureCountLabel}${attachmentNote}`)
   }
 
   const openCreateWorkOrderConfirmation = () => {
@@ -1125,7 +1144,8 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
     }
   }
 
-  const generateSelectedPackageReport = async () => {
+  const generateSelectedPackageReport = async (variant: 'package' | 'completion' = 'package') => {
+    const isCompletionReport = variant === 'completion'
     if (!selectedPackage || packagePhaseItems.length === 0) {
       setStatus(m.reportRequiresFeatures)
       return
@@ -1138,15 +1158,16 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
     }
 
     setGeneratingReport(true)
-    setStatus(m.generatingReport)
+    setStatus(isCompletionReport ? m.generatingCompletionReport : m.generatingReport)
     try {
       await generatePackageReport({
         reportWindow,
         packageId: selectedPackage.id,
         layerUrl: selectedPackage.layerUrl,
-        features: packagePhaseItems
+        features: packagePhaseItems,
+        variant
       })
-      setStatus(`${m.reportGenerated} ${selectedPackage.id}`)
+      setStatus(`${isCompletionReport ? m.completionReportGenerated : m.reportGenerated} ${selectedPackage.id}`)
     } catch (error) {
       const message = error instanceof Error ? error.message : m.reportGenerationFailed
       renderReportError(reportWindow, message)
@@ -2259,10 +2280,10 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
           size: 'sm',
           style: modeActionButtonStyle,
           onClick: () => {
-            setStatus(m.completionReportPending)
+            generateSelectedPackageReport('completion').catch(() => undefined)
           },
-          disabled: loadingPackagePhases || packagePhaseItems.length === 0
-        }, m.completionReport),
+          disabled: loadingPackagePhases || packagePhaseItems.length === 0 || generatingReport
+        }, generatingReport ? m.generatingCompletionReport : m.completionReport),
         h(Button, {
           type: 'primary',
           size: 'sm',
@@ -2277,6 +2298,40 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
   }
 
   const updateStatusConfirmationItems = getWorkOrderStatusUpdateItems()
+  const showStatusUpdateFileUpload = selectedStatusRequiresCompletionFile()
+  const statusUpdateFilePicker = showStatusUpdateFileUpload && h('div', {
+    className: 'mt-2 mb-1 p-2 border rounded',
+    style: {
+      display: 'inline-block',
+      width: 'fit-content',
+      maxWidth: '100%',
+      backgroundColor: 'transparent',
+      borderColor: 'transparent'
+    }
+  },
+    h('label', {
+      htmlFor: `${props.id}-status-update-file`,
+      className: 'mb-2',
+      style: { display: 'block', fontSize: 14, fontWeight: 700 }
+    }, m.statusUpdateFileLabel),
+    h('input', {
+      ref: statusUpdateFileInputRef,
+      id: `${props.id}-status-update-file`,
+      type: 'file',
+      accept: 'application/pdf,image/*',
+      onChange: (evt: React.ChangeEvent<HTMLInputElement>) => {
+        const file = evt.target.files?.[0] || null
+        if (file && !isAcceptedAttachmentFile(file)) {
+          evt.target.value = ''
+          setStagedStatusUpdateFile(null)
+          setStatus(m.workOrderFileTypeInvalid)
+          return
+        }
+        setStagedStatusUpdateFile(file)
+      },
+      style: { display: 'block', maxWidth: '100%', fontSize: 12 }
+    })
+  )
 
   return h(React.Fragment, null,
     props.useMapWidgetIds?.[0] && h(JimuMapViewComponent, {
@@ -2419,12 +2474,7 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
           accept: 'application/pdf,image/*',
           onChange: (evt: React.ChangeEvent<HTMLInputElement>) => {
             const file = evt.target.files?.[0] || null
-            const isAccepted = file && (
-              file.type === 'application/pdf' ||
-              file.type.startsWith('image/') ||
-              /\.pdf$/i.test(file.name)
-            )
-            if (file && !isAccepted) {
+            if (file && !isAcceptedAttachmentFile(file)) {
               evt.target.value = ''
               setStagedWorkOrderFile(null)
               setStatus(m.workOrderFileTypeInvalid)
@@ -2486,7 +2536,7 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
       h('div', { className: 'mt-2', style: { fontSize: 14, fontWeight: 700 } },
         `${m.targetStatusLabel} ${getSelectedWorkOrderStatusLabel()}`
       ),
-      h('div', { className: 'mt-1', style: { fontSize: 14, fontWeight: 700 } },
+      h('div', { className: 'mt-2', style: { fontSize: 14, fontWeight: 700 } },
         `${m.createWorkOrderFeatureCountLabel} ${updateStatusConfirmationItems.length} of ${packagePhaseItems.length}`
       ),
       h('div', { className: 'mt-3', style: { fontSize: 12, fontWeight: 600 } }, m.affectedFeaturesLabel),
@@ -2501,7 +2551,8 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
         h('div', { className: 'mt-1', style: { opacity: 0.75 } },
           `+ ${updateStatusConfirmationItems.length - 10} ${m.moreFeaturesLabel}`
         )
-      )
+      ),
+      statusUpdateFilePicker
     ),
     h(ModalFooter, null,
       h(Button, { type: 'default', onClick: closeUpdateStatusConfirmation }, m.cancel),

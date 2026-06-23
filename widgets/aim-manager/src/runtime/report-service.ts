@@ -10,14 +10,18 @@ import {
 } from './utils'
 
 const ATTACHMENT_LIMIT_PER_FEATURE = 4
+const COMPLETION_ATTACHMENT_FALLBACK_LIMIT = 2
 const ATTACHMENT_DOWNLOAD_CONCURRENCY = 4
 const EMPTY_REPORT_VALUE = '--'
+const COMPLETION_ATTACHMENT_NAME_TERMS = ['before', 'after', 'completed', 'complete']
+type ReportVariant = 'package' | 'completion'
 
 interface GeneratePackageReportOptions {
   reportWindow: Window
   packageId: string
   layerUrl: string
   features: PackageCartItem[]
+  variant?: ReportVariant
 }
 
 interface ReportAttachment {
@@ -32,6 +36,34 @@ interface FeatureReportData {
   attachments: ReportAttachment[]
 }
 
+interface ReportCopy {
+  eyebrow: string
+  loadingSubtitle: string
+  loadingPreparing: (total: number) => string
+  loadingProcessing: (current: number, total: number) => string
+  documentTitleSuffix: string
+  deficiencyLabel: string
+}
+
+const getReportCopy = (variant: ReportVariant): ReportCopy =>
+  variant === 'completion'
+    ? {
+      eyebrow: 'AiM Completion Report',
+      loadingSubtitle: 'Generating completion report and loading image attachments.',
+      loadingPreparing: (total) => `Preparing ${total} phases`,
+      loadingProcessing: (current, total) => `Processing ${current} of ${total}`,
+      documentTitleSuffix: 'completion report',
+      deficiencyLabel: 'Phase'
+    }
+    : {
+      eyebrow: 'AiM Package Report',
+      loadingSubtitle: 'Generating package report and loading image attachments.',
+      loadingPreparing: (total) => `Preparing ${total} deficiencies`,
+      loadingProcessing: (current, total) => `Processing ${current} of ${total}`,
+      documentTitleSuffix: 'report',
+      deficiencyLabel: 'Deficiency'
+    }
+
 const escapeHtml = (value: any) => String(value ?? '')
   .replace(/&/g, '&amp;')
   .replace(/</g, '&lt;')
@@ -44,6 +76,52 @@ const hasValue = (value: any) =>
 
 const displayReportValue = (value: any) =>
   hasValue(value) ? String(value) : EMPTY_REPORT_VALUE
+
+const getAttachmentNameMatchCount = (attachment: any) => {
+  const name = String(attachment?.name || '').toLowerCase()
+  return COMPLETION_ATTACHMENT_NAME_TERMS.reduce((count, term) =>
+    name.includes(term) ? count + 1 : count, 0)
+}
+
+const getAttachmentDateMs = (attachment: any) => {
+  const candidates = [
+    attachment?.created,
+    attachment?.created_date,
+    attachment?.createdDate,
+    attachment?.creationDate,
+    attachment?.editDate,
+    attachment?.edit_date,
+    attachment?.lastEditDate,
+    attachment?.last_edit_date,
+    attachment?.lastModified,
+    attachment?.modified,
+    attachment?.exifInfo?.DateTimeOriginal,
+    attachment?.exifInfo?.DateTime
+  ]
+
+  for (const candidate of candidates) {
+    if (!hasValue(candidate)) continue
+    const date = new Date(candidate)
+    if (!Number.isNaN(date.getTime())) return date.getTime()
+  }
+
+  return null
+}
+
+const selectReportAttachmentInfos = (attachmentInfos: any[], variant: ReportVariant) => {
+  if (variant !== 'completion') {
+    return attachmentInfos.slice(0, ATTACHMENT_LIMIT_PER_FEATURE)
+  }
+
+  const matchedInfos = attachmentInfos.filter((attachment) => getAttachmentNameMatchCount(attachment) >= 2)
+  if (matchedInfos.length > 0) {
+    return matchedInfos.slice(0, ATTACHMENT_LIMIT_PER_FEATURE)
+  }
+
+  return [...attachmentInfos]
+    .sort((a, b) => (getAttachmentDateMs(b) ?? -Infinity) - (getAttachmentDateMs(a) ?? -Infinity))
+    .slice(0, COMPLETION_ATTACHMENT_FALLBACK_LIMIT)
+}
 
 const mapWithConcurrency = async <T, R>(
   items: T[],
@@ -69,22 +147,23 @@ const mapWithConcurrency = async <T, R>(
   return results
 }
 
-const renderLoading = (reportWindow: Window, packageId: string, current = 0, total = 0) => {
+const renderLoading = (reportWindow: Window, packageId: string, current = 0, total = 0, variant: ReportVariant = 'package') => {
+  const copy = getReportCopy(variant)
   const doc = reportWindow.document
   const safeTotal = Math.max(total, 0)
   const safeCurrent = safeTotal > 0 ? Math.min(Math.max(current, 0), safeTotal) : 0
   const percent = safeTotal > 0 ? Math.round((safeCurrent / safeTotal) * 100) : 0
   const statusText = safeTotal > 0 && safeCurrent > 0
-    ? `Processing ${safeCurrent} of ${safeTotal}`
+    ? copy.loadingProcessing(safeCurrent, safeTotal)
     : safeTotal > 0
-      ? `Preparing ${safeTotal} deficiencies`
+      ? copy.loadingPreparing(safeTotal)
       : 'Preparing report'
   doc.open()
   doc.write(`<!doctype html>
 <html>
 <head>
   <meta charset="utf-8">
-  <title>${escapeHtml(packageId)} report</title>
+  <title>${escapeHtml(packageId)} ${escapeHtml(copy.documentTitleSuffix)}</title>
   <style>
     :root {
       color-scheme: light;
@@ -193,9 +272,9 @@ const renderLoading = (reportWindow: Window, packageId: string, current = 0, tot
 </head>
 <body>
   <div class="loading">
-    <p class="eyebrow">AiM Package Report</p>
+    <p class="eyebrow">${escapeHtml(copy.eyebrow)}</p>
     <h1>${escapeHtml(packageId)}</h1>
-    <p class="subtitle">Generating package report and loading image attachments.</p>
+    <p class="subtitle">${escapeHtml(copy.loadingSubtitle)}</p>
     <div class="progress-row">
       <div class="spinner" aria-hidden="true"></div>
       <div>
@@ -276,18 +355,27 @@ const renderFieldGroup = (title: string, fields: Array<[string, any]>, className
   </section>`
 }
 
-const renderFeatureDetails = (feature: PackageCartItem, index: number, totalCount: number) => {
+const renderFeatureDetails = (feature: PackageCartItem, index: number, totalCount: number, variant: ReportVariant) => {
   const attributes = feature.attributes || {}
 
-  const summaryItems = [
-    renderSummaryItem('Deficiency', `${index + 1} of ${totalCount}`),
-    renderSummaryItem('Object ID', feature.objectId),
-    renderSummaryItem('Work Code', getAttributeValue(attributes, WORK_CODE_FIELD)),
-    renderSummaryItem('Location', getAttributeValue(attributes, 'LocationCode')),
-    renderSummaryItem('Work Unit', getAttributeValue(attributes, 'WorkUnit')),
-    renderSummaryItem('Inspected Date', formatReportDate(getAttributeValue(attributes, CREATED_DATE_FIELD))),
-    renderSummaryItem('Inspector', getAttributeValue(attributes, INSPECTOR_FIELD))
-  ].filter(Boolean).join('')
+  const copy = getReportCopy(variant)
+  const repairCompleteDate = getAttributeValue(attributes, 'RepairCompleteDate') ??
+    getAttributeValue(attributes, 'RepairCompletedDate')
+  const summaryFields: Array<[string, any]> = [
+    [copy.deficiencyLabel, `${index + 1} of ${totalCount}`],
+    ['Object ID', feature.objectId],
+    ['Work Code', getAttributeValue(attributes, WORK_CODE_FIELD)],
+    ['Location', getAttributeValue(attributes, 'LocationCode')],
+    ['Work Unit', getAttributeValue(attributes, 'WorkUnit')],
+    ['Inspected Date', formatReportDate(getAttributeValue(attributes, CREATED_DATE_FIELD))],
+    variant === 'completion'
+      ? ['Completed Date', formatReportDate(repairCompleteDate)]
+      : ['Inspector', getAttributeValue(attributes, INSPECTOR_FIELD)]
+  ]
+
+  const summaryItems = summaryFields
+    .map(([label, value]) => renderSummaryItem(label, value))
+    .join('')
 
   const primaryFields: Array<[string, any]> = [
     ['Repair Recommendation', getAttributeValue(attributes, 'RepairRecommendation')],
@@ -321,8 +409,8 @@ const renderAttachments = (reportData: FeatureReportData) => {
     </section>`
   }
 
-  const summary = reportData.attachmentCount > ATTACHMENT_LIMIT_PER_FEATURE
-    ? `<p class="attachment-summary">Showing ${ATTACHMENT_LIMIT_PER_FEATURE} of ${reportData.attachmentCount} image attachments.</p>`
+  const summary = reportData.attachmentCount > reportData.attachments.length
+    ? `<p class="attachment-summary">Showing ${reportData.attachments.length} of ${reportData.attachmentCount} image attachments.</p>`
     : ''
 
   return `<section class="attachment-section">
@@ -350,16 +438,23 @@ const renderAttachments = (reportData: FeatureReportData) => {
 const renderReport = (
   reportWindow: Window,
   packageId: string,
-  reportData: FeatureReportData[]
+  reportData: FeatureReportData[],
+  variant: ReportVariant
 ) => {
   const doc = reportWindow.document
   const generatedAt = new Date().toLocaleString()
+  const copy = getReportCopy(variant)
+  const firstAttributes = reportData[0]?.feature.attributes || {}
+  const workOrderNumber = getAttributeValue(firstAttributes, 'WorkOrderNumber')
+  const headerTitle = variant === 'completion' && hasValue(workOrderNumber)
+    ? `${packageId} | #${workOrderNumber}`
+    : packageId
   doc.open()
   doc.write(`<!doctype html>
 <html>
 <head>
   <meta charset="utf-8">
-  <title>${escapeHtml(packageId)} report</title>
+  <title>${escapeHtml(headerTitle)} ${escapeHtml(copy.documentTitleSuffix)}</title>
   <style>
     :root {
       color-scheme: light;
@@ -689,12 +784,12 @@ const renderReport = (
   <main>
     <header class="report-header">
       <div class="title-block">
-        <p class="eyebrow">AiM Package Report</p>
-        <h1>${escapeHtml(packageId)}</h1>
+        <p class="eyebrow">${escapeHtml(copy.eyebrow)}</p>
+        <h1>${escapeHtml(headerTitle)}</h1>
       </div>
       <div class="report-meta">
         <div class="meta-item">
-          <span>Deficiencies</span>
+          <span>${escapeHtml(variant === 'completion' ? 'Phases' : 'Deficiencies')}</span>
           <strong>${reportData.length}</strong>
         </div>
         <div class="meta-item">
@@ -705,7 +800,7 @@ const renderReport = (
     </header>
     ${reportData.map((item, index) => `
       <section class="deficiency">
-        ${renderFeatureDetails(item.feature, index, reportData.length)}
+        ${renderFeatureDetails(item.feature, index, reportData.length, variant)}
         ${renderAttachments(item)}
       </section>
     `).join('')}
@@ -729,9 +824,10 @@ export const generatePackageReport = async ({
   reportWindow,
   packageId,
   layerUrl,
-  features
+  features,
+  variant = 'package'
 }: GeneratePackageReportOptions) => {
-  renderLoading(reportWindow, packageId, 0, features.length)
+  renderLoading(reportWindow, packageId, 0, features.length, variant)
 
   const [FeatureLayer, esriRequest] = await loadArcGISJSAPIModules([
     'esri/layers/FeatureLayer',
@@ -752,10 +848,10 @@ export const generatePackageReport = async ({
     features,
     1,
     async (feature, index): Promise<FeatureReportData> => {
-      renderLoading(reportWindow, packageId, index + 1, features.length)
+      renderLoading(reportWindow, packageId, index + 1, features.length, variant)
       const attachmentInfos = (attachmentsByObjectId?.[String(feature.objectId)] || [])
         .filter((attachment: any) => attachment.contentType?.toLowerCase().startsWith('image/'))
-      const selectedInfos = attachmentInfos.slice(0, ATTACHMENT_LIMIT_PER_FEATURE)
+      const selectedInfos = selectReportAttachmentInfos(attachmentInfos, variant)
       const attachments = await mapWithConcurrency(
         selectedInfos,
         ATTACHMENT_DOWNLOAD_CONCURRENCY,
@@ -787,7 +883,7 @@ export const generatePackageReport = async ({
     }
   )
 
-  renderReport(reportWindow, packageId, reportData)
+  renderReport(reportWindow, packageId, reportData, variant)
   reportWindow.addEventListener('beforeunload', () => {
     blobUrls.forEach((blobUrl) => {
       URL.revokeObjectURL(blobUrl)
