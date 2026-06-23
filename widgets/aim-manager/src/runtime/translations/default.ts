@@ -1,6 +1,6 @@
 export default {
   widgetTitle: 'AiM Manager',
-  packageManagementTitle: 'AiM Management',
+  packageManagementTitle: 'Package Finder',
   refreshList: 'Refresh',
   loadingPackages: 'Loading packages...',
   loadError: 'Unable to load package list from one or more target layers.',
@@ -21,8 +21,8 @@ export default {
   createConfirmationFeatureCountLabel: 'Features to update:',
   createConfirmationDetail: 'Creating this package will update the staged deficiencies and generate a project folder location in Box.',
   confirmCreatePackage: 'Confirm Create',
-  viewPackage: 'View Package',
-  viewWorkOrder: 'Review W.O.',
+  viewPackage: 'Approve Package',
+  viewWorkOrder: 'S.I. Review',
   reviewingWorkOrder: 'Mode: Reviewing Work Order',
   reviewWorkOrderModeCancelled: 'Review work order mode cancelled.',
   selectedPackageLabel: 'Selected Package',

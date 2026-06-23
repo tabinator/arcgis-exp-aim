@@ -20,6 +20,7 @@ export interface CartLayerQueryResult {
 export interface TargetLayer {
   name: string
   url: string
+  boxFolderId?: string
 }
 
 export interface SelectionSource {

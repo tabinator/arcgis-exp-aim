@@ -1,10 +1,17 @@
 {
   "packageField": "PCKGID",
   "aimSubmitUrl": "https://ocpw-intigration-hub-staging.azurewebsites.net/api/aim/workorders/submit",
-  "folderBaseUrl": "",
+  "aimPostAttachmentUrl": "",
+  "boxApiBaseUrl": "https://webapps.ocgis.com/box/api",
+  "boxCreateFolderUrl": "https://ocpw-box-api-staging.azurewebsites.net/api/createfolder",
   "targetLayerUrl1": "",
   "targetLayerUrl2": "",
   "targetLayerUrl3": "",
   "targetLayerUrl4": "",
-  "targetLayerUrl5": ""
+  "targetLayerUrl5": "",
+  "targetLayerBoxFolderId1": "",
+  "targetLayerBoxFolderId2": "",
+  "targetLayerBoxFolderId3": "",
+  "targetLayerBoxFolderId4": "",
+  "targetLayerBoxFolderId5": ""
 }

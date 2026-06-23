@@ -42,7 +42,7 @@ import type {
   TargetLayer,
   WorkOrderApiResponse
 } from './types'
-import { DEFAULT_AIM_SUBMIT_URL } from '../config'
+import { DEFAULT_AIM_SUBMIT_URL, DEFAULT_BOX_GET_FOLDER_SHARE_LINK_URL } from '../config'
 import type { IMConfig } from '../config'
 
 interface LayerFieldInfo {
@@ -68,7 +68,7 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
   const h = React.createElement
   const m = defaultMessages
   const packageField = props.config?.packageField?.trim() || 'PCKGID'
-  const folderBaseUrl = props.config?.folderBaseUrl?.trim()
+  const boxApiBaseUrl = props.config?.boxApiBaseUrl?.trim() || props.config?.folderBaseUrl?.trim() || DEFAULT_BOX_GET_FOLDER_SHARE_LINK_URL
   const aimSubmitUrl = props.config?.aimSubmitUrl?.trim() || DEFAULT_AIM_SUBMIT_URL
 
   const [loading, setLoading] = React.useState(false)
@@ -139,14 +139,15 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
   })
 
   const targetLayers: TargetLayer[] = React.useMemo(() => [
-    { name: props.config?.targetLayerName1?.trim() || '', url: props.config?.targetLayerUrl1?.trim() || '' },
-    { name: props.config?.targetLayerName2?.trim() || '', url: props.config?.targetLayerUrl2?.trim() || '' },
-    { name: props.config?.targetLayerName3?.trim() || '', url: props.config?.targetLayerUrl3?.trim() || '' },
-    { name: props.config?.targetLayerName4?.trim() || '', url: props.config?.targetLayerUrl4?.trim() || '' },
-    { name: props.config?.targetLayerName5?.trim() || '', url: props.config?.targetLayerUrl5?.trim() || '' }
+    { name: props.config?.targetLayerName1?.trim() || '', url: props.config?.targetLayerUrl1?.trim() || '', boxFolderId: props.config?.targetLayerBoxFolderId1?.trim() || '' },
+    { name: props.config?.targetLayerName2?.trim() || '', url: props.config?.targetLayerUrl2?.trim() || '', boxFolderId: props.config?.targetLayerBoxFolderId2?.trim() || '' },
+    { name: props.config?.targetLayerName3?.trim() || '', url: props.config?.targetLayerUrl3?.trim() || '', boxFolderId: props.config?.targetLayerBoxFolderId3?.trim() || '' },
+    { name: props.config?.targetLayerName4?.trim() || '', url: props.config?.targetLayerUrl4?.trim() || '', boxFolderId: props.config?.targetLayerBoxFolderId4?.trim() || '' },
+    { name: props.config?.targetLayerName5?.trim() || '', url: props.config?.targetLayerUrl5?.trim() || '', boxFolderId: props.config?.targetLayerBoxFolderId5?.trim() || '' }
   ].filter((layer) => Boolean(layer.url)).map((layer, idx) => ({
     name: layer.name || `${m.layerPrefix} ${idx + 1}`,
-    url: layer.url
+    url: layer.url,
+    boxFolderId: layer.boxFolderId
   })), [
     m.layerPrefix,
     props.config?.targetLayerName1,
@@ -158,7 +159,12 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
     props.config?.targetLayerUrl2,
     props.config?.targetLayerUrl3,
     props.config?.targetLayerUrl4,
-    props.config?.targetLayerUrl5
+    props.config?.targetLayerUrl5,
+    props.config?.targetLayerBoxFolderId1,
+    props.config?.targetLayerBoxFolderId2,
+    props.config?.targetLayerBoxFolderId3,
+    props.config?.targetLayerBoxFolderId4,
+    props.config?.targetLayerBoxFolderId5
   ])
 
   React.useEffect(() => {
@@ -1806,6 +1812,83 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
     }
   }
 
+  const readBoxApiResponse = async (response: Response) => {
+    const text = await response.text()
+    if (!text) return null
+    try {
+      return JSON.parse(text)
+    } catch {
+      return text
+    }
+  }
+
+  const getBoxApiBaseUrl = () => boxApiBaseUrl.replace(/\/+$/, '')
+
+  const getLayerBoxFolderId = (layerUrl: string) =>
+    targetLayers.find((layer) => getServiceLayerKey(layer.url) === getServiceLayerKey(layerUrl))?.boxFolderId?.trim() || ''
+
+  const getSharedLinkFromResponse = (data: any) => {
+    if (typeof data === 'string') return data.trim()
+    return String(
+      data?.sharedLink ||
+      data?.shared_link ||
+      data?.url ||
+      data?.webUrl ||
+      data?.web_url ||
+      data?.link ||
+      ''
+    ).trim()
+  }
+
+  const openBoxFolderLink = async (layerUrl: string, packageId: string) => {
+    const parentFolderId = getLayerBoxFolderId(layerUrl)
+    if (!parentFolderId) {
+      setStatus(`Configure a Box folder ID for the target layer before opening ${packageId}.`)
+      return
+    }
+
+    setStatus(`Loading Box folder link for ${packageId}...`)
+
+    try {
+      const apiBaseUrl = getBoxApiBaseUrl()
+      const searchUrl = new URL(`${apiBaseUrl}/search-folder`)
+      searchUrl.search = new URLSearchParams({
+        parentFolderId,
+        name: packageId
+      }).toString()
+
+      const searchResponse = await fetch(searchUrl.toString())
+      const searchData = await readBoxApiResponse(searchResponse)
+      if (!searchResponse.ok) {
+        throw new Error(typeof searchData === 'string' ? searchData : `Box folder search failed: HTTP ${searchResponse.status}`)
+      }
+
+      const boxFolderId = String(searchData?.id || searchData?.folderId || searchData?.folder_id || '').trim()
+      if (!boxFolderId) {
+        throw new Error(`No Box folder found for ${packageId}.`)
+      }
+
+      const sharedLinkResponse = await fetch(`${apiBaseUrl}/folder/${encodeURIComponent(boxFolderId)}/shared-link`)
+      const sharedLinkData = await readBoxApiResponse(sharedLinkResponse)
+      if (!sharedLinkResponse.ok) {
+        throw new Error(typeof sharedLinkData === 'string' ? sharedLinkData : `Box shared link request failed: HTTP ${sharedLinkResponse.status}`)
+      }
+
+      const sharedLink = getSharedLinkFromResponse(sharedLinkData)
+      if (!sharedLink) {
+        throw new Error(`Box shared link response did not include a link for ${packageId}.`)
+      }
+
+      const openedWindow = window.open(sharedLink, '_blank', 'noopener,noreferrer')
+      if (!openedWindow) {
+        throw new Error(m.reportPopupBlocked)
+      }
+      setStatus(`Opened Box folder link for ${packageId}.`)
+    } catch (e) {
+      setStatus(e instanceof Error ? e.message : `Unable to open Box folder for ${packageId}.`)
+    }
+  }
+
   React.useEffect(() => {
     if (!packageSearchInitializedRef.current) {
       packageSearchInitializedRef.current = true
@@ -1824,6 +1907,7 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
   const row = (layerUrl: string, pkg: PackageSummary) => {
     const key = getPackageKey(layerUrl, pkg.id)
     const isSelected = key === selectedPackage?.key
+    const layerBoxFolderId = getLayerBoxFolderId(layerUrl)
     return h('div', { key, className: 'd-flex align-items-center justify-content-between py-1', style: { gap: '0.5rem' } },
       h('div', { className: 'd-flex align-items-center', style: { gap: '0.5rem', minWidth: 0 } },
         h(Checkbox, {
@@ -1848,11 +1932,9 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
         }, String(pkg.featureCount))
       ),
       h(Button, {
-        size: 'sm', type: 'default', title: m.openFolder, disabled: !folderBaseUrl,
+        size: 'sm', type: 'default', title: m.openFolder, disabled: !layerBoxFolderId,
         onClick: () => {
-          if (folderBaseUrl) {
-            window.open(`${folderBaseUrl}/${pkg.id}`, '_blank', 'noopener,noreferrer')
-          }
+          openBoxFolderLink(layerUrl, pkg.id).catch(() => undefined)
         },
         style: { width: 32, minWidth: 32, height: 32, padding: 0, display: 'inline-flex', alignItems: 'center', justifyContent: 'center' }
       }, '📁')
@@ -2202,6 +2284,7 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
     const workOrderNumber = displayOptionalValue(getAttributeValue(firstPhaseAttributes, WORK_ORDER_NUMBER_SEARCH_FIELD))
     const packageLayerName = groups.find((group) => group.layerUrl === selectedPackage?.layerUrl)?.layerName ||
       targetLayers.find((layer) => layer.url === selectedPackage?.layerUrl)?.name
+    const selectedPackageBoxFolderId = selectedPackage?.layerUrl ? getLayerBoxFolderId(selectedPackage.layerUrl) : ''
     const statusUpdateItems = getWorkOrderStatusUpdateItems()
     const selectedPhaseCount = statusUpdateItems.length
     const statusHasChanged = selectedWorkOrderStatus !== defaultWorkOrderStatus
@@ -2232,10 +2315,10 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
               size: 'sm',
               type: 'default',
               title: m.openFolder,
-              disabled: !folderBaseUrl || !selectedPackage?.id,
+              disabled: !selectedPackageBoxFolderId || !selectedPackage?.id,
               onClick: () => {
-                if (folderBaseUrl && selectedPackage?.id) {
-                  window.open(`${folderBaseUrl}/${selectedPackage.id}`, '_blank', 'noopener,noreferrer')
+                if (selectedPackage?.layerUrl && selectedPackage?.id) {
+                  openBoxFolderLink(selectedPackage.layerUrl, selectedPackage.id).catch(() => undefined)
                 }
               },
               style: { width: 28, minWidth: 28, height: 28, padding: 0, display: 'inline-flex', alignItems: 'center', justifyContent: 'center' }
