@@ -22,6 +22,13 @@ interface GeneratePackageReportOptions {
   layerUrl: string
   features: PackageCartItem[]
   variant?: ReportVariant
+  userInfo?: ReportUserInfo
+}
+
+interface ReportUserInfo {
+  username?: string
+  fullName?: string
+  email?: string
 }
 
 interface ReportAttachment {
@@ -48,7 +55,7 @@ interface ReportCopy {
 const getReportCopy = (variant: ReportVariant): ReportCopy =>
   variant === 'completion'
     ? {
-      eyebrow: 'AiM Completion Report',
+      eyebrow: 'GIS Completion Report',
       loadingSubtitle: 'Generating completion report and loading image attachments.',
       loadingPreparing: (total) => `Preparing ${total} phases`,
       loadingProcessing: (current, total) => `Processing ${current} of ${total}`,
@@ -56,7 +63,7 @@ const getReportCopy = (variant: ReportVariant): ReportCopy =>
       deficiencyLabel: 'Phase'
     }
     : {
-      eyebrow: 'AiM Package Report',
+      eyebrow: 'GIS Package Report',
       loadingSubtitle: 'Generating package report and loading image attachments.',
       loadingPreparing: (total) => `Preparing ${total} deficiencies`,
       loadingProcessing: (current, total) => `Processing ${current} of ${total}`,
@@ -76,6 +83,30 @@ const hasValue = (value: any) =>
 
 const displayReportValue = (value: any) =>
   hasValue(value) ? String(value) : EMPTY_REPORT_VALUE
+
+const getReportFileDate = () => {
+  const now = new Date()
+  const mm = String(now.getMonth() + 1).padStart(2, '0')
+  const dd = String(now.getDate()).padStart(2, '0')
+  const yy = String(now.getFullYear()).slice(-2)
+  return `${mm}${dd}${yy}`
+}
+
+const sanitizeFileNamePart = (value: any, fallback: string) => {
+  const sanitized = String(value ?? '')
+    .trim()
+    .replace(/[^a-z0-9_-]+/gi, '-')
+    .replace(/^-+|-+$/g, '')
+  return sanitized || fallback
+}
+
+const getReportDocumentTitle = (variant: ReportVariant, packageId: string, workOrderNumber: any) => {
+  const datePart = getReportFileDate()
+  if (variant === 'completion') {
+    return `completion-report-${sanitizeFileNamePart(workOrderNumber, 'unknown-work-order')}-${datePart}`
+  }
+  return `package-report-${sanitizeFileNamePart(packageId, 'unknown-package')}-${datePart}`
+}
 
 const getAttachmentNameMatchCount = (attachment: any) => {
   const name = String(attachment?.name || '').toLowerCase()
@@ -439,13 +470,19 @@ const renderReport = (
   reportWindow: Window,
   packageId: string,
   reportData: FeatureReportData[],
-  variant: ReportVariant
+  variant: ReportVariant,
+  userInfo?: ReportUserInfo
 ) => {
   const doc = reportWindow.document
   const generatedAt = new Date().toLocaleString()
   const copy = getReportCopy(variant)
+  const reportUserName = userInfo?.fullName || userInfo?.username
+  const reportEyebrow = hasValue(reportUserName)
+    ? `${variant === 'completion' ? 'Completion' : 'Package'} Report By ${reportUserName}`
+    : copy.eyebrow
   const firstAttributes = reportData[0]?.feature.attributes || {}
   const workOrderNumber = getAttributeValue(firstAttributes, 'WorkOrderNumber')
+  const documentTitle = getReportDocumentTitle(variant, packageId, workOrderNumber)
   const headerTitle = variant === 'completion' && hasValue(workOrderNumber)
     ? `${packageId} | #${workOrderNumber}`
     : packageId
@@ -454,7 +491,7 @@ const renderReport = (
 <html>
 <head>
   <meta charset="utf-8">
-  <title>${escapeHtml(headerTitle)} ${escapeHtml(copy.documentTitleSuffix)}</title>
+  <title>${escapeHtml(documentTitle)}</title>
   <style>
     :root {
       color-scheme: light;
@@ -784,7 +821,7 @@ const renderReport = (
   <main>
     <header class="report-header">
       <div class="title-block">
-        <p class="eyebrow">${escapeHtml(copy.eyebrow)}</p>
+        <p class="eyebrow">${escapeHtml(reportEyebrow)}</p>
         <h1>${escapeHtml(headerTitle)}</h1>
       </div>
       <div class="report-meta">
@@ -825,7 +862,8 @@ export const generatePackageReport = async ({
   packageId,
   layerUrl,
   features,
-  variant = 'package'
+  variant = 'package',
+  userInfo
 }: GeneratePackageReportOptions) => {
   renderLoading(reportWindow, packageId, 0, features.length, variant)
 
@@ -883,7 +921,7 @@ export const generatePackageReport = async ({
     }
   )
 
-  renderReport(reportWindow, packageId, reportData, variant)
+  renderReport(reportWindow, packageId, reportData, variant, userInfo)
   reportWindow.addEventListener('beforeunload', () => {
     blobUrls.forEach((blobUrl) => {
       URL.revokeObjectURL(blobUrl)

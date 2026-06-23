@@ -127,6 +127,16 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
   const cartGraphicsMapRef = React.useRef<any>(null)
   const phaseSelectionLayerRef = React.useRef<any>(null)
   const phaseSelectionMapRef = React.useRef<any>(null)
+  const currentUserInfo = ReactRedux.useSelector((state: IMState) => {
+    const appState: any = state
+    const user = appState.user || appState.portalSelf?.user
+    if (!user) return null
+    return {
+      username: user.username,
+      fullName: user.fullName,
+      email: user.email
+    }
+  })
 
   const targetLayers: TargetLayer[] = React.useMemo(() => [
     { name: props.config?.targetLayerName1?.trim() || '', url: props.config?.targetLayerUrl1?.trim() || '' },
@@ -781,8 +791,6 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
 
   const escapeSqlString = (value: string) => value.replace(/'/g, "''")
 
-  const escapeSqlLikeString = (value: string) => escapeSqlString(value).replace(/[%_]/g, (match) => `\\${match}`)
-
   const normalizeFieldName = (value?: string) => String(value || '').replace(/[^a-z0-9]/gi, '').toLowerCase()
 
   const isStringField = (field?: LayerFieldInfo) => {
@@ -838,43 +846,45 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
     return resolvedStatus || ''
   }
 
-  const getSearchWhereClause = (
-    searchText: string,
-    searchFields: LayerFieldInfo[]
-  ) => {
-    const trimmed = searchText.trim()
-    if (trimmed.length < PACKAGE_SEARCH_MINIMUM_LENGTH) return ''
-
-    const escapedLikeValue = `%${escapeSqlLikeString(trimmed).toUpperCase()}%`
-    const exactNumberValue = Number(trimmed)
-    const clauses: string[] = []
-
-    searchFields.forEach((field) => {
-      if (isStringField(field)) {
-        clauses.push(`UPPER(${field.name}) LIKE '${escapedLikeValue}' ESCAPE '\\'`)
-      } else if (isNumericField(field) && !Number.isNaN(exactNumberValue)) {
-        clauses.push(`${field.name} = ${exactNumberValue}`)
-      }
-    })
-
-    return clauses.length ? ` AND (${clauses.join(' OR ')})` : ''
+  const isOpenAimStatus = (value: any) => {
+    if (value === null || value === undefined) return true
+    const normalizedValue = String(value).trim()
+    return normalizedValue === '' || normalizedValue.toUpperCase() === 'OPEN'
   }
 
   const loadLayerPackages = React.useCallback(async (layerUrl: string, searchText = ''): Promise<PackageSummary[]> => {
     const fields = await getLayerFields(layerUrl)
+    const aimStatusField = findLayerField(fields, AIM_STATUS_FIELD)
     const searchFields = [
       findLayerField(fields, PACKAGE_ID_SEARCH_FIELD),
       findLayerField(fields, WORK_ORDER_NUMBER_SEARCH_FIELD)
-    ].filter(Boolean) as LayerFieldInfo[]
-    const searchWhereClause = getSearchWhereClause(searchText, searchFields)
-    const outFieldNames = Array.from(new Set([packageField, ...searchFields.map((field) => field.name)]))
-    const packageCounts = new Map<string, number>()
+    ].filter(Boolean)
+    const outFieldNames = Array.from(new Set([
+      packageField,
+      ...(aimStatusField ? [aimStatusField.name] : []),
+      ...searchFields.map((field) => field.name)
+    ]))
+    const trimmedSearchText = searchText.trim()
+    const upperSearchText = trimmedSearchText.toUpperCase()
+    const exactSearchNumber = Number(trimmedSearchText)
+    const featureMatchesSearch = (attributes: { [key: string]: any }) => {
+      if (trimmedSearchText.length < PACKAGE_SEARCH_MINIMUM_LENGTH) return true
+
+      return searchFields.some((field) => {
+        const value = getAttributeValue(attributes, field.name)
+        if (value === null || value === undefined) return false
+        if (isStringField(field)) return String(value).toUpperCase().includes(upperSearchText)
+        if (isNumericField(field) && !Number.isNaN(exactSearchNumber)) return Number(value) === exactSearchNumber
+        return false
+      })
+    }
+    const packageSummaries = new Map<string, { featureCount: number, isEligible: boolean, matchesSearch: boolean }>()
     let offset = 0
     let hasMore = true
     while (hasMore) {
       const q = new URL(layerUrl + '/query')
       q.search = new URLSearchParams({
-        where: `${packageField} IS NOT NULL AND ${packageField} <> ''${searchWhereClause}`,
+        where: `${packageField} IS NOT NULL AND ${packageField} <> ''`,
         outFields: outFieldNames.join(','),
         returnGeometry: 'false',
         f: 'json',
@@ -890,7 +900,11 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
         const v = f.attributes?.[packageField]
         if (v !== null && v !== undefined && String(v).trim() !== '') {
           const packageId = String(v)
-          packageCounts.set(packageId, (packageCounts.get(packageId) || 0) + 1)
+          const summary = packageSummaries.get(packageId) || { featureCount: 0, isEligible: true, matchesSearch: false }
+          summary.featureCount += 1
+          summary.isEligible = summary.isEligible && isOpenAimStatus(getAttributeValue(f.attributes || {}, AIM_STATUS_FIELD))
+          summary.matchesSearch = summary.matchesSearch || featureMatchesSearch(f.attributes || {})
+          packageSummaries.set(packageId, summary)
         }
       })
       const fullPage = feats.length === QUERY_PAGE_SIZE
@@ -898,8 +912,9 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
       offset += feats.length
       if (feats.length === 0) hasMore = false
     }
-    return Array.from(packageCounts.entries())
-      .map(([id, featureCount]) => ({ id, featureCount }))
+    return Array.from(packageSummaries.entries())
+      .filter(([, summary]) => summary.isEligible && summary.matchesSearch)
+      .map(([id, summary]) => ({ id, featureCount: summary.featureCount }))
       .sort((a, b) => a.id.localeCompare(b.id))
   }, [packageField])
 
@@ -1165,7 +1180,8 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
         packageId: selectedPackage.id,
         layerUrl: selectedPackage.layerUrl,
         features: packagePhaseItems,
-        variant
+        variant,
+        userInfo: currentUserInfo || undefined
       })
       setStatus(`${isCompletionReport ? m.completionReportGenerated : m.reportGenerated} ${selectedPackage.id}`)
     } catch (error) {
@@ -1455,22 +1471,22 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
       return {
         type: 'simple-marker',
         style: 'circle',
-        color: [0, 171, 190, 0.85],
-        size: 12,
+        color: [255, 244, 120, 0.74],
+        size: 14,
         outline: { color: [255, 255, 255, 1], width: 2 }
       }
     }
     if (type === 'polyline') {
       return {
         type: 'simple-line',
-        color: [0, 171, 190, 1],
-        width: 4
+        color: [255, 244, 120, 0.8],
+        width: 5
       }
     }
     return {
       type: 'simple-fill',
-      color: [0, 171, 190, 0.18],
-      outline: { color: [0, 171, 190, 1], width: 2 }
+      color: [255, 244, 120, 0.14],
+      outline: { color: [255, 255, 255, 0.95], width: 3 }
     }
   }
 
@@ -1505,7 +1521,7 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
       return {
         type: 'simple-marker',
         style: 'circle',
-        color: [204, 51, 255, 0.9],
+        color: [0, 150, 255, 0.95],
         size: 14,
         outline: { color: [255, 255, 255, 1], width: 2 }
       }
@@ -1513,14 +1529,14 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
     if (type === 'polyline') {
       return {
         type: 'simple-line',
-        color: [204, 51, 255, 1],
+        color: [0, 135, 255, 1],
         width: 5
       }
     }
     return {
       type: 'simple-fill',
-      color: [204, 51, 255, 0.22],
-      outline: { color: [204, 51, 255, 1], width: 3 }
+      color: [0, 135, 255, 0.2],
+      outline: { color: [0, 135, 255, 1], width: 3 }
     }
   }
 
@@ -1567,21 +1583,43 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
     const view = jimuMapView?.view
     if (!view || graphics.length === 0) return false
 
+    const zoomOutFactor = 1.75
+    const singlePointScale = 1000
+    const [Extent] = await loadArcGISJSAPIModules(['esri/geometry/Extent'])
     const geometries = graphics
       .map((graphic) => graphic.geometry)
       .filter((geometry) => Boolean(geometry))
-    const extents = geometries
-      .map((geometry) => geometry.extent || geometry)
-      .filter((target) => Boolean(target))
     const singleGeometryType = geometries.length === 1 ? geometries[0]?.type : null
     const isSinglePointTarget = singleGeometryType === 'point' || singleGeometryType === 'multipoint'
+    const getGeometryExtent = (geometry: any) => {
+      if (!geometry) return null
+      if (geometry.extent) return geometry.extent.clone?.() || geometry.extent
+      if (geometry.type === 'point' && typeof geometry.x === 'number' && typeof geometry.y === 'number') {
+        return new Extent({
+          xmin: geometry.x,
+          ymin: geometry.y,
+          xmax: geometry.x,
+          ymax: geometry.y,
+          spatialReference: geometry.spatialReference || view.spatialReference
+        })
+      }
+      return null
+    }
+    const combinedExtent = geometries
+      .map(getGeometryExtent)
+      .filter((extent) => Boolean(extent))
+      .reduce((combined, extent) => {
+        if (!combined) return extent
+        return combined.union?.(extent) || combined
+      }, null)
+    const expandedExtent = combinedExtent?.expand ? combinedExtent.expand(zoomOutFactor) : combinedExtent
     const target = isSinglePointTarget
-      ? { target: geometries[0], scale: Math.min(view.scale || 5000, 5000) }
-      : extents
+      ? { target: geometries[0], scale: singlePointScale }
+      : expandedExtent || geometries
 
     await view.goTo(target, {
       duration: 700,
-      padding: { top: 60, right: 60, bottom: 60, left: 60 }
+      padding: { top: 140, right: 140, bottom: 140, left: 140 }
     })
 
     return true
@@ -1880,7 +1918,7 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
       style: {
         gap: '0.5rem',
         cursor: onSelect || onPhaseSelectionToggle ? 'pointer' : undefined,
-        backgroundColor: isSelectedPhase ? 'rgba(204, 51, 255, 0.1)' : undefined
+        backgroundColor: isSelectedPhase ? 'rgba(0, 135, 255, 0.13)' : undefined
       }
     },
       h('div', { className: 'd-flex align-items-center', style: { gap: '0.5rem', minWidth: 0, overflow: 'hidden' } },
