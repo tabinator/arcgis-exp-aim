@@ -2832,7 +2832,7 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
     setIsOpen: (isOpen: boolean) => void,
     controls: any[]
   ) =>
-    h('div', { className: 'border rounded', style: { overflow: 'hidden' } },
+    h('div', { className: 'border rounded', style: { overflow: 'hidden', flex: '0 0 auto' } },
       h(Button, {
         type: 'tertiary',
         size: 'sm',
@@ -2868,7 +2868,7 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
           onClick: cancelCreateMode
         }, m.cancel)
       ),
-      h('div', null,
+      h('div', { style: { flex: '0 0 auto' } },
         h('div', { className: 'mb-1', style: { fontSize: 12, fontWeight: 600 } }, m.packageIdLabel),
         h(TextInput, {
           value: draftPackageId,
@@ -2919,7 +2919,14 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
           h('span', null, m.propertyNamesMustMatch)
         )
       ]),
-      h('div', { className: 'border rounded p-2 d-flex flex-column flex-grow-1', style: { minHeight: 0 } },
+      h('div', {
+        className: 'border rounded p-2 d-flex flex-column',
+        style: {
+          flex: '1 1 120px',
+          minHeight: 96,
+          overflow: 'hidden'
+        }
+      },
         h('div', { className: 'd-flex align-items-center justify-content-between mb-2', style: { gap: '0.5rem' } },
           h('div', { className: 'font-weight-bold', style: { fontSize: 12 } }, m.packageCart),
           h('div', { style: { fontSize: 11, opacity: 0.75 } }, `${cartItems.length} ${m.stagedCountSuffix}`)
@@ -2930,9 +2937,9 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
         )
       ),
       validationWarnings.length > 0
-        ? h(Alert, { form: 'basic', type: 'warning', text: `${m.validationPrefix} ${validationWarnings.join(' ')}`, style: validationAlertStyle })
-        : h(Alert, { form: 'basic', type: 'success', text: m.validationReady, style: validationAlertStyle }),
-      h('div', { className: 'd-flex', style: { gap: '0.35rem' } },
+        ? h(Alert, { form: 'basic', type: 'warning', text: `${m.validationPrefix} ${validationWarnings.join(' ')}`, style: { ...validationAlertStyle, flex: '0 0 auto' } })
+        : h(Alert, { form: 'basic', type: 'success', text: m.validationReady, style: { ...validationAlertStyle, flex: '0 0 auto' } }),
+      h('div', { className: 'd-flex', style: { gap: '0.35rem', flex: '0 0 auto' } },
         h(Button, {
           type: 'default',
           size: 'sm',
