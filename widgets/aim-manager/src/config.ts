@@ -7,6 +7,7 @@ export interface Config {
   boxCreateFolderUrl?: string
   aimSubmitUrl?: string
   aimPostAttachmentUrl?: string
+  boxFileUploadUrl?: string
   targetLayerName1?: string
   targetLayerName2?: string
   targetLayerName3?: string
@@ -25,7 +26,9 @@ export interface Config {
 }
 
 export const DEFAULT_AIM_SUBMIT_URL = 'https://ocpw-intigration-hub-staging.azurewebsites.net/api/aim/workorders/submit'
+export const DEFAULT_AIM_POST_ATTACHMENT_URL = 'https://ocpw-intigration-hub-staging.azurewebsites.net/api/aim/workorders/{workOrderNumber}/documents'
 export const DEFAULT_BOX_CREATE_FOLDER_URL = 'https://ocpw-box-api-staging.azurewebsites.net/api/createfolder'
-export const DEFAULT_BOX_GET_FOLDER_SHARE_LINK_URL = 'https://webapps.ocgis.com/box/api'
+export const DEFAULT_BOX_FILE_UPLOAD_URL = 'https://ocpw-box-api.azurewebsites.net/api/file/upload'
+export const DEFAULT_BOX_GET_FOLDER_SHARE_LINK_URL = 'https://ocpw-box-api.azurewebsites.net/api'
 
 export type IMConfig = ImmutableObject<Config>

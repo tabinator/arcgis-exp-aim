@@ -3,7 +3,7 @@ import type { AllWidgetSettingProps } from 'jimu-for-builder'
 import { MapWidgetSelector, SettingSection, SettingRow } from 'jimu-ui/advanced/setting-components'
 import { TextInput } from 'jimu-ui'
 import defaultMessages from './translations/default'
-import { DEFAULT_AIM_SUBMIT_URL, DEFAULT_BOX_CREATE_FOLDER_URL, DEFAULT_BOX_GET_FOLDER_SHARE_LINK_URL } from '../config'
+import { DEFAULT_AIM_POST_ATTACHMENT_URL, DEFAULT_AIM_SUBMIT_URL, DEFAULT_BOX_CREATE_FOLDER_URL, DEFAULT_BOX_FILE_UPLOAD_URL, DEFAULT_BOX_GET_FOLDER_SHARE_LINK_URL } from '../config'
 import type { IMConfig } from '../config'
 
 const Setting = (props: AllWidgetSettingProps<IMConfig>) => {
@@ -85,10 +85,20 @@ const Setting = (props: AllWidgetSettingProps<IMConfig>) => {
       h(SettingRow, null,
         h('div', { className: 'mb-1', style: { fontWeight: 600 } }, m.aimPostAttachmentUrlLabel),
         h(TextInput, {
-          value: cfg.aimPostAttachmentUrl || '',
-          placeholder: m.aimPostAttachmentUrlPlaceholder,
+          value: cfg.aimPostAttachmentUrl || DEFAULT_AIM_POST_ATTACHMENT_URL,
+          placeholder: DEFAULT_AIM_POST_ATTACHMENT_URL,
           onChange: (evt) => {
             onConfigChange('aimPostAttachmentUrl', evt.target.value)
+          }
+        })
+      ),
+      h(SettingRow, null,
+        h('div', { className: 'mb-1', style: { fontWeight: 600 } }, m.boxFileUploadUrlLabel),
+        h(TextInput, {
+          value: cfg.boxFileUploadUrl || DEFAULT_BOX_FILE_UPLOAD_URL,
+          placeholder: DEFAULT_BOX_FILE_UPLOAD_URL,
+          onChange: (evt) => {
+            onConfigChange('boxFileUploadUrl', evt.target.value)
           }
         })
       ),
