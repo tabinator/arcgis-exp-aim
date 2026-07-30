@@ -1,0 +1,15 @@
+{
+  "surveyMonumentsLayerUrl": "https://www.ocgis.com/landbase/rest/services/FieldServices/Monument_Mobile_App/FeatureServer/999066",
+  "monumentProjectsLayerUrl": "https://www.ocgis.com/landbase/rest/services/FieldServices/Monument_Mobile_App/FeatureServer/999068",
+  "traverseConnectionsLayerUrl": "https://www.ocgis.com/landbase/rest/services/FieldServices/Monument_Mobile_App/FeatureServer/999082",
+  "monumentHistoryTableUrl": "https://www.ocgis.com/landbase/rest/services/FieldServices/Monument_Mobile_App/FeatureServer/999069",
+  "projectGlobalIdField": "GlobalID",
+  "projectDisplayField": "Name",
+  "monumentGlobalIdField": "GlobalID",
+  "monumentPointNumberField": "PointNumber",
+  "historyMonumentGlobalIdField": "PointGlobalID",
+  "historyProjectGlobalIdField": "ProjectGlobalID",
+  "traverseProjectGlobalIdField": "ProjectID",
+  "traverseFromPointNumberField": "FromPointNum",
+  "traverseToPointNumberField": "ToPointNum"
+}
