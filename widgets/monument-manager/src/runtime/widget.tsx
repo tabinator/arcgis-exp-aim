@@ -246,6 +246,35 @@ interface AutoAssignPlan {
   errorCount: number
 }
 
+type PointNumberPlanAction = 'update' | 'skip'
+
+interface PointNumberPlanRow {
+  id: string
+  historyObjectId: number | string
+  historyPointNumber: string
+  pointGlobalId: string
+  surveyObjectId?: number | string
+  currentPointNumber?: string
+  newPointNumber?: string
+  action: PointNumberPlanAction
+  status: string
+  severity: 'ready' | 'info' | 'warning' | 'error'
+}
+
+interface PointNumberPlan {
+  rows: PointNumberPlanRow[]
+  assignableRows: PointNumberPlanRow[]
+  selectedCount: number
+  readyCount: number
+  missingPointGlobalIdCount: number
+  missingPointNumberCount: number
+  notFoundCount: number
+  conflictCount: number
+  alreadyMatchedCount: number
+  overwriteCount: number
+  errorCount: number
+}
+
 interface MergeRollbackAction {
   label: string
   run: () => Promise<void>
@@ -859,6 +888,10 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
   const [autoAssigningHistory, setAutoAssigningHistory] = React.useState(false)
   const [autoAssignPlan, setAutoAssignPlan] = React.useState<AutoAssignPlan | null>(null)
   const [autoAssignModalOpen, setAutoAssignModalOpen] = React.useState(false)
+  const [buildingPointNumberPlan, setBuildingPointNumberPlan] = React.useState(false)
+  const [applyingPointNumbers, setApplyingPointNumbers] = React.useState(false)
+  const [pointNumberPlan, setPointNumberPlan] = React.useState<PointNumberPlan | null>(null)
+  const [pointNumberModalOpen, setPointNumberModalOpen] = React.useState(false)
   const [attachmentItems, setAttachmentItems] = React.useState<AttachmentSummary[]>([])
   const [stagedAttachmentFiles, setStagedAttachmentFiles] = React.useState<StagedAttachmentFile[]>([])
   const [attachmentError, setAttachmentError] = React.useState('')
@@ -890,6 +923,7 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
   const monumentGraphicsMapRef = React.useRef<any>(null)
   const suppressAssignSurveySelectionSyncRef = React.useRef(false)
   const monumentProjectsLayerRef = React.useRef<{ url: string, layer: any } | null>(null)
+  const surveyMonumentsLayerRef = React.useRef<{ url: string, layer: any } | null>(null)
   const monumentHistoryLayerRef = React.useRef<{ url: string, layer: any } | null>(null)
   const attachmentFileInputRef = React.useRef<HTMLInputElement | null>(null)
   const projectCsvFileInputRef = React.useRef<HTMLInputElement | null>(null)
@@ -1289,6 +1323,17 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
     monumentHistoryLayerRef.current = { url: monumentHistoryUrl, layer }
     return layer
   }, [monumentHistoryUrl])
+
+  const getSurveyMonumentsLayer = React.useCallback(async () => {
+    if (surveyMonumentsLayerRef.current?.url === surveyMonumentsUrl) {
+      return surveyMonumentsLayerRef.current.layer
+    }
+    const [FeatureLayer] = await loadArcGISJSAPIModules(['esri/layers/FeatureLayer'])
+    const layer = new FeatureLayer({ url: surveyMonumentsUrl })
+    await layer.load()
+    surveyMonumentsLayerRef.current = { url: surveyMonumentsUrl, layer }
+    return layer
+  }, [surveyMonumentsUrl])
 
   const getNumericObjectId = (objectId: string | number) => {
     const numericObjectId = typeof objectId === 'number' ? objectId : Number(objectId)
@@ -3203,6 +3248,187 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
     traverseConnectionsUrl
   ])
 
+  const buildPointNumberPlan = React.useCallback(async (): Promise<PointNumberPlan | null> => {
+    const selectedHistoryItems = historyItems.filter((item) => selectedHistoryKeys.includes(getHistoryKey(item)))
+    if (selectedHistoryItems.length === 0) {
+      setStatus(m.selectHistoryFirst)
+      return null
+    }
+
+    const pointNumbersByGlobalId = selectedHistoryItems.reduce<Map<string, Set<string>>>((result, item) => {
+      const pointGlobalId = (item.monumentGlobalId || '').trim().toLowerCase()
+      const pointNumber = item.pointNumber === '-' ? '' : item.pointNumber.trim()
+      if (!pointGlobalId || !pointNumber) return result
+      result.set(pointGlobalId, new Set([...(result.get(pointGlobalId) || []), pointNumber]))
+      return result
+    }, new Map())
+    const conflictingGlobalIds = new Set(Array.from(pointNumbersByGlobalId.entries())
+      .filter(([, pointNumbers]) => pointNumbers.size > 1)
+      .map(([pointGlobalId]) => pointGlobalId))
+    const surveyMonumentsByGlobalId = await queryFinalizeSurveyMonumentsByGlobalIds(
+      selectedHistoryItems.map((item) => item.monumentGlobalId || '')
+    )
+
+    const rows = selectedHistoryItems.map((item) => {
+      const pointGlobalId = (item.monumentGlobalId || '').trim()
+      const pointGlobalIdKey = pointGlobalId.toLowerCase()
+      const historyPointNumber = item.pointNumber === '-' ? '' : item.pointNumber.trim()
+      const baseRow = {
+        id: `point-number-${getHistoryKey(item)}`,
+        historyObjectId: item.objectId,
+        historyPointNumber: item.pointNumber,
+        pointGlobalId
+      }
+
+      if (!pointGlobalId) {
+        return {
+          ...baseRow,
+          action: 'skip' as PointNumberPlanAction,
+          status: m.pointNumberMissingRelationship,
+          severity: 'error' as const
+        }
+      }
+      if (!historyPointNumber) {
+        return {
+          ...baseRow,
+          action: 'skip' as PointNumberPlanAction,
+          status: m.pointNumberMissingHistoryValue,
+          severity: 'error' as const
+        }
+      }
+      if (conflictingGlobalIds.has(pointGlobalIdKey)) {
+        return {
+          ...baseRow,
+          newPointNumber: historyPointNumber,
+          action: 'skip' as PointNumberPlanAction,
+          status: m.pointNumberConflict,
+          severity: 'error' as const
+        }
+      }
+
+      const surveyMonument = surveyMonumentsByGlobalId.get(pointGlobalIdKey)
+      if (!surveyMonument) {
+        return {
+          ...baseRow,
+          newPointNumber: historyPointNumber,
+          action: 'skip' as PointNumberPlanAction,
+          status: m.monumentZoomNotFound,
+          severity: 'error' as const
+        }
+      }
+
+      const currentPointNumber = surveyMonument.pointNumber === '-' ? '' : surveyMonument.pointNumber.trim()
+      if (currentPointNumber === historyPointNumber) {
+        return {
+          ...baseRow,
+          surveyObjectId: surveyMonument.objectId,
+          currentPointNumber,
+          newPointNumber: historyPointNumber,
+          action: 'skip' as PointNumberPlanAction,
+          status: m.pointNumberAlreadyMatches,
+          severity: 'info' as const
+        }
+      }
+
+      return {
+        ...baseRow,
+        surveyObjectId: surveyMonument.objectId,
+        currentPointNumber,
+        newPointNumber: historyPointNumber,
+        action: 'update' as PointNumberPlanAction,
+        status: currentPointNumber ? m.pointNumberWillOverwrite : m.readyLabel,
+        severity: currentPointNumber ? 'warning' as const : 'ready' as const
+      }
+    })
+    const assignableRows = rows.filter((row) => row.action === 'update' && row.surveyObjectId !== undefined)
+
+    return {
+      rows,
+      assignableRows,
+      selectedCount: selectedHistoryItems.length,
+      readyCount: assignableRows.length,
+      missingPointGlobalIdCount: rows.filter((row) => row.status === m.pointNumberMissingRelationship).length,
+      missingPointNumberCount: rows.filter((row) => row.status === m.pointNumberMissingHistoryValue).length,
+      notFoundCount: rows.filter((row) => row.status === m.monumentZoomNotFound).length,
+      conflictCount: rows.filter((row) => row.status === m.pointNumberConflict).length,
+      alreadyMatchedCount: rows.filter((row) => row.status === m.pointNumberAlreadyMatches).length,
+      overwriteCount: rows.filter((row) => row.status === m.pointNumberWillOverwrite).length,
+      errorCount: rows.filter((row) => row.severity === 'error').length
+    }
+  }, [
+    historyItems,
+    m.monumentZoomNotFound,
+    m.pointNumberAlreadyMatches,
+    m.pointNumberConflict,
+    m.pointNumberMissingHistoryValue,
+    m.pointNumberMissingRelationship,
+    m.pointNumberWillOverwrite,
+    m.readyLabel,
+    m.selectHistoryFirst,
+    queryFinalizeSurveyMonumentsByGlobalIds,
+    selectedHistoryKeys
+  ])
+
+  const openPointNumberReview = React.useCallback(async () => {
+    setBuildingPointNumberPlan(true)
+    setPointNumberModalOpen(true)
+    try {
+      const plan = await buildPointNumberPlan()
+      setPointNumberPlan(plan)
+      if (plan) setStatus(`${m.pointNumberPlanReady}: ${plan.readyCount}. ${m.pointNumberSkipped}: ${plan.rows.length - plan.readyCount}`)
+    } catch (err) {
+      const message = err instanceof Error ? err.message : m.pointNumberPlanFailed
+      setPointNumberPlan(null)
+      setStatus(`${m.pointNumberPlanFailed} ${message || ''}`.trim())
+    } finally {
+      setBuildingPointNumberPlan(false)
+    }
+  }, [buildPointNumberPlan, m.pointNumberPlanFailed, m.pointNumberPlanReady, m.pointNumberSkipped])
+
+  const applyPointNumberPlan = React.useCallback(async () => {
+    if (!pointNumberPlan) return
+    const updateRows = pointNumberPlan.assignableRows.filter((row) => row.surveyObjectId !== undefined && row.newPointNumber)
+    if (updateRows.length === 0) {
+      setStatus(`${m.applyPointNumbers}: 0`)
+      return
+    }
+
+    setApplyingPointNumbers(true)
+    try {
+      const layer = await getSurveyMonumentsLayer()
+      const results = await layer.applyEdits({
+        updateFeatures: updateRows.map((row) => ({
+          attributes: {
+            OBJECTID: row.surveyObjectId,
+            [monumentPointNumberField]: row.newPointNumber
+          }
+        }))
+      }, {
+        rollbackOnFailureEnabled: true
+      })
+      const failedResult = (results.updateFeatureResults || []).find((result: any) => result?.error)
+      if (failedResult) throw new Error(failedResult.error?.message || m.pointNumberApplyFailed)
+
+      setStatus(`${m.pointNumberApplyComplete}: ${updateRows.length}`)
+      setPointNumberModalOpen(false)
+      if (selectedProject) await loadProjectHistory(selectedProject)
+    } catch (err) {
+      const message = err instanceof Error ? err.message : m.pointNumberApplyFailed
+      setStatus(`${m.pointNumberApplyFailed} ${message || ''}`.trim())
+    } finally {
+      setApplyingPointNumbers(false)
+    }
+  }, [
+    getSurveyMonumentsLayer,
+    loadProjectHistory,
+    m.applyPointNumbers,
+    m.pointNumberApplyComplete,
+    m.pointNumberApplyFailed,
+    monumentPointNumberField,
+    pointNumberPlan,
+    selectedProject
+  ])
+
   const parseTraverseFile = async (file: File): Promise<TraverseFileSummary> => {
     const text = await file.text()
     const lines = text.split(/\r?\n/)
@@ -3908,16 +4134,13 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
               : historyItems.map(historyRow)
         ),
         h('div', { className: 'd-flex mt-2', style: { gap: '0.35rem' } },
-          mode === 'merge-points' && h(Button, {
+          h(Button, {
             type: 'primary',
             size: 'sm',
             style: modeActionButtonStyle,
+            disabled: buildingPointNumberPlan || applyingPointNumbers || loadingHistory || selectedHistoryKeys.length === 0,
             onClick: () => {
-              if (selectedHistoryKeys.length === 0) {
-                setStatus(m.selectHistoryFirst)
-                return
-              }
-              setStatus(`${m.updatePointNumber}: ${selectedHistoryKeys.length}`)
+              openPointNumberReview().catch(() => undefined)
             }
           }, m.updatePointNumber)
         )
@@ -4361,6 +4584,68 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
       }, autoAssigningHistory ? m.assignAll : m.applyAssignments)
     ))
 
+  const pointNumberModal = () =>
+    h(Modal, {
+      isOpen: pointNumberModalOpen,
+      toggle: () => {
+        setPointNumberModalOpen(false)
+      },
+      centered: true,
+      backdrop: 'static',
+      style: { width: 800, maxWidth: 'calc(100vw - 2rem)' }
+    },
+    h(ModalHeader, {
+      toggle: () => {
+        setPointNumberModalOpen(false)
+      }
+    }, m.reviewPointNumberTitle),
+    h(ModalBody, null,
+      h('div', { className: 'd-flex flex-column', style: { gap: '0.75rem', maxHeight: '68vh', minHeight: 320 } },
+        buildingPointNumberPlan
+          ? h('div', { style: { fontSize: 12, opacity: 0.75 } }, m.loadingPointNumberPlan)
+          : !pointNumberPlan
+            ? h('div', { style: { fontSize: 12, opacity: 0.75 } }, m.pointNumberPlanEmpty)
+            : h(React.Fragment, null,
+              h('div', { className: 'd-flex flex-wrap', style: { gap: '0.5rem' } },
+                validationCountTile(m.selectedHistoryCount, pointNumberPlan.selectedCount),
+                validationCountTile(m.readyLabel, pointNumberPlan.readyCount),
+                validationCountTile(m.pointNumberWillOverwrite, pointNumberPlan.overwriteCount),
+                validationCountTile(m.pointNumberAlreadyMatches, pointNumberPlan.alreadyMatchedCount),
+                validationCountTile(m.errorsLabel, pointNumberPlan.errorCount)
+              ),
+              h('div', { className: 'flex-grow-1', style: { minHeight: 0, overflowY: 'auto', overflowX: 'auto' } },
+                validationHeaderRow([m.historyPointNumberLabel, m.surveyMonumentLabel, m.currentSurveyPointNumberLabel, m.newSurveyPointNumberLabel, m.actionLabel, m.statusLabel]),
+                ...pointNumberPlan.rows.map((row) =>
+                  validationDataRow([
+                    row.historyPointNumber,
+                    row.surveyObjectId ? `${m.objectIdLabel} ${row.surveyObjectId}` : '-',
+                    row.currentPointNumber || '-',
+                    row.newPointNumber || '-',
+                    row.action === 'update' ? m.updateLabel : m.autoAssignSkipAction,
+                    row.status
+                  ], row.id)
+                )
+              )
+            )
+      )
+    ),
+    h(ModalFooter, null,
+      h(Button, {
+        type: 'default',
+        disabled: applyingPointNumbers,
+        onClick: () => {
+          setPointNumberModalOpen(false)
+        }
+      }, m.close),
+      h(Button, {
+        type: 'primary',
+        disabled: buildingPointNumberPlan || applyingPointNumbers || !pointNumberPlan || pointNumberPlan.readyCount === 0 || pointNumberPlan.errorCount > 0,
+        onClick: () => {
+          applyPointNumberPlan().catch(() => undefined)
+        }
+      }, applyingPointNumbers ? m.updatePointNumber : m.applyPointNumbers)
+    ))
+
   const validationModalBody = () => {
     if (validationReviewMode === 'static') {
       if (!parsedStaticData) {
@@ -4763,6 +5048,7 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
     ),
     attachmentModal(),
     autoAssignModal(),
+    pointNumberModal(),
     validationModal()
   )
 }
