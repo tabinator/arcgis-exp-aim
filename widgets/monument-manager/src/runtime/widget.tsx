@@ -96,7 +96,120 @@ interface TraverseFileSummary {
   size: number
   lineCount: number
   nonEmptyLineCount: number
+  text: string
   basisOfBearing?: string
+}
+
+interface ParsedTraverseMonument {
+  pointId: string
+  northing?: number
+  easting?: number
+  description: string
+  fixedStation: boolean
+  stdDevN?: number
+  stdDevE?: number
+  stdDevElev?: number
+  updated: boolean
+  sourceFileName: string
+}
+
+interface ParsedTraverseConnection {
+  fromPointNum: string
+  toPointNum: string
+  fromPointN?: number
+  fromPointE?: number
+  toPointN?: number
+  toPointE?: number
+  distance?: number
+  direction?: number
+  updated: boolean
+  sourceFileName: string
+}
+
+interface ParsedTraverseFileResult {
+  fileId: string
+  fileName: string
+  monuments: ParsedTraverseMonument[]
+  connections: ParsedTraverseConnection[]
+  fixedStations: string[]
+}
+
+interface ParsedTraverseData {
+  monuments: ParsedTraverseMonument[]
+  connections: ParsedTraverseConnection[]
+  fixedStations: string[]
+  files: ParsedTraverseFileResult[]
+}
+
+interface ParsedProjectControl {
+  name: string
+  resN?: number
+  resE?: number
+  fixedStation: boolean
+  northing?: number
+  easting?: number
+  elevation?: number
+  nonControlStation: boolean
+  updated: boolean
+  sourceFileName: string
+}
+
+interface ParsedStaticFileResult {
+  fileId: string
+  fileName: string
+  projectControls: ParsedProjectControl[]
+  basisOfBearing?: string
+  validations: FinalizeValidationMessage[]
+}
+
+type FinalizeEditKind =
+  'update-history'
+  | 'create-history'
+  | 'update-survey-monument'
+  | 'create-survey-monument'
+  | 'backfill-history-relationship'
+  | 'create-traverse-connection'
+
+interface PlannedFinalizeEdit {
+  kind: FinalizeEditKind
+  label: string
+  pointId?: string
+  objectId?: string | number
+  globalId?: string
+  attributes?: { [key: string]: any }
+  geometry?: { x: number, y: number }
+}
+
+interface FinalizeValidationMessage {
+  severity: 'info' | 'warning' | 'error'
+  message: string
+  pointId?: string
+}
+
+interface FinalizePlan {
+  edits: PlannedFinalizeEdit[]
+  validations: FinalizeValidationMessage[]
+  counts: { [key in FinalizeEditKind]: number }
+  canCommit: boolean
+}
+
+interface FinalizeRollbackStep {
+  label: string
+  execute: () => Promise<void>
+  rollback: () => Promise<void>
+}
+
+interface FinalizeHistoryRecord {
+  objectId: number | string
+  globalId: string
+  pointGlobalId: string
+  pointNumber: string
+}
+
+interface FinalizeSurveyMonumentRecord {
+  objectId: number | string
+  globalId: string
+  pointNumber: string
 }
 
 interface MergeRollbackAction {
@@ -105,8 +218,11 @@ interface MergeRollbackAction {
 }
 
 type MergeOperationType = 'target' | 'mean'
+type FinalizeValidationTab = 'summary' | 'monuments' | 'connections' | 'history' | 'issues'
+type ValidationReviewMode = 'traverse' | 'static'
 
 const PROJECT_COMPLETED_FIELD = 'FieldWorkComp'
+const PROJECT_BASIS_OF_BEARING_FIELD = 'BasisOfBearing'
 const PROJECT_SEARCH_MINIMUM_LENGTH = 3
 const PROJECT_QUERY_LIMIT = 100
 const HISTORY_QUERY_LIMIT = 2000
@@ -165,6 +281,433 @@ const extractBasisOfBearing = (text: string) => {
   if (!basisLine) return ''
   const separatorIndex = basisLine.search(/[:=-]/)
   return separatorIndex >= 0 ? basisLine.slice(separatorIndex + 1).trim() || basisLine : basisLine
+}
+
+const normalizeLstColumns = (line: string) => line.trim().replace(/\s+/g, ' ').split(' ').filter(Boolean)
+
+const parseLstNumber = (value?: string) => {
+  if (!value) return undefined
+  const parsed = Number(value.replace(/,/g, ''))
+  return Number.isFinite(parsed) ? parsed : undefined
+}
+
+const cleanTraverseDescription = (parts: string[]) => {
+  const description = parts.join(' ').trim()
+  return description.replace(/\b(CPT_OMIT|MON_OMIT)\s*/g, '').trim()
+}
+
+const normalizeComparableName = (value: string) =>
+  value
+    .replace(/\.[^/.]+$/, '')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, ' ')
+    .trim()
+
+const namesLookSimilar = (left: string, right: string) => {
+  const normalizedLeft = normalizeComparableName(left)
+  const normalizedRight = normalizeComparableName(right)
+  if (!normalizedLeft || !normalizedRight) return false
+  if (normalizedLeft === normalizedRight) return true
+  if (normalizedLeft.includes(normalizedRight) || normalizedRight.includes(normalizedLeft)) return true
+
+  const leftTokens = normalizedLeft.split(/\s+/).filter((token) => token.length > 1)
+  const rightTokens = normalizedRight.split(/\s+/).filter((token) => token.length > 1)
+  if (leftTokens.length === 0 || rightTokens.length === 0) return false
+
+  const rightTokenSet = new Set(rightTokens)
+  const matchingTokenCount = leftTokens.filter((token) => rightTokenSet.has(token)).length
+  return matchingTokenCount / Math.max(leftTokens.length, rightTokens.length) >= 0.5
+}
+
+const calculateTraverseDistance = (fromPointE: number, fromPointN: number, toPointE: number, toPointN: number) =>
+  Math.sqrt((toPointE - fromPointE) ** 2 + (toPointN - fromPointN) ** 2)
+
+const calculateTraverseAzimuth = (fromPointE: number, fromPointN: number, toPointE: number, toPointN: number) => {
+  const radians = Math.atan2(toPointE - fromPointE, toPointN - fromPointN)
+  return (radians * 180 / Math.PI + 360) % 360
+}
+
+const calculateAzimuthQuadrant = (azimuth: number) => {
+  if (azimuth >= 0 && azimuth <= 90) return 1
+  if (azimuth > 90 && azimuth <= 180) return 2
+  if (azimuth > 180 && azimuth <= 270) return 3
+  return 4
+}
+
+const formatBearingDms = (decimalDegrees: number) => {
+  const totalSeconds = Math.round(decimalDegrees * 3600)
+  const degrees = Math.floor(totalSeconds / 3600)
+  const minutes = Math.floor((totalSeconds - degrees * 3600) / 60)
+  const seconds = totalSeconds - degrees * 3600 - minutes * 60
+  return `${String(degrees).padStart(2, '0')}-${String(minutes).padStart(2, '0')}-${String(seconds).padStart(2, '0')}`
+}
+
+const formatBearingDistance = (distance: number) => {
+  const roundedDistance = Math.round(distance * 100) / 100
+  const [whole, decimal = '00'] = roundedDistance.toFixed(2).split('.')
+  const formattedWhole = whole.padStart(3, '0').replace(/\B(?=(\d{3})+(?!\d))/g, ',')
+  return `${formattedWhole}.${decimal}`
+}
+
+const calculateBasisOfBearingFromControls = (projectControls: ParsedProjectControl[]) => {
+  const fixedControls = projectControls.filter((control) =>
+    control.fixedStation &&
+    control.resN === 0 &&
+    control.resE === 0 &&
+    control.northing !== undefined &&
+    control.easting !== undefined
+  )
+  if (fixedControls.length < 2) return ''
+
+  const startControl = fixedControls[0]
+  const endControl = fixedControls[1]
+  const azimuth = calculateTraverseAzimuth(startControl.easting, startControl.northing, endControl.easting, endControl.northing)
+  const quadrant = calculateAzimuthQuadrant(azimuth)
+  let northBearing = 0
+  if (quadrant === 1) {
+    northBearing = azimuth
+  } else if (quadrant === 2) {
+    northBearing = 360 - (azimuth + 180)
+  } else if (quadrant === 3) {
+    northBearing = azimuth - 180
+  } else {
+    northBearing = 360 - azimuth
+  }
+
+  const distance = Math.round(calculateTraverseDistance(startControl.easting, startControl.northing, endControl.easting, endControl.northing) * 100) / 100
+  if (distance <= 0) return ''
+
+  const bearingSuffix = quadrant === 2 || quadrant === 4 ? 'W' : 'E'
+  return `N${formatBearingDms(Math.abs(northBearing))}${bearingSuffix} ${formatBearingDistance(distance)}'`
+}
+
+const hasCoordinatePair = (monument?: ParsedTraverseMonument): monument is ParsedTraverseMonument & { northing: number, easting: number } =>
+  monument?.northing !== undefined && monument.easting !== undefined
+
+const enrichTraverseConnections = (
+  connections: ParsedTraverseConnection[],
+  monumentsByPointId: Map<string, ParsedTraverseMonument>
+) =>
+  connections.map((connection) => {
+    const fromMonument = monumentsByPointId.get(connection.fromPointNum)
+    const toMonument = monumentsByPointId.get(connection.toPointNum)
+    const enrichedConnection: ParsedTraverseConnection = {
+      ...connection,
+      fromPointN: fromMonument?.northing,
+      fromPointE: fromMonument?.easting,
+      toPointN: toMonument?.northing,
+      toPointE: toMonument?.easting
+    }
+
+    if (hasCoordinatePair(fromMonument) && hasCoordinatePair(toMonument)) {
+      enrichedConnection.distance = calculateTraverseDistance(
+        fromMonument.easting,
+        fromMonument.northing,
+        toMonument.easting,
+        toMonument.northing
+      )
+      enrichedConnection.direction = calculateTraverseAzimuth(
+        fromMonument.easting,
+        fromMonument.northing,
+        toMonument.easting,
+        toMonument.northing
+      )
+    }
+
+    return enrichedConnection
+  })
+
+const emptyFinalizeCounts = (): { [key in FinalizeEditKind]: number } => ({
+  'update-history': 0,
+  'create-history': 0,
+  'update-survey-monument': 0,
+  'create-survey-monument': 0,
+  'backfill-history-relationship': 0,
+  'create-traverse-connection': 0
+})
+
+const countFinalizeEdit = (counts: { [key in FinalizeEditKind]: number }, kind: FinalizeEditKind) => {
+  counts[kind] += 1
+}
+
+const createFinalizeStepRunner = async (steps: FinalizeRollbackStep[]) => {
+  const completedSteps: FinalizeRollbackStep[] = []
+  try {
+    for (const step of steps) {
+      await step.execute()
+      completedSteps.push(step)
+    }
+  } catch (err) {
+    for (const step of [...completedSteps].reverse()) {
+      await step.rollback()
+    }
+    throw err
+  }
+}
+
+const parseTraverseText = (text: string, fileId: string, fileName: string, parseControllingStations: boolean): ParsedTraverseFileResult => {
+  const monumentsByPointId = new Map<string, ParsedTraverseMonument>()
+  const fixedStations = new Set<string>()
+  const connections: ParsedTraverseConnection[] = []
+  let sumContSta = false
+  let sumContStaHeader = false
+  let adjCoordinates = false
+  let adjCoordinatesHeader = false
+  let adjMeasDistObs = false
+  let adjMeasDistObsHeader = false
+  let staCoorStanDev = false
+  let staCoorStanDevHeader = false
+  let adjCoordinateDescColumn = 4
+
+  text.split(/\r?\n/).some((rawLine) => {
+    const line = rawLine.trim()
+    if (line === 'Summary of Controlling Stations' && parseControllingStations) {
+      sumContSta = true
+      return false
+    }
+    if (sumContSta && line.startsWith('Fixed Stations')) {
+      sumContStaHeader = true
+      return false
+    }
+    if (sumContStaHeader && line !== '') {
+      const data = normalizeLstColumns(line)
+      if (data[0]) fixedStations.add(data[0])
+    }
+    if (sumContSta && sumContStaHeader && line === '') {
+      sumContSta = false
+      sumContStaHeader = false
+    }
+
+    if (line === 'Adjusted Coordinates (FeetUS)') {
+      adjCoordinates = true
+      return false
+    }
+    if (adjCoordinates && line.startsWith('Station')) {
+      adjCoordinatesHeader = true
+      const data = normalizeLstColumns(line)
+      adjCoordinateDescColumn = data[3] === 'Description' ? 3 : 4
+      return false
+    }
+    if (adjCoordinatesHeader && line !== '') {
+      const data = normalizeLstColumns(line)
+      const pointId = data[0]
+      if (pointId && data.length >= 3 && !monumentsByPointId.has(pointId)) {
+        monumentsByPointId.set(pointId, {
+          pointId,
+          northing: parseLstNumber(data[1]),
+          easting: parseLstNumber(data[2]),
+          description: cleanTraverseDescription(data.slice(adjCoordinateDescColumn)),
+          fixedStation: fixedStations.has(pointId),
+          updated: false,
+          sourceFileName: fileName
+        })
+      }
+      return false
+    }
+    if (adjCoordinates && adjCoordinatesHeader && line === '') {
+      adjCoordinates = false
+      adjCoordinatesHeader = false
+    }
+
+    if (line === 'Adjusted Measured Distance Observations (FeetUS)' || line === 'Adjusted Distance Observations (FeetUS)') {
+      adjMeasDistObs = true
+      return false
+    }
+    if (adjMeasDistObs && line.startsWith('From')) {
+      adjMeasDistObsHeader = true
+      return false
+    }
+    if (adjMeasDistObsHeader && line !== '') {
+      const data = normalizeLstColumns(line)
+      if (data[0] && data[1]) {
+        connections.push({
+          fromPointNum: data[0],
+          toPointNum: data[1],
+          updated: false,
+          sourceFileName: fileName
+        })
+      }
+      return false
+    }
+    if (adjMeasDistObs && adjMeasDistObsHeader && line === '') {
+      adjMeasDistObs = false
+      adjMeasDistObsHeader = false
+    }
+
+    if (line === 'Station Coordinate Standard Deviations (FeetUS)') {
+      staCoorStanDev = true
+      return false
+    }
+    if (staCoorStanDev && line.startsWith('Station')) {
+      staCoorStanDevHeader = true
+      return false
+    }
+    if (staCoorStanDevHeader && line !== '') {
+      const data = normalizeLstColumns(line)
+      const monument = monumentsByPointId.get(data[0])
+      if (monument) {
+        monument.stdDevN = parseLstNumber(data[1])
+        monument.stdDevE = parseLstNumber(data[2])
+        if (data.length > 3) monument.stdDevElev = parseLstNumber(data[3])
+      }
+      return false
+    }
+    if (staCoorStanDev && staCoorStanDevHeader && line === '') {
+      return true
+    }
+
+    return false
+  })
+
+  fixedStations.forEach((pointId) => {
+    const monument = monumentsByPointId.get(pointId)
+    if (monument) monument.fixedStation = true
+  })
+
+  return {
+    fileId,
+    fileName,
+    monuments: Array.from(monumentsByPointId.values()),
+    connections,
+    fixedStations: Array.from(fixedStations)
+  }
+}
+
+const parseStaticText = (text: string, fileId: string, fileName: string): ParsedStaticFileResult => {
+  const projectControlsByName = new Map<string, ParsedProjectControl>()
+  const validations: FinalizeValidationMessage[] = []
+  let adjustedStationInfoFound = false
+  let adjustedCoordinatesFound = false
+  let gpsVectorFound = false
+  let stationHeaderFound = false
+  let fromHeaderFound = false
+  let sawAdjustedStationInfo = false
+  let sawAdjustedCoordinates = false
+  let sawGpsVectorSummary = false
+
+  text.split(/\r?\n/).some((rawLine) => {
+    const line = rawLine.trim()
+    if (line === 'Adjusted Station Information') {
+      adjustedStationInfoFound = true
+      sawAdjustedStationInfo = true
+      return false
+    }
+    if (adjustedStationInfoFound) {
+      if (line.startsWith('Station')) {
+        stationHeaderFound = true
+        return false
+      }
+      if (stationHeaderFound && !adjustedCoordinatesFound && line !== '') {
+        const data = normalizeLstColumns(line)
+        const name = data[0]
+        const resN = parseLstNumber(data[1])
+        const resE = parseLstNumber(data[2])
+        if (!name) {
+          validations.push({ severity: 'warning', message: 'Static station row is missing a station name.' })
+          return false
+        }
+        projectControlsByName.set(name, {
+          name,
+          resN,
+          resE,
+          fixedStation: resN === 0 && resE === 0,
+          nonControlStation: false,
+          updated: false,
+          sourceFileName: fileName
+        })
+        return false
+      }
+      if (stationHeaderFound && line === '') {
+        stationHeaderFound = false
+        adjustedStationInfoFound = false
+      }
+    }
+
+    if (line === 'Adjusted Coordinates (FeetUS)') {
+      adjustedCoordinatesFound = true
+      sawAdjustedCoordinates = true
+      return false
+    }
+    if (adjustedCoordinatesFound) {
+      if (line.startsWith('Station')) {
+        stationHeaderFound = true
+        return false
+      }
+      if (stationHeaderFound && line !== '') {
+        const data = normalizeLstColumns(line)
+        const name = data[0]
+        if (!name) {
+          validations.push({ severity: 'warning', message: 'Static coordinate row is missing a station name.' })
+          return false
+        }
+        const existingControl = projectControlsByName.get(name)
+        const control = existingControl || {
+          name,
+          fixedStation: false,
+          nonControlStation: true,
+          updated: false,
+          sourceFileName: fileName
+        }
+        control.northing = parseLstNumber(data[1])
+        control.easting = parseLstNumber(data[2])
+        control.elevation = parseLstNumber(data[3])
+        control.nonControlStation = !existingControl
+        projectControlsByName.set(name, control)
+        return false
+      }
+      if (stationHeaderFound && line === '') {
+        stationHeaderFound = false
+        adjustedCoordinatesFound = false
+      }
+    }
+
+    if (line === 'GPS Vector Residual Summary (FeetUS)') {
+      gpsVectorFound = true
+      sawGpsVectorSummary = true
+      return false
+    }
+    if (gpsVectorFound) {
+      if (line.startsWith('From')) {
+        fromHeaderFound = true
+        return false
+      }
+      if (fromHeaderFound && line === '') {
+        return true
+      }
+    }
+
+    return false
+  })
+
+  if (!sawAdjustedStationInfo) validations.push({ severity: 'warning', message: 'Adjusted Station Information section was not found.' })
+  if (!sawAdjustedCoordinates) validations.push({ severity: 'error', message: 'Adjusted Coordinates section was not found.' })
+  if (!sawGpsVectorSummary) validations.push({ severity: 'info', message: 'GPS Vector Residual Summary section was not found.' })
+
+  const projectControls = Array.from(projectControlsByName.values())
+  projectControls.forEach((control) => {
+    if (control.northing === undefined || control.easting === undefined) {
+      validations.push({
+        severity: 'warning',
+        pointId: control.name,
+        message: 'Project control station is missing usable northing/easting.'
+      })
+    }
+  })
+  const basisOfBearing = calculateBasisOfBearingFromControls(projectControls)
+  if (!basisOfBearing) {
+    validations.push({
+      severity: 'warning',
+      message: 'Basis of Bearing could not be calculated from two fixed control stations.'
+    })
+  }
+
+  return {
+    fileId,
+    fileName,
+    projectControls,
+    basisOfBearing,
+    validations
+  }
 }
 
 const normalizeUrl = (url?: string) => {
@@ -292,7 +835,14 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
   const [loadingProjectCsv, setLoadingProjectCsv] = React.useState(false)
   const [traverseFiles, setTraverseFiles] = React.useState<TraverseFileSummary[]>([])
   const [staticFiles, setStaticFiles] = React.useState<TraverseFileSummary[]>([])
+  const [parsedTraverseData, setParsedTraverseData] = React.useState<ParsedTraverseData | null>(null)
+  const [parsedStaticData, setParsedStaticData] = React.useState<ParsedStaticFileResult | null>(null)
+  const [finalizePlan, setFinalizePlan] = React.useState<FinalizePlan | null>(null)
+  const [validationModalOpen, setValidationModalOpen] = React.useState(false)
+  const [validationTab, setValidationTab] = React.useState<FinalizeValidationTab>('summary')
+  const [validationReviewMode, setValidationReviewMode] = React.useState<ValidationReviewMode>('traverse')
   const [basisOfBearing, setBasisOfBearing] = React.useState('')
+  const [acceptingBasisOfBearing, setAcceptingBasisOfBearing] = React.useState(false)
   const [loadingTraverseFiles, setLoadingTraverseFiles] = React.useState(false)
   const [status, setStatus] = React.useState(m.statusReady)
   const searchInitializedRef = React.useRef(false)
@@ -300,6 +850,7 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
   const monumentGraphicsLayerRef = React.useRef<any>(null)
   const monumentGraphicsMapRef = React.useRef<any>(null)
   const suppressAssignSurveySelectionSyncRef = React.useRef(false)
+  const monumentProjectsLayerRef = React.useRef<{ url: string, layer: any } | null>(null)
   const monumentHistoryLayerRef = React.useRef<{ url: string, layer: any } | null>(null)
   const attachmentFileInputRef = React.useRef<HTMLInputElement | null>(null)
   const projectCsvFileInputRef = React.useRef<HTMLInputElement | null>(null)
@@ -330,6 +881,7 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
   const monumentProjectsUrl = cfg.monumentProjectsLayerUrl || DEFAULT_MONUMENT_PROJECTS_LAYER_URL
   const surveyMonumentsUrl = cfg.surveyMonumentsLayerUrl || DEFAULT_SURVEY_MONUMENTS_LAYER_URL
   const monumentHistoryUrl = cfg.monumentHistoryTableUrl || DEFAULT_MONUMENT_HISTORY_TABLE_URL
+  const traverseConnectionsUrl = cfg.traverseConnectionsLayerUrl || DEFAULT_TRAVERSE_CONNECTIONS_LAYER_URL
   const projectDisplayField = cfg.projectDisplayField || 'Name'
   const projectGlobalIdField = cfg.projectGlobalIdField || 'GlobalID'
   const monumentGlobalIdField = cfg.monumentGlobalIdField || 'GlobalID'
@@ -405,6 +957,23 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
     if (size < 1024 * 1024) return `${(size / 1024).toFixed(1)} KB`
     return `${(size / 1024 / 1024).toFixed(1)} MB`
   }
+
+  const formatTraverseNumber = (value?: number, precision = 3) =>
+    value === undefined || !Number.isFinite(value) ? '-' : value.toFixed(precision)
+
+  const getFinalizeEditsByPointId = React.useCallback((pointId: string) =>
+    (finalizePlan?.edits || []).filter((edit) => edit.pointId === pointId),
+  [finalizePlan?.edits])
+
+  const getFinalizeEditLabel = React.useCallback((pointId: string, kinds: FinalizeEditKind[]) => {
+    const match = getFinalizeEditsByPointId(pointId).find((edit) => kinds.includes(edit.kind))
+    return match ? match.label.split(':')[0] : '-'
+  }, [getFinalizeEditsByPointId])
+
+  const validationErrorCount = finalizePlan?.validations.filter((validation) => validation.severity === 'error').length || 0
+  const validationWarningCount = finalizePlan?.validations.filter((validation) => validation.severity === 'warning').length || 0
+  const staticValidationErrorCount = parsedStaticData?.validations.filter((validation) => validation.severity === 'error').length || 0
+  const staticValidationWarningCount = parsedStaticData?.validations.filter((validation) => validation.severity === 'warning').length || 0
 
   const toProjectSummary = React.useCallback((attributes: { [key: string]: any }): MonumentProjectSummary => ({
     objectId: attributes.OBJECTID,
@@ -657,6 +1226,17 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
     getRuntimeDataSources(surveyMonumentsUrl, surveyMonumentDataSourceIds),
   [getRuntimeDataSources, surveyMonumentDataSourceIds, surveyMonumentsUrl])
 
+  const getMonumentProjectsLayer = React.useCallback(async () => {
+    if (monumentProjectsLayerRef.current?.url === monumentProjectsUrl) {
+      return monumentProjectsLayerRef.current.layer
+    }
+    const [FeatureLayer] = await loadArcGISJSAPIModules(['esri/layers/FeatureLayer'])
+    const layer = new FeatureLayer({ url: monumentProjectsUrl })
+    await layer.load()
+    monumentProjectsLayerRef.current = { url: monumentProjectsUrl, layer }
+    return layer
+  }, [monumentProjectsUrl])
+
   const getMonumentHistoryLayer = React.useCallback(async () => {
     if (monumentHistoryLayerRef.current?.url === monumentHistoryUrl) {
       return monumentHistoryLayerRef.current.layer
@@ -848,6 +1428,40 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
     setAttachmentItems([])
     setAttachmentError('')
     clearStagedAttachmentFiles()
+  }
+
+  const openValidationModal = () => {
+    setValidationTab('summary')
+    setValidationModalOpen(true)
+  }
+
+  const closeValidationModal = () => {
+    setValidationModalOpen(false)
+  }
+
+  const reviewTraverseValidation = () => {
+    setValidationReviewMode('traverse')
+    openValidationModal()
+    if (traverseFiles.length > 0) stageProcessTraverseFiles().catch(() => undefined)
+  }
+
+  const reviewStaticValidation = () => {
+    setValidationReviewMode('static')
+    openValidationModal()
+    const staticFile = staticFiles[0]
+    if (!staticFile) return
+
+    const parsedStaticFile = parseStaticText(staticFile.text, staticFile.id, staticFile.name)
+    setParsedStaticData(parsedStaticFile)
+    if (parsedStaticFile.basisOfBearing) setBasisOfBearing(parsedStaticFile.basisOfBearing)
+    const errorCount = parsedStaticFile.validations.filter((validation) => validation.severity === 'error').length
+    const warningCount = parsedStaticFile.validations.filter((validation) => validation.severity === 'warning').length
+    setStatus(`${m.staticValidationReady}: ${parsedStaticFile.projectControls.length} ${m.projectControlsLabel}, ${errorCount} ${m.errorsLabel}, ${warningCount} ${m.warningsLabel}`)
+  }
+
+  const stageFinalizeProjectEdits = () => {
+    if (!finalizePlan) return
+    setStatus(`${m.traverseMode}: ${finalizePlan.edits.length} ${m.plannedEditsLabel}. ${m.finalizeProjectPending}`)
   }
 
   const selectMonumentHistoryRecord = React.useCallback(async (objectId?: string | number | null) => {
@@ -2009,6 +2623,278 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
     setStatus(`${m.createTitle}: ${projectName}, ${projectCsvRowCount}. ${m.createProjectPending}`)
   }
 
+  const queryFinalizeHistoryByPointNumbers = React.useCallback(async (
+    projectGlobalId: string,
+    pointNumbers: string[]
+  ) => {
+    const uniquePointNumbers = Array.from(new Set(pointNumbers.map((pointNumber) => pointNumber.trim()).filter(Boolean)))
+    const historiesByPointNumber = new Map<string, FinalizeHistoryRecord[]>()
+    if (!projectGlobalId || uniquePointNumbers.length === 0) return historiesByPointNumber
+
+    for (let offset = 0; offset < uniquePointNumbers.length; offset += MONUMENT_GLOBAL_ID_QUERY_CHUNK_SIZE) {
+      const batch = uniquePointNumbers.slice(offset, offset + MONUMENT_GLOBAL_ID_QUERY_CHUNK_SIZE)
+      const query = new URL(`${monumentHistoryUrl}/query`)
+      query.search = new URLSearchParams({
+        where: `${historyProjectGlobalIdField} = '${escapeSqlString(projectGlobalId)}' AND PointNumber IN (${batch.map((pointNumber) => `'${escapeSqlString(pointNumber)}'`).join(',')})`,
+        outFields: [
+          'OBJECTID',
+          'GlobalID',
+          historyMonumentGlobalIdField,
+          'PointNumber'
+        ].join(','),
+        returnGeometry: 'false',
+        resultRecordCount: String(HISTORY_QUERY_LIMIT),
+        f: 'json'
+      }).toString()
+
+      const response = await fetch(query.toString())
+      const data = await response.json() as QueryResponse
+      if (!response.ok || data.error) throw new Error(data.error?.message || response.statusText)
+
+      ;(data.features || []).forEach((feature) => {
+        const attributes = feature.attributes || {}
+        const pointNumber = getStringAttribute(attributes, 'PointNumber')
+        if (!pointNumber) return
+        const key = pointNumber.trim().toLowerCase()
+        historiesByPointNumber.set(key, [
+          ...(historiesByPointNumber.get(key) || []),
+          {
+            objectId: getAttributeValue(attributes, 'OBJECTID'),
+            globalId: getStringAttribute(attributes, 'GlobalID'),
+            pointGlobalId: getStringAttribute(attributes, historyMonumentGlobalIdField),
+            pointNumber
+          }
+        ])
+      })
+    }
+
+    return historiesByPointNumber
+  }, [historyMonumentGlobalIdField, historyProjectGlobalIdField, monumentHistoryUrl])
+
+  const queryFinalizeSurveyMonumentsByGlobalIds = React.useCallback(async (globalIds: string[]) => {
+    const uniqueGlobalIds = Array.from(new Set(globalIds.map((globalId) => globalId.trim()).filter(Boolean)))
+    const monumentsByGlobalId = new Map<string, FinalizeSurveyMonumentRecord>()
+    if (uniqueGlobalIds.length === 0) return monumentsByGlobalId
+
+    for (let offset = 0; offset < uniqueGlobalIds.length; offset += MONUMENT_GLOBAL_ID_QUERY_CHUNK_SIZE) {
+      const batch = uniqueGlobalIds.slice(offset, offset + MONUMENT_GLOBAL_ID_QUERY_CHUNK_SIZE)
+      const query = new URL(`${surveyMonumentsUrl}/query`)
+      query.search = new URLSearchParams({
+        where: `${monumentGlobalIdField} IN (${batch.map((globalId) => `'${escapeSqlString(globalId)}'`).join(',')})`,
+        outFields: [
+          'OBJECTID',
+          monumentGlobalIdField,
+          monumentPointNumberField
+        ].join(','),
+        returnGeometry: 'false',
+        resultRecordCount: String(HISTORY_QUERY_LIMIT),
+        f: 'json'
+      }).toString()
+
+      const response = await fetch(query.toString())
+      const data = await response.json() as QueryResponse
+      if (!response.ok || data.error) throw new Error(data.error?.message || response.statusText)
+
+      ;(data.features || []).forEach((feature) => {
+        const attributes = feature.attributes || {}
+        const globalId = getStringAttribute(attributes, monumentGlobalIdField)
+        if (!globalId) return
+        monumentsByGlobalId.set(globalId.trim().toLowerCase(), {
+          objectId: getAttributeValue(attributes, 'OBJECTID'),
+          globalId,
+          pointNumber: getStringAttribute(attributes, monumentPointNumberField)
+        })
+      })
+    }
+
+    return monumentsByGlobalId
+  }, [monumentGlobalIdField, monumentPointNumberField, surveyMonumentsUrl])
+
+  const buildFinalizePlan = React.useCallback(async (traverseData: ParsedTraverseData): Promise<FinalizePlan> => {
+    const counts = emptyFinalizeCounts()
+    const edits: PlannedFinalizeEdit[] = []
+    const validations: FinalizeValidationMessage[] = []
+    const projectGlobalId = selectedProject?.globalId || ''
+
+    if (!projectGlobalId) {
+      validations.push({ severity: 'error', message: m.selectProjectFirst })
+      return { edits, validations, counts, canCommit: false }
+    }
+
+    traverseData.monuments.forEach((monument) => {
+      if (!hasCoordinatePair(monument)) {
+        validations.push({
+          severity: 'error',
+          pointId: monument.pointId,
+          message: m.traverseMissingCoordinates
+        })
+      }
+    })
+    traverseData.connections.forEach((connection) => {
+      if (connection.distance === undefined || connection.direction === undefined) {
+        validations.push({
+          severity: 'warning',
+          pointId: `${connection.fromPointNum}-${connection.toPointNum}`,
+          message: m.traverseConnectionMissingCoordinates
+        })
+      }
+    })
+
+    const historiesByPointNumber = await queryFinalizeHistoryByPointNumbers(
+      projectGlobalId,
+      traverseData.monuments.map((monument) => monument.pointId)
+    )
+    const historyPointGlobalIds = Array.from(historiesByPointNumber.values())
+      .flat()
+      .map((history) => history.pointGlobalId)
+      .filter(Boolean)
+    const surveyMonumentsByGlobalId = await queryFinalizeSurveyMonumentsByGlobalIds(historyPointGlobalIds)
+
+    traverseData.monuments.forEach((monument) => {
+      const historyRecords = historiesByPointNumber.get(monument.pointId.trim().toLowerCase()) || []
+      if (historyRecords.length > 1) {
+        validations.push({
+          severity: 'warning',
+          pointId: monument.pointId,
+          message: m.finalizeDuplicateHistory
+        })
+      }
+
+      const historyAttributes = {
+        PointNumber: monument.pointId,
+        StdDevN: monument.stdDevN,
+        StdDevE: monument.stdDevE,
+        StdDevElev: monument.stdDevElev,
+        FixedStation: monument.fixedStation ? 1 : 0,
+        XCoordinate: monument.easting,
+        YCoordinate: monument.northing,
+        ProjectGlobalID: projectGlobalId,
+        Remarks: monument.description
+      }
+      const geometry = hasCoordinatePair(monument)
+        ? { x: monument.easting, y: monument.northing }
+        : undefined
+
+      if (historyRecords.length > 0) {
+        historyRecords.forEach((history) => {
+          edits.push({
+            kind: 'update-history',
+            label: `${m.finalizeUpdateHistory}: ${monument.pointId}`,
+            pointId: monument.pointId,
+            objectId: history.objectId,
+            globalId: history.globalId,
+            attributes: historyAttributes
+          })
+          countFinalizeEdit(counts, 'update-history')
+        })
+        const relatedHistory = historyRecords.find((history) => history.pointGlobalId) || historyRecords[0]
+        const relatedSurveyMonument = relatedHistory.pointGlobalId
+          ? surveyMonumentsByGlobalId.get(relatedHistory.pointGlobalId.trim().toLowerCase())
+          : null
+        if (relatedSurveyMonument && geometry) {
+          edits.push({
+            kind: 'update-survey-monument',
+            label: `${m.finalizeUpdateSurveyMonument}: ${monument.pointId}`,
+            pointId: monument.pointId,
+            objectId: relatedSurveyMonument.objectId,
+            globalId: relatedSurveyMonument.globalId,
+            geometry
+          })
+          countFinalizeEdit(counts, 'update-survey-monument')
+        } else if (geometry) {
+          edits.push({
+            kind: 'create-survey-monument',
+            label: `${m.finalizeCreateSurveyMonument}: ${monument.pointId}`,
+            pointId: monument.pointId,
+            attributes: { [monumentPointNumberField]: monument.pointId },
+            geometry
+          })
+          edits.push({
+            kind: 'backfill-history-relationship',
+            label: `${m.finalizeBackfillHistory}: ${monument.pointId}`,
+            pointId: monument.pointId,
+            objectId: relatedHistory.objectId
+          })
+          countFinalizeEdit(counts, 'create-survey-monument')
+          countFinalizeEdit(counts, 'backfill-history-relationship')
+        }
+      } else {
+        edits.push({
+          kind: 'create-history',
+          label: `${m.finalizeCreateHistory}: ${monument.pointId}`,
+          pointId: monument.pointId,
+          attributes: historyAttributes
+        })
+        countFinalizeEdit(counts, 'create-history')
+        if (geometry) {
+          edits.push({
+            kind: 'create-survey-monument',
+            label: `${m.finalizeCreateSurveyMonument}: ${monument.pointId}`,
+            pointId: monument.pointId,
+            attributes: { [monumentPointNumberField]: monument.pointId },
+            geometry
+          })
+          edits.push({
+            kind: 'backfill-history-relationship',
+            label: `${m.finalizeBackfillHistory}: ${monument.pointId}`,
+            pointId: monument.pointId
+          })
+          countFinalizeEdit(counts, 'create-survey-monument')
+          countFinalizeEdit(counts, 'backfill-history-relationship')
+        }
+      }
+    })
+
+    traverseData.connections.forEach((connection) => {
+      edits.push({
+        kind: 'create-traverse-connection',
+        label: `${m.finalizeCreateTraverseConnection}: ${connection.fromPointNum}-${connection.toPointNum}`,
+        pointId: `${connection.fromPointNum}-${connection.toPointNum}`,
+        attributes: {
+          ProjectID: projectGlobalId,
+          FromPointNum: connection.fromPointNum,
+          ToPointNum: connection.toPointNum,
+          FromPointN: connection.fromPointN,
+          FromPointE: connection.fromPointE,
+          ToPointN: connection.toPointN,
+          ToPointE: connection.toPointE,
+          Distance: connection.distance,
+          Direction: connection.direction
+        }
+      })
+      countFinalizeEdit(counts, 'create-traverse-connection')
+    })
+
+    validations.push({
+      severity: 'info',
+      message: `${m.finalizeDryRunOnly}: ${traverseConnectionsUrl}`
+    })
+
+    return {
+      edits,
+      validations,
+      counts,
+      canCommit: validations.every((validation) => validation.severity !== 'error')
+    }
+  }, [
+    m.finalizeBackfillHistory,
+    m.finalizeCreateHistory,
+    m.finalizeCreateSurveyMonument,
+    m.finalizeCreateTraverseConnection,
+    m.finalizeDryRunOnly,
+    m.finalizeDuplicateHistory,
+    m.finalizeUpdateHistory,
+    m.finalizeUpdateSurveyMonument,
+    m.selectProjectFirst,
+    m.traverseConnectionMissingCoordinates,
+    m.traverseMissingCoordinates,
+    monumentPointNumberField,
+    queryFinalizeHistoryByPointNumbers,
+    queryFinalizeSurveyMonumentsByGlobalIds,
+    selectedProject?.globalId,
+    traverseConnectionsUrl
+  ])
+
   const parseTraverseFile = async (file: File): Promise<TraverseFileSummary> => {
     const text = await file.text()
     const lines = text.split(/\r?\n/)
@@ -2018,9 +2904,19 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
       size: file.size,
       lineCount: lines.length,
       nonEmptyLineCount: lines.filter((line) => line.trim().length > 0).length,
+      text,
       basisOfBearing: extractBasisOfBearing(text)
     }
   }
+
+  const getProjectFileNameValidationStatus = React.useCallback((files: TraverseFileSummary[]) => {
+    const projectName = selectedProject?.name || ''
+    if (!projectName || files.length === 0) return ''
+
+    const mismatchedFiles = files.filter((file) => !namesLookSimilar(projectName, file.name))
+    if (mismatchedFiles.length === 0) return `${m.projectFileNameValidated}: ${projectName}`
+    return m.projectFileNameMismatch
+  }, [m.projectFileNameMismatch, m.projectFileNameValidated, selectedProject?.name])
 
   const importTraverseFiles = React.useCallback(async (files: FileList | File[]) => {
     const incomingFiles = Array.from(files).filter((file) => file.name.toLowerCase().endsWith('.lst'))
@@ -2030,14 +2926,18 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
     try {
       const parsedFiles = await Promise.all(incomingFiles.map(parseTraverseFile))
       setTraverseFiles(parsedFiles)
-      setStatus(`${m.traverseParsed}: ${parsedFiles.length}`)
+      setParsedTraverseData(null)
+      setParsedStaticData(null)
+      setFinalizePlan(null)
+      setValidationModalOpen(false)
+      setStatus(getProjectFileNameValidationStatus(parsedFiles) || `${m.traverseParsed}: ${parsedFiles.length}`)
     } catch (err) {
       const message = err instanceof Error ? err.message : m.traverseParseFailed
       setStatus(`${m.traverseParseFailed} ${message || ''}`.trim())
     } finally {
       setLoadingTraverseFiles(false)
     }
-  }, [m.traverseParsed, m.traverseParseFailed])
+  }, [getProjectFileNameValidationStatus, m.traverseParsed, m.traverseParseFailed])
 
   const importStaticFile = React.useCallback(async (file?: File) => {
     if (!file) return
@@ -2047,42 +2947,124 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
       const parsedFile = await parseTraverseFile(file)
       setStaticFiles([parsedFile])
       setBasisOfBearing(parsedFile.basisOfBearing || '')
-      setStatus(`${m.traverseParsed}: 1`)
+      setParsedTraverseData(null)
+      setParsedStaticData(null)
+      setFinalizePlan(null)
+      setValidationModalOpen(false)
+      setStatus(getProjectFileNameValidationStatus([parsedFile]) || `${m.traverseParsed}: 1`)
     } catch (err) {
       const message = err instanceof Error ? err.message : m.traverseParseFailed
       setStatus(`${m.traverseParseFailed} ${message || ''}`.trim())
     } finally {
       setLoadingTraverseFiles(false)
     }
-  }, [m.traverseParsed, m.traverseParseFailed])
+  }, [getProjectFileNameValidationStatus, m.traverseParsed, m.traverseParseFailed])
 
   const resetTraverseFiles = () => {
     setTraverseFiles([])
+    setParsedTraverseData(null)
+    setParsedStaticData(null)
+    setFinalizePlan(null)
+    setValidationModalOpen(false)
     setStatus(m.traverseFilesReset)
   }
 
-  const stageProcessTraverseFiles = () => {
-    setStatus(`${m.processFiles}: ${traverseFiles.length}. ${m.traverseProcessPending}`)
+  const stageProcessTraverseFiles = async () => {
+    setLoadingTraverseFiles(true)
+    const fileResults = traverseFiles.map((file) => parseTraverseText(file.text, file.id, file.name, staticFiles.length === 0))
+    const monumentsByPointId = new Map<string, ParsedTraverseMonument>()
+    const fixedStations = new Set<string>()
+
+    fileResults.forEach((result) => {
+      result.fixedStations.forEach((pointId) => fixedStations.add(pointId))
+      result.monuments.forEach((monument) => {
+        if (!monumentsByPointId.has(monument.pointId)) monumentsByPointId.set(monument.pointId, monument)
+      })
+    })
+    fixedStations.forEach((pointId) => {
+      const monument = monumentsByPointId.get(pointId)
+      if (monument) monument.fixedStation = true
+    })
+    const enrichedFileResults = fileResults.map((result) => ({
+      ...result,
+      connections: enrichTraverseConnections(result.connections, monumentsByPointId)
+    }))
+    const connections = enrichedFileResults.flatMap((result) => result.connections)
+    const calculatedConnectionCount = connections.filter((connection) =>
+      connection.distance !== undefined && connection.direction !== undefined
+    ).length
+
+    const parsedData = {
+      monuments: Array.from(monumentsByPointId.values()),
+      connections,
+      fixedStations: Array.from(fixedStations),
+      files: enrichedFileResults
+    }
+    try {
+      const plan = await buildFinalizePlan(parsedData)
+      await createFinalizeStepRunner([{
+        label: m.finalizeDryRunOnly,
+        execute: () => Promise.resolve(),
+        rollback: () => Promise.resolve()
+      }])
+      setParsedTraverseData(parsedData)
+      setFinalizePlan(plan)
+      setStatus(`${m.traverseProcessed}: ${parsedData.monuments.length} ${m.traverseMonumentsLabel}, ${parsedData.connections.length} ${m.traverseConnectionsLabel}, ${calculatedConnectionCount} ${m.traverseCalculatedLabel}, ${parsedData.fixedStations.length} ${m.fixedStationsLabel}. ${m.finalizePlanReady}: ${plan.edits.length}`)
+    } catch (err) {
+      const message = err instanceof Error ? err.message : m.finalizePlanFailed
+      setFinalizePlan(null)
+      setStatus(`${m.finalizePlanFailed} ${message || ''}`.trim())
+    } finally {
+      setLoadingTraverseFiles(false)
+    }
   }
 
   const resetStaticFile = () => {
     setStaticFiles([])
     setBasisOfBearing('')
+    setParsedTraverseData(null)
+    setParsedStaticData(null)
+    setFinalizePlan(null)
+    setValidationModalOpen(false)
     setStatus(m.staticFileReset)
   }
 
-  const stageProcessStaticFile = () => {
-    const staticFileName = staticFiles[0]?.name || '-'
-    setStatus(`${m.processFile}: ${staticFileName}. ${m.staticProcessPending}`)
-  }
+  const acceptBasisOfBearing = async () => {
+    const value = basisOfBearing.trim()
+    if (!value) return
+    if (!selectedProject) {
+      setStatus(m.selectProjectFirst)
+      return
+    }
 
-  const clearBasisOfBearing = () => {
-    setBasisOfBearing('')
-    setStatus(m.basisOfBearingCleared)
-  }
+    const objectId = getNumericObjectId(selectedProject.objectId)
+    if (objectId === null) {
+      setStatus(m.basisOfBearingUpdateFailed)
+      return
+    }
 
-  const acceptBasisOfBearing = () => {
-    setStatus(`${m.basisOfBearingAccepted} ${basisOfBearing.trim()}`)
+    setAcceptingBasisOfBearing(true)
+    try {
+      const layer = await getMonumentProjectsLayer()
+      const results = await layer.applyEdits({
+        updateFeatures: [{
+          attributes: {
+            OBJECTID: objectId,
+            [PROJECT_BASIS_OF_BEARING_FIELD]: value
+          }
+        }]
+      }, {
+        rollbackOnFailureEnabled: true
+      })
+      const failedResult = (results.updateFeatureResults || []).find((result: any) => result?.error)
+      if (failedResult) throw new Error(failedResult.error?.message || m.basisOfBearingUpdateFailed)
+      setStatus(`${m.basisOfBearingAccepted} ${value}`)
+    } catch (err) {
+      const message = err instanceof Error ? err.message : m.basisOfBearingUpdateFailed
+      setStatus(`${m.basisOfBearingUpdateFailed} ${message || ''}`.trim())
+    } finally {
+      setAcceptingBasisOfBearing(false)
+    }
   }
 
   const toggleUseSelectedProjectForCreate = () => {
@@ -2951,6 +3933,284 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
     h('div', { style: { flex: '0 0 auto', fontSize: 10, opacity: 0.68 } }, formatFileSize(file.size))
     )
 
+  const validationTabButton = (tab: FinalizeValidationTab, label: string) =>
+    h(Button, {
+      key: tab,
+      size: 'sm',
+      type: validationTab === tab ? 'primary' : 'default',
+      style: { height: 28, padding: '0 8px', fontSize: 11 },
+      onClick: () => {
+        setValidationTab(tab)
+      }
+    }, label)
+
+  const validationCountTile = (label: string, value: number | string) =>
+    h('div', {
+      className: 'border rounded p-2',
+      style: { minWidth: 100, flex: '1 1 120px', backgroundColor: 'rgba(0, 0, 0, 0.02)' }
+    },
+    h('div', { style: { fontSize: 10, opacity: 0.68 } }, label),
+    h('div', { style: { fontSize: 17, fontWeight: 700, lineHeight: '22px' } }, String(value))
+    )
+
+  const validationDataRow = (cells: Array<string | number | undefined>, key: string) =>
+    h('div', {
+      key,
+      className: 'd-grid py-1',
+      style: {
+        display: 'grid',
+        gridTemplateColumns: `repeat(${cells.length}, minmax(82px, 1fr))`,
+        gap: '0.45rem',
+        fontSize: 11,
+        borderBottom: '1px solid rgba(0, 0, 0, 0.06)'
+      }
+    },
+    ...cells.map((cell, index) =>
+      h('div', {
+        key: `${key}-${index}`,
+        title: cell === undefined ? '-' : String(cell),
+        style: { minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }
+      }, cell === undefined || cell === '' ? '-' : String(cell))
+    )
+    )
+
+  const validationHeaderRow = (cells: string[]) =>
+    h('div', {
+      className: 'd-grid pb-1',
+      style: {
+        display: 'grid',
+        gridTemplateColumns: `repeat(${cells.length}, minmax(82px, 1fr))`,
+        gap: '0.45rem',
+        fontSize: 10,
+        fontWeight: 700,
+        opacity: 0.72,
+        borderBottom: '1px solid rgba(0, 0, 0, 0.12)'
+      }
+    },
+    ...cells.map((cell) => h('div', { key: cell }, cell))
+    )
+
+  const validationModalBody = () => {
+    if (validationReviewMode === 'static') {
+      if (!parsedStaticData) {
+        return h('div', { style: { fontSize: 12, opacity: 0.75 } }, m.staticValidationEmpty)
+      }
+
+      if (validationTab === 'summary') {
+        return h('div', { className: 'd-flex flex-column', style: { gap: '0.75rem' } },
+          h('div', { className: 'd-flex flex-wrap', style: { gap: '0.5rem' } },
+            validationCountTile(m.projectControlsLabel, parsedStaticData.projectControls.length),
+            validationCountTile(m.fixedStationsLabel, parsedStaticData.projectControls.filter((control) => control.fixedStation).length),
+            validationCountTile(m.nonControlStationsLabel, parsedStaticData.projectControls.filter((control) => control.nonControlStation).length),
+            validationCountTile(m.errorsLabel, staticValidationErrorCount),
+            validationCountTile(m.warningsLabel, staticValidationWarningCount),
+            validationCountTile(m.basisOfBearingTitle, parsedStaticData.basisOfBearing || '-')
+          ),
+          h('div', null,
+            validationHeaderRow([m.workflowStepLabel, m.countLabel, m.statusLabel]),
+            validationDataRow([m.adjustedStationInformationLabel, parsedStaticData.projectControls.filter((control) => !control.nonControlStation).length, m.readyLabel], 'static-adjusted-station-info'),
+            validationDataRow([m.adjustedCoordinatesLabel, parsedStaticData.projectControls.filter((control) => control.northing !== undefined && control.easting !== undefined).length, staticValidationErrorCount > 0 ? m.needsReviewLabel : m.readyLabel], 'static-adjusted-coordinates')
+          )
+        )
+      }
+
+      if (validationTab === 'monuments') {
+        return h('div', null,
+          validationHeaderRow([m.stationLabel, m.resNLabel, m.resELabel, m.fixedStationLabel, m.northingLabel, m.eastingLabel, m.elevationLabel, m.controlTypeLabel]),
+          ...parsedStaticData.projectControls.map((control) =>
+            validationDataRow([
+              control.name,
+              formatTraverseNumber(control.resN, 4),
+              formatTraverseNumber(control.resE, 4),
+              control.fixedStation ? m.yesLabel : m.noLabel,
+              formatTraverseNumber(control.northing),
+              formatTraverseNumber(control.easting),
+              formatTraverseNumber(control.elevation),
+              control.nonControlStation ? m.nonControlStationLabel : m.controlStationLabel
+            ], `static-control-${control.name}`)
+          )
+        )
+      }
+
+      if (validationTab === 'issues') {
+        return h('div', null,
+          parsedStaticData.validations.length === 0
+            ? h('div', { style: { fontSize: 12, opacity: 0.75 } }, m.noValidationIssues)
+            : parsedStaticData.validations.map((validation, index) =>
+              h('div', {
+                key: `${validation.severity}-${validation.pointId || index}`,
+                className: 'py-1',
+                style: {
+                  fontSize: 12,
+                  borderBottom: '1px solid rgba(0, 0, 0, 0.06)',
+                  color: validation.severity === 'error' ? 'var(--danger-600, #c92a2a)' : validation.severity === 'warning' ? 'var(--warning-700, #8a5a00)' : undefined
+                }
+              },
+              h('div', { style: { fontWeight: 700 } }, validation.severity.toUpperCase()),
+              h('div', null, `${validation.pointId ? `${validation.pointId} - ` : ''}${validation.message}`)
+              )
+            )
+        )
+      }
+
+      return h('div', { style: { fontSize: 12, opacity: 0.75 } }, m.staticValidationTabUnavailable)
+    }
+
+    if (!finalizePlan || !parsedTraverseData) {
+      return h('div', { style: { fontSize: 12, opacity: 0.75 } }, m.finalizePlanEmpty)
+    }
+
+    if (validationTab === 'summary') {
+      const workflowRows: Array<[string, number]> = [
+        [m.finalizeUpdateHistory, finalizePlan.counts['update-history']],
+        [m.finalizeCreateHistory, finalizePlan.counts['create-history']],
+        [m.finalizeUpdateSurveyMonument, finalizePlan.counts['update-survey-monument']],
+        [m.finalizeCreateSurveyMonument, finalizePlan.counts['create-survey-monument']],
+        [m.finalizeBackfillHistory, finalizePlan.counts['backfill-history-relationship']],
+        [m.finalizeCreateTraverseConnection, finalizePlan.counts['create-traverse-connection']]
+      ]
+      return h('div', { className: 'd-flex flex-column', style: { gap: '0.75rem' } },
+        h('div', { className: 'd-flex flex-wrap', style: { gap: '0.5rem' } },
+          validationCountTile(m.traverseMonumentsLabel, parsedTraverseData.monuments.length),
+          validationCountTile(m.traverseConnectionsLabel, parsedTraverseData.connections.length),
+          validationCountTile(m.fixedStationsLabel, parsedTraverseData.fixedStations.length),
+          validationCountTile(m.errorsLabel, validationErrorCount),
+          validationCountTile(m.warningsLabel, validationWarningCount)
+        ),
+        h('div', null,
+          validationHeaderRow([m.workflowStepLabel, m.countLabel, m.statusLabel]),
+          ...workflowRows.map(([label, count]) =>
+            validationDataRow([label, count, count > 0 ? m.readyLabel : '-'], `workflow-${label}`)
+          )
+        )
+      )
+    }
+
+    if (validationTab === 'monuments') {
+      return h('div', null,
+        validationHeaderRow([m.pointLabel, m.northingLabel, m.eastingLabel, m.fixedStationLabel, m.stdDevNLabel, m.stdDevELabel, m.actionLabel]),
+        ...parsedTraverseData.monuments.map((monument) =>
+          validationDataRow([
+            monument.pointId,
+            formatTraverseNumber(monument.northing),
+            formatTraverseNumber(monument.easting),
+            monument.fixedStation ? m.yesLabel : m.noLabel,
+            formatTraverseNumber(monument.stdDevN, 4),
+            formatTraverseNumber(monument.stdDevE, 4),
+            getFinalizeEditLabel(monument.pointId, ['update-survey-monument', 'create-survey-monument'])
+          ], `monument-${monument.pointId}`)
+        )
+      )
+    }
+
+    if (validationTab === 'connections') {
+      return h('div', null,
+        validationHeaderRow([m.fromLabel, m.toLabel, m.distanceLabel, m.directionLabel, m.statusLabel]),
+        ...parsedTraverseData.connections.map((connection, index) =>
+          validationDataRow([
+            connection.fromPointNum,
+            connection.toPointNum,
+            formatTraverseNumber(connection.distance),
+            formatTraverseNumber(connection.direction, 4),
+            connection.distance !== undefined && connection.direction !== undefined ? m.readyLabel : m.needsReviewLabel
+          ], `connection-${connection.fromPointNum}-${connection.toPointNum}-${index}`)
+        )
+      )
+    }
+
+    if (validationTab === 'history') {
+      return h('div', null,
+        validationHeaderRow([m.pointLabel, m.historyActionLabel, m.surveyActionLabel, m.relationshipActionLabel]),
+        ...parsedTraverseData.monuments.map((monument) =>
+          validationDataRow([
+            monument.pointId,
+            getFinalizeEditLabel(monument.pointId, ['update-history', 'create-history']),
+            getFinalizeEditLabel(monument.pointId, ['update-survey-monument', 'create-survey-monument']),
+            getFinalizeEditLabel(monument.pointId, ['backfill-history-relationship'])
+          ], `history-${monument.pointId}`)
+        )
+      )
+    }
+
+    return h('div', null,
+      finalizePlan.validations.length === 0
+        ? h('div', { style: { fontSize: 12, opacity: 0.75 } }, m.noValidationIssues)
+        : finalizePlan.validations.map((validation, index) =>
+          h('div', {
+            key: `${validation.severity}-${validation.pointId || index}`,
+            className: 'py-1',
+            style: {
+              fontSize: 12,
+              borderBottom: '1px solid rgba(0, 0, 0, 0.06)',
+              color: validation.severity === 'error' ? 'var(--danger-600, #c92a2a)' : validation.severity === 'warning' ? 'var(--warning-700, #8a5a00)' : undefined
+            }
+          },
+          h('div', { style: { fontWeight: 700 } }, validation.severity.toUpperCase()),
+          h('div', null, `${validation.pointId ? `${validation.pointId} - ` : ''}${validation.message}`)
+          )
+        )
+    )
+  }
+
+  const validationModal = () =>
+    h(Modal, {
+      isOpen: validationModalOpen,
+      toggle: closeValidationModal,
+      centered: true,
+      backdrop: 'static',
+      style: { width: 760, maxWidth: 'calc(100vw - 2rem)' }
+    },
+    h(ModalHeader, { toggle: closeValidationModal }, m.finalizeValidationTitle),
+    h(ModalBody, null,
+      h('div', { className: 'd-flex flex-column', style: { gap: '0.75rem', maxHeight: '68vh', minHeight: 360 } },
+        validationReviewMode === 'traverse' && finalizePlan && h('div', {
+          className: 'border rounded p-2',
+          style: {
+            fontSize: 12,
+            fontWeight: 700,
+            color: validationErrorCount > 0 ? 'var(--danger-600, #c92a2a)' : undefined,
+            backgroundColor: 'rgba(0, 0, 0, 0.02)'
+          }
+        }, validationErrorCount > 0
+          ? `${m.cannotFinalizeLabel}: ${validationErrorCount} ${m.errorsLabel}`
+          : `${m.readyToFinalizeLabel}: ${finalizePlan.edits.length} ${m.plannedEditsLabel}`
+        ),
+        validationReviewMode === 'static' && parsedStaticData && h('div', {
+          className: 'border rounded p-2',
+          style: {
+            fontSize: 12,
+            fontWeight: 700,
+            color: staticValidationErrorCount > 0 ? 'var(--danger-600, #c92a2a)' : undefined,
+            backgroundColor: 'rgba(0, 0, 0, 0.02)'
+          }
+        }, staticValidationErrorCount > 0
+          ? `${m.needsReviewLabel}: ${staticValidationErrorCount} ${m.errorsLabel}`
+          : `${m.staticValidationReady}: ${parsedStaticData.projectControls.length} ${m.projectControlsLabel}`
+        ),
+        h('div', { className: 'd-flex flex-wrap', style: { gap: '0.35rem' } },
+          validationTabButton('summary', m.summaryTab),
+          validationTabButton('monuments', m.monumentsTab),
+          validationReviewMode === 'traverse' && validationTabButton('connections', m.connectionsTab),
+          validationReviewMode === 'traverse' && validationTabButton('history', m.historyTab),
+          validationTabButton('issues', m.issuesTab)
+        ),
+        h('div', { className: 'flex-grow-1', style: { minHeight: 0, overflowY: 'auto', overflowX: 'auto' } },
+          validationModalBody()
+        )
+      )
+    ),
+    h(ModalFooter, null,
+      h(Button, {
+        type: 'default',
+        onClick: closeValidationModal
+      }, m.close),
+      validationReviewMode === 'traverse' && h(Button, {
+        type: 'primary',
+        disabled: loadingTraverseFiles || !finalizePlan || !finalizePlan.canCommit,
+        onClick: stageFinalizeProjectEdits
+      }, m.traverseMode)
+    ))
+
   const traversePanel = () =>
     h('div', { className: 'd-flex flex-column flex-grow-1', style: { gap: '0.75rem', minHeight: 0 } },
       h('div', { className: 'd-flex align-items-center justify-content-between', style: { gap: '0.5rem' } },
@@ -2964,7 +4224,7 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
         }, m.cancel)
       ),
       selectedProject && h('div', { style: { fontSize: 14, fontWeight: 700, lineHeight: '18px', overflowWrap: 'anywhere' } }, selectedProject.name),
-      h('div', { className: 'border rounded p-2 d-flex flex-column', style: { minHeight: 159, flex: '1.44 1 0' } },
+      h('div', { className: 'border rounded p-2 d-flex flex-column', style: { minHeight: 150, flex: '1 1 0' } },
         h('div', { className: 'd-flex align-items-center justify-content-between mb-2', style: { gap: '0.5rem' } },
           h('div', { className: 'font-weight-bold', style: { fontSize: 12 } }, m.traverseFilesTitle),
           h(Button, {
@@ -3005,21 +4265,21 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
             }
           }, m.chooseLstFiles),
           h(Button, {
-            type: 'primary',
+            type: 'default',
             size: 'sm',
             disabled: loadingTraverseFiles || traverseFiles.length === 0,
             style: modeActionButtonStyle,
-            onClick: stageProcessTraverseFiles
-          }, m.processFiles)
+            onClick: reviewTraverseValidation
+          }, m.reviewValidation)
         )
       ),
-      h('div', { className: 'border rounded p-2 d-flex flex-column', style: { minHeight: 110, flex: '1 1 0' } },
+      h('div', { className: 'border rounded p-2 d-flex flex-column', style: { minHeight: 150, flex: '1 1 0' } },
         h('div', { className: 'd-flex align-items-center justify-content-between mb-2', style: { gap: '0.5rem' } },
-          h('div', { className: 'font-weight-bold', style: { fontSize: 12 } }, m.selectStaticFileTitle),
+          h('div', { className: 'font-weight-bold', style: { fontSize: 12 } }, m.calculateBasisOfBearingTitle),
           h(Button, {
             size: 'sm',
             type: 'tertiary',
-            disabled: loadingTraverseFiles || staticFiles.length === 0,
+            disabled: loadingTraverseFiles || (staticFiles.length === 0 && basisOfBearing.trim().length === 0),
             onClick: resetStaticFile,
             style: { height: 24, padding: '0 6px', fontSize: 11 }
           }, m.clear)
@@ -3034,12 +4294,21 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
             evt.target.value = ''
           }
         }),
-        h('div', { className: 'flex-grow-1', style: { minHeight: 0, overflowY: 'auto', overflowX: 'hidden' } },
+        h('div', { className: 'mb-3', style: { minHeight: 44, maxHeight: 72, overflowY: 'auto', overflowX: 'hidden' } },
+          h('div', { className: 'font-weight-bold mb-1', style: { fontSize: 11, opacity: 0.78 } }, m.staticFileLabel),
           staticFiles.length === 0
-            ? h('div', { style: { fontSize: 12, opacity: 0.72 } }, m.traverseFilesEmpty)
+            ? h('div', { style: { fontSize: 12, opacity: 0.72 } }, m.staticFilesEmpty)
             : staticFiles.map(traverseFileRow)
         ),
-        h('div', { className: 'd-flex mt-2', style: { gap: '0.35rem' } },
+        h('div', { className: 'font-weight-bold mb-1', style: { fontSize: 11, opacity: 0.78 } }, m.basisOfBearingTitle),
+        h(TextInput, {
+          value: basisOfBearing,
+          placeholder: m.basisOfBearingPlaceholder,
+          onChange: (evt) => {
+            setBasisOfBearing(evt.target.value)
+          }
+        }),
+        h('div', { className: 'd-flex', style: { gap: '0.35rem', marginTop: 'auto', paddingTop: '0.5rem' } },
           h(Button, {
             type: 'primary',
             size: 'sm',
@@ -3050,39 +4319,20 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
             }
           }, m.chooseStaticFile),
           h(Button, {
-            type: 'primary',
+            type: 'default',
             size: 'sm',
             disabled: loadingTraverseFiles || staticFiles.length === 0,
             style: modeActionButtonStyle,
-            onClick: stageProcessStaticFile
-          }, m.processFile)
-        )
-      ),
-      h('div', { className: 'border rounded p-2 d-flex flex-column', style: { minHeight: 83, flex: '0.76 1 0' } },
-        h('div', { className: 'd-flex align-items-center justify-content-between mb-2', style: { gap: '0.5rem' } },
-          h('div', { className: 'font-weight-bold', style: { fontSize: 12 } }, m.basisOfBearingTitle),
-          h(Button, {
-            size: 'sm',
-            type: 'tertiary',
-            disabled: basisOfBearing.trim().length === 0,
-            onClick: clearBasisOfBearing,
-            style: { height: 24, padding: '0 6px', fontSize: 11 }
-          }, m.clear)
-        ),
-        h(TextInput, {
-          value: basisOfBearing,
-          placeholder: m.basisOfBearingPlaceholder,
-          onChange: (evt) => {
-            setBasisOfBearing(evt.target.value)
-          }
-        }),
-        h('div', { className: 'd-flex mt-2', style: { gap: '0.35rem' } },
+            onClick: reviewStaticValidation
+          }, m.reviewValidation),
           h(Button, {
             type: 'primary',
             size: 'sm',
             style: modeActionButtonStyle,
-            disabled: basisOfBearing.trim().length === 0,
-            onClick: acceptBasisOfBearing
+            disabled: acceptingBasisOfBearing || basisOfBearing.trim().length === 0 || !selectedProject,
+            onClick: () => {
+              acceptBasisOfBearing().catch(() => undefined)
+            }
           }, m.acceptBoB)
         )
       )
@@ -3133,10 +4383,15 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
           h('div', { className: 'font-weight-bold mb-2', style: { fontSize: 12 } }, m.selectedFeatures),
           h('div', { style: { fontSize: 12, opacity: 0.72 } }, m.selectedFeaturesEmpty)
         ),
-        shouldShowStatusAlert() && h(Alert, { form: 'basic', type: 'info', text: status })
+        shouldShowStatusAlert() && h(Alert, {
+          form: 'basic',
+          type: status === m.projectFileNameMismatch ? 'warning' : 'info',
+          text: status
+        })
       )
     ),
-    attachmentModal()
+    attachmentModal(),
+    validationModal()
   )
 }
 
