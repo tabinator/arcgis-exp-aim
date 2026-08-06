@@ -212,6 +212,40 @@ interface FinalizeSurveyMonumentRecord {
   pointNumber: string
 }
 
+interface AutoAssignHistoryCandidate {
+  objectId: number | string
+  pointGlobalId: string
+  pointNumber: string
+  projectGlobalId: string
+  createdDate?: number
+}
+
+type AutoAssignPlanAction = 'assign' | 'skip'
+
+interface AutoAssignPlanRow {
+  id: string
+  monumentKey: string
+  pointNumber: string
+  historyObjectId?: number | string
+  historyPointNumber?: string
+  currentProjectGlobalId?: string
+  currentProjectName?: string
+  createdDate?: number
+  action: AutoAssignPlanAction
+  status: string
+  severity: 'ready' | 'info' | 'warning' | 'error'
+}
+
+interface AutoAssignPlan {
+  rows: AutoAssignPlanRow[]
+  assignableRows: AutoAssignPlanRow[]
+  readyCount: number
+  alreadyAssignedCount: number
+  noEligibleHistoryCount: number
+  multipleCandidateCount: number
+  errorCount: number
+}
+
 interface MergeRollbackAction {
   label: string
   run: () => Promise<void>
@@ -820,6 +854,11 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
   const [historyError, setHistoryError] = React.useState('')
   const [loadingAssignHistory, setLoadingAssignHistory] = React.useState(false)
   const [addingAssignHistory, setAddingAssignHistory] = React.useState(false)
+  const [assigningHistoryProjectKey, setAssigningHistoryProjectKey] = React.useState('')
+  const [buildingAutoAssignPlan, setBuildingAutoAssignPlan] = React.useState(false)
+  const [autoAssigningHistory, setAutoAssigningHistory] = React.useState(false)
+  const [autoAssignPlan, setAutoAssignPlan] = React.useState<AutoAssignPlan | null>(null)
+  const [autoAssignModalOpen, setAutoAssignModalOpen] = React.useState(false)
   const [attachmentItems, setAttachmentItems] = React.useState<AttachmentSummary[]>([])
   const [stagedAttachmentFiles, setStagedAttachmentFiles] = React.useState<StagedAttachmentFile[]>([])
   const [attachmentError, setAttachmentError] = React.useState('')
@@ -960,6 +999,9 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
 
   const formatTraverseNumber = (value?: number, precision = 3) =>
     value === undefined || !Number.isFinite(value) ? '-' : value.toFixed(precision)
+
+  const formatDateTime = (value?: number) =>
+    value ? new Date(value).toLocaleString() : '-'
 
   const getFinalizeEditsByPointId = React.useCallback((pointId: string) =>
     (finalizePlan?.edits || []).filter((edit) => edit.pointId === pointId),
@@ -1794,6 +1836,222 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
     }
   }, [historyMonumentGlobalIdField, historyProjectGlobalIdField, loadProjectNamesByGlobalIds, m.assignHistoryLoaded, m.assignSurveyMissingGlobalId, m.historyLoadFailed, monumentHistoryUrl, toHistorySummary])
 
+  const loadAutoAssignHistoryCandidates = React.useCallback(async (monumentGlobalIds: string[]) => {
+    const uniqueGlobalIds = Array.from(new Set(monumentGlobalIds.map((globalId) => globalId.trim()).filter(Boolean)))
+    const candidatesByMonumentGlobalId = new Map<string, AutoAssignHistoryCandidate[]>()
+    if (uniqueGlobalIds.length === 0) return candidatesByMonumentGlobalId
+
+    for (let offset = 0; offset < uniqueGlobalIds.length; offset += MONUMENT_GLOBAL_ID_QUERY_CHUNK_SIZE) {
+      const batch = uniqueGlobalIds.slice(offset, offset + MONUMENT_GLOBAL_ID_QUERY_CHUNK_SIZE)
+      const query = new URL(`${monumentHistoryUrl}/query`)
+      query.search = new URLSearchParams({
+        where: `${historyMonumentGlobalIdField} IN (${batch.map((globalId) => `'${escapeSqlString(globalId)}'`).join(',')})`,
+        outFields: [
+          'OBJECTID',
+          historyMonumentGlobalIdField,
+          historyProjectGlobalIdField,
+          'PointNumber',
+          'created_date'
+        ].join(','),
+        returnGeometry: 'false',
+        orderByFields: 'created_date DESC, OBJECTID DESC',
+        resultRecordCount: String(HISTORY_QUERY_LIMIT),
+        f: 'json'
+      }).toString()
+
+      const response = await fetch(query.toString())
+      const data = await response.json() as QueryResponse
+      if (!response.ok || data.error) throw new Error(data.error?.message || response.statusText)
+
+      ;(data.features || []).forEach((feature) => {
+        const attributes = feature.attributes || {}
+        const pointGlobalId = getStringAttribute(attributes, historyMonumentGlobalIdField)
+        if (!pointGlobalId) return
+        const key = pointGlobalId.trim().toLowerCase()
+        candidatesByMonumentGlobalId.set(key, [
+          ...(candidatesByMonumentGlobalId.get(key) || []),
+          {
+            objectId: getAttributeValue(attributes, 'OBJECTID'),
+            pointGlobalId,
+            pointNumber: getStringAttribute(attributes, 'PointNumber'),
+            projectGlobalId: getStringAttribute(attributes, historyProjectGlobalIdField),
+            createdDate: Number(getAttributeValue(attributes, 'created_date')) || undefined
+          }
+        ])
+      })
+    }
+
+    return candidatesByMonumentGlobalId
+  }, [historyMonumentGlobalIdField, historyProjectGlobalIdField, monumentHistoryUrl])
+
+  const buildAutoAssignPlan = React.useCallback(async (): Promise<AutoAssignPlan | null> => {
+    if (!selectedProject?.globalId) {
+      setStatus(m.historyMissingProjectId)
+      return null
+    }
+    if (assignSurveyMonuments.length === 0) {
+      setStatus(m.assignSelectSurveyMonuments)
+      return null
+    }
+
+    const assignableMonuments = assignSurveyMonuments.filter((monument) => Boolean(monument.globalId))
+    if (assignableMonuments.length === 0) {
+      setStatus(m.assignSurveyMissingGlobalId)
+      return null
+    }
+
+    const candidatesByMonumentGlobalId = await loadAutoAssignHistoryCandidates(assignableMonuments.map((monument) => monument.globalId || ''))
+    const assignedProjectNames = await loadProjectNamesByGlobalIds(
+      Array.from(candidatesByMonumentGlobalId.values())
+        .flat()
+        .map((candidate) => candidate.projectGlobalId)
+        .filter(Boolean)
+    )
+    const rows = assignSurveyMonuments.map((monument) => {
+      const monumentKey = getSurveyMonumentKey(monument)
+      if (!monument.globalId) {
+        return {
+          id: `missing-global-${monumentKey}`,
+          monumentKey,
+          pointNumber: monument.pointNumber,
+          action: 'skip' as AutoAssignPlanAction,
+          status: m.assignSurveyMissingGlobalId,
+          severity: 'error' as const
+        }
+      }
+
+      const candidates = candidatesByMonumentGlobalId.get(monument.globalId.trim().toLowerCase()) || []
+      const blankCandidates = candidates.filter((candidate) => !candidate.projectGlobalId)
+      if (blankCandidates.length > 0) {
+        const candidate = blankCandidates[0]
+        return {
+          id: `assign-${monumentKey}-${candidate.objectId}`,
+          monumentKey,
+          pointNumber: monument.pointNumber,
+          historyObjectId: candidate.objectId,
+          historyPointNumber: candidate.pointNumber,
+          createdDate: candidate.createdDate,
+          action: 'assign' as AutoAssignPlanAction,
+          status: blankCandidates.length > 1 ? m.autoAssignMultipleCandidates : m.readyLabel,
+          severity: blankCandidates.length > 1 ? 'warning' as const : 'ready' as const
+        }
+      }
+
+      if (candidates.some((candidate) => Boolean(candidate.projectGlobalId))) {
+        return {
+          id: `assigned-${monumentKey}`,
+          monumentKey,
+          pointNumber: monument.pointNumber,
+          historyObjectId: candidates[0]?.objectId,
+          historyPointNumber: candidates[0]?.pointNumber,
+          currentProjectGlobalId: candidates[0]?.projectGlobalId,
+          currentProjectName: assignedProjectNames.get(candidates[0]?.projectGlobalId || ''),
+          createdDate: candidates[0]?.createdDate,
+          action: 'skip' as AutoAssignPlanAction,
+          status: m.autoAssignAlreadyAssigned,
+          severity: 'info' as const
+        }
+      }
+
+      return {
+        id: `none-${monumentKey}`,
+        monumentKey,
+        pointNumber: monument.pointNumber,
+        action: 'skip' as AutoAssignPlanAction,
+        status: m.autoAssignNoEligibleHistory,
+        severity: 'warning' as const
+      }
+    })
+    const assignableRows = rows.filter((row) => row.action === 'assign' && row.historyObjectId !== undefined)
+
+    return {
+      rows,
+      assignableRows,
+      readyCount: assignableRows.length,
+      alreadyAssignedCount: rows.filter((row) => row.status === m.autoAssignAlreadyAssigned).length,
+      noEligibleHistoryCount: rows.filter((row) => row.status === m.autoAssignNoEligibleHistory).length,
+      multipleCandidateCount: rows.filter((row) => row.status === m.autoAssignMultipleCandidates).length,
+      errorCount: rows.filter((row) => row.severity === 'error').length
+    }
+  }, [
+    assignSurveyMonuments,
+    loadAutoAssignHistoryCandidates,
+    loadProjectNamesByGlobalIds,
+    m.assignSelectSurveyMonuments,
+    m.assignSurveyMissingGlobalId,
+    m.autoAssignAlreadyAssigned,
+    m.autoAssignMultipleCandidates,
+    m.autoAssignNoEligibleHistory,
+    m.historyMissingProjectId,
+    m.readyLabel,
+    selectedProject?.globalId
+  ])
+
+  const openAutoAssignReview = React.useCallback(async () => {
+    setBuildingAutoAssignPlan(true)
+    setAutoAssignModalOpen(true)
+    try {
+      const plan = await buildAutoAssignPlan()
+      setAutoAssignPlan(plan)
+      if (plan) setStatus(`${m.autoAssignPlanReady}: ${plan.readyCount}. ${m.autoAssignSkipped}: ${plan.rows.length - plan.readyCount}`)
+    } catch (err) {
+      const message = err instanceof Error ? err.message : m.autoAssignFailed
+      setAutoAssignPlan(null)
+      setStatus(`${m.autoAssignFailed} ${message || ''}`.trim())
+    } finally {
+      setBuildingAutoAssignPlan(false)
+    }
+  }, [buildAutoAssignPlan, m.autoAssignFailed, m.autoAssignPlanReady, m.autoAssignSkipped])
+
+  const applyAutoAssignPlan = React.useCallback(async () => {
+    if (!autoAssignPlan || !selectedProject?.globalId) return
+    const selectedCandidates = autoAssignPlan.assignableRows.filter((row) => row.historyObjectId !== undefined)
+
+    setAutoAssigningHistory(true)
+    try {
+      if (selectedCandidates.length === 0) {
+        setStatus(`${m.autoAssignComplete}: 0. ${m.autoAssignNoEligibleHistory}: ${autoAssignPlan.rows.length}`)
+        return
+      }
+      const layer = await getMonumentHistoryLayer()
+      const results = await layer.applyEdits({
+        updateFeatures: selectedCandidates.map((row) => ({
+          attributes: {
+            OBJECTID: row.historyObjectId,
+            [historyProjectGlobalIdField]: selectedProject.globalId
+          }
+        }))
+      }, {
+        rollbackOnFailureEnabled: true
+      })
+      const failedResult = (results.updateFeatureResults || []).find((result: any) => result?.error)
+      if (failedResult) throw new Error(failedResult.error?.message || m.autoAssignFailed)
+
+      const skippedCount = autoAssignPlan.rows.length - selectedCandidates.length
+      setStatus(`${m.autoAssignComplete}: ${selectedCandidates.length}. ${m.autoAssignSkipped}: ${skippedCount}`)
+      setAutoAssignModalOpen(false)
+      const activeMonument = assignSurveyMonuments.find((monument) => getSurveyMonumentKey(monument) === activeAssignSurveyKey)
+      if (activeMonument) await loadAssignHistoryForSurveyMonument(activeMonument)
+    } catch (err) {
+      const message = err instanceof Error ? err.message : m.autoAssignFailed
+      setStatus(`${m.autoAssignFailed} ${message || ''}`.trim())
+    } finally {
+      setAutoAssigningHistory(false)
+    }
+  }, [
+    activeAssignSurveyKey,
+    autoAssignPlan,
+    assignSurveyMonuments,
+    getMonumentHistoryLayer,
+    historyProjectGlobalIdField,
+    loadAssignHistoryForSurveyMonument,
+    m.autoAssignComplete,
+    m.autoAssignFailed,
+    m.autoAssignNoEligibleHistory,
+    m.autoAssignSkipped,
+    selectedProject?.globalId
+  ])
+
   const createAssociatedHistoryForSelectedSurveyMonument = React.useCallback(async () => {
     const monument = assignSurveyMonuments.find((item) => getSurveyMonumentKey(item) === activeAssignSurveyKey)
     if (!monument) {
@@ -1847,6 +2105,56 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
       setAddingAssignHistory(false)
     }
   }, [activeAssignSurveyKey, assignSurveyMonuments, getMonumentHistoryLayer, historyMonumentGlobalIdField, historyProjectGlobalIdField, loadAssignHistoryForSurveyMonument, m.addHistoryFailed, m.addHistorySuccess, m.assignSurveyMissingGlobalId, m.historyMissingProjectId, m.selectSurveyMonumentFirst, selectMonumentHistoryRecord, selectedProject])
+
+  const assignProjectToHistoryItem = React.useCallback(async (item: MonumentHistorySummary) => {
+    if (!selectedProject?.globalId) {
+      setStatus(m.historyMissingProjectId)
+      return
+    }
+
+    const objectId = getNumericObjectId(item.objectId)
+    if (objectId === null) {
+      setStatus(m.assignProjectValueFailed)
+      return
+    }
+
+    const itemKey = getHistoryKey(item)
+    setAssigningHistoryProjectKey(itemKey)
+    try {
+      const layer = await getMonumentHistoryLayer()
+      const results = await layer.applyEdits({
+        updateFeatures: [{
+          attributes: {
+            OBJECTID: objectId,
+            [historyProjectGlobalIdField]: selectedProject.globalId
+          }
+        }]
+      }, {
+        rollbackOnFailureEnabled: true
+      })
+      const failedResult = (results.updateFeatureResults || []).find((result: any) => result?.error)
+      if (failedResult) throw new Error(failedResult.error?.message || m.assignProjectValueFailed)
+
+      setStatus(`${m.assignProjectValueSuccess}: ${item.pointNumber}`)
+      const activeMonument = assignSurveyMonuments.find((monument) => getSurveyMonumentKey(monument) === activeAssignSurveyKey)
+      if (activeMonument) await loadAssignHistoryForSurveyMonument(activeMonument)
+    } catch (err) {
+      const message = err instanceof Error ? err.message : m.assignProjectValueFailed
+      setStatus(`${m.assignProjectValueFailed} ${message || ''}`.trim())
+    } finally {
+      setAssigningHistoryProjectKey('')
+    }
+  }, [
+    activeAssignSurveyKey,
+    assignSurveyMonuments,
+    getMonumentHistoryLayer,
+    historyProjectGlobalIdField,
+    loadAssignHistoryForSurveyMonument,
+    m.assignProjectValueFailed,
+    m.assignProjectValueSuccess,
+    m.historyMissingProjectId,
+    selectedProject?.globalId
+  ])
 
   const ensureMonumentGraphicsLayer = React.useCallback(async () => {
     if (!jimuMapView?.view?.map) return null
@@ -3361,9 +3669,10 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
         size: 'sm',
         type: 'default',
         title: m.assignProjectValue,
+        disabled: assigningHistoryProjectKey === itemKey || !selectedProject,
         onClick: (evt) => {
           evt.stopPropagation()
-          setStatus(m.assignProjectValuePending)
+          assignProjectToHistoryItem(item).catch(() => undefined)
         },
         style: { width: 32, minWidth: 32, height: 32, padding: 0, display: 'inline-flex', alignItems: 'center', justifyContent: 'center' }
       }, '↗')
@@ -3659,9 +3968,9 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
             type: 'primary',
             size: 'sm',
             style: modeActionButtonStyle,
-            disabled: assignSurveyMonuments.length === 0,
+            disabled: buildingAutoAssignPlan || autoAssigningHistory || assignSurveyMonuments.length === 0 || !selectedProject,
             onClick: () => {
-              setStatus(`${m.assignAll}: ${assignSurveyMonuments.length}`)
+              openAutoAssignReview().catch(() => undefined)
             }
           }, m.assignAll)
         )
@@ -3989,6 +4298,68 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
     },
     ...cells.map((cell) => h('div', { key: cell }, cell))
     )
+
+  const autoAssignModal = () =>
+    h(Modal, {
+      isOpen: autoAssignModalOpen,
+      toggle: () => {
+        setAutoAssignModalOpen(false)
+      },
+      centered: true,
+      backdrop: 'static',
+      style: { width: 760, maxWidth: 'calc(100vw - 2rem)' }
+    },
+    h(ModalHeader, {
+      toggle: () => {
+        setAutoAssignModalOpen(false)
+      }
+    }, m.reviewAutoAssignTitle),
+    h(ModalBody, null,
+      h('div', { className: 'd-flex flex-column', style: { gap: '0.75rem', maxHeight: '68vh', minHeight: 320 } },
+        buildingAutoAssignPlan
+          ? h('div', { style: { fontSize: 12, opacity: 0.75 } }, m.loadingAutoAssignPlan)
+          : !autoAssignPlan
+            ? h('div', { style: { fontSize: 12, opacity: 0.75 } }, m.autoAssignPlanEmpty)
+            : h(React.Fragment, null,
+              h('div', { className: 'd-flex flex-wrap', style: { gap: '0.5rem' } },
+                validationCountTile(m.selectedSurveyMonuments, autoAssignPlan.rows.length),
+                validationCountTile(m.readyToAssignLabel, autoAssignPlan.readyCount),
+                validationCountTile(m.autoAssignAlreadyAssigned, autoAssignPlan.alreadyAssignedCount),
+                validationCountTile(m.autoAssignNoEligibleHistory, autoAssignPlan.noEligibleHistoryCount),
+                validationCountTile(m.autoAssignMultipleCandidates, autoAssignPlan.multipleCandidateCount)
+              ),
+              h('div', { className: 'flex-grow-1', style: { minHeight: 0, overflowY: 'auto', overflowX: 'auto' } },
+                validationHeaderRow([m.pointNumberLabel, m.selectedHistoryLabel, m.createdDateLabel, m.currentProjectLabel, m.actionLabel, m.statusLabel]),
+                ...autoAssignPlan.rows.map((row) =>
+                  validationDataRow([
+                    row.pointNumber,
+                    row.historyObjectId ? `${m.objectIdLabel} ${row.historyObjectId}` : '-',
+                    formatDateTime(row.createdDate),
+                    row.currentProjectName || row.currentProjectGlobalId || '-',
+                    row.action === 'assign' ? m.assignProjectValue : m.autoAssignSkipAction,
+                    row.status
+                  ], row.id)
+                )
+              )
+            )
+      )
+    ),
+    h(ModalFooter, null,
+      h(Button, {
+        type: 'default',
+        disabled: autoAssigningHistory,
+        onClick: () => {
+          setAutoAssignModalOpen(false)
+        }
+      }, m.close),
+      h(Button, {
+        type: 'primary',
+        disabled: buildingAutoAssignPlan || autoAssigningHistory || !autoAssignPlan || autoAssignPlan.readyCount === 0 || autoAssignPlan.errorCount > 0,
+        onClick: () => {
+          applyAutoAssignPlan().catch(() => undefined)
+        }
+      }, autoAssigningHistory ? m.assignAll : m.applyAssignments)
+    ))
 
   const validationModalBody = () => {
     if (validationReviewMode === 'static') {
@@ -4391,6 +4762,7 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
       )
     ),
     attachmentModal(),
+    autoAssignModal(),
     validationModal()
   )
 }
