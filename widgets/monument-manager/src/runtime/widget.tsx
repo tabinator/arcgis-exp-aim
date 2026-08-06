@@ -9,7 +9,7 @@ import {
   type IMState
 } from 'jimu-core'
 import { JimuMapViewComponent, loadArcGISJSAPIModules } from 'jimu-arcgis'
-import { Alert, Button, Card, CardBody, CardHeader, Checkbox, TextInput } from 'jimu-ui'
+import { Alert, Button, Card, CardBody, CardHeader, Checkbox, Modal, ModalBody, ModalFooter, ModalHeader, TextInput } from 'jimu-ui'
 import {
   DEFAULT_MONUMENT_HISTORY_TABLE_URL,
   DEFAULT_MONUMENT_PROJECTS_LAYER_URL,
@@ -19,7 +19,7 @@ import {
 import type { IMConfig } from '../config'
 import defaultMessages from './translations/default'
 
-type MonumentMode = 'finder' | 'history' | 'create' | 'traverse' | 'update-xy'
+type MonumentMode = 'finder' | 'history' | 'create' | 'create-project' | 'merge-points' | 'traverse' | 'update-xy'
 
 interface ModeDefinition {
   id: MonumentMode
@@ -65,6 +65,20 @@ interface QueryResponse {
   geometryType?: string
   spatialReference?: any
   error?: { message?: string }
+}
+
+interface AttachmentSummary {
+  id: number
+  name: string
+  contentType?: string
+  size?: number
+  url?: string
+}
+
+interface StagedAttachmentFile {
+  id: string
+  file: File
+  previewUrl: string
 }
 
 const PROJECT_COMPLETED_FIELD = 'FieldWorkComp'
@@ -186,18 +200,32 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
   const [loadingHistory, setLoadingHistory] = React.useState(false)
   const [historyError, setHistoryError] = React.useState('')
   const [loadingAssignHistory, setLoadingAssignHistory] = React.useState(false)
+  const [attachmentItems, setAttachmentItems] = React.useState<AttachmentSummary[]>([])
+  const [stagedAttachmentFiles, setStagedAttachmentFiles] = React.useState<StagedAttachmentFile[]>([])
+  const [attachmentError, setAttachmentError] = React.useState('')
+  const [attachmentHistoryItem, setAttachmentHistoryItem] = React.useState<MonumentHistorySummary | null>(null)
+  const [loadingAttachments, setLoadingAttachments] = React.useState(false)
+  const [uploadingAttachments, setUploadingAttachments] = React.useState(false)
   const [status, setStatus] = React.useState(m.statusReady)
   const searchInitializedRef = React.useRef(false)
   const projectLayerFiltersRef = React.useRef(new Map<string, { layer: any, definitionExpression: string | null | undefined }>())
   const monumentGraphicsLayerRef = React.useRef<any>(null)
   const monumentGraphicsMapRef = React.useRef<any>(null)
   const suppressAssignSurveySelectionSyncRef = React.useRef(false)
+  const monumentHistoryLayerRef = React.useRef<{ url: string, layer: any } | null>(null)
+  const attachmentFileInputRef = React.useRef<HTMLInputElement | null>(null)
 
   const workflowModes: ModeDefinition[] = [
     { id: 'history', label: m.viewHistoryMode, title: m.viewHistoryTitle },
     { id: 'create', label: m.createMode, title: m.assignProjectTitle },
+    { id: 'create-project', label: m.createTitle, title: m.createTitle },
+    { id: 'merge-points', label: m.mergePointsMode, title: m.mergePointsTitle },
     { id: 'traverse', label: m.traverseMode, title: m.traverseTitle },
     { id: 'update-xy', label: m.updateXyMode, title: m.updateXyTitle }
+  ]
+  const workflowModeRows: MonumentMode[][] = [
+    ['history', 'create', 'create-project'],
+    ['merge-points', 'traverse', 'update-xy']
   ]
 
   const activeMode = workflowModes.find((item) => item.id === mode) || workflowModes[0]
@@ -277,6 +305,13 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
 
   const displayOptionalValue = (value: any) =>
     value === null || value === undefined || String(value).trim() === '' ? '-' : String(value)
+
+  const formatFileSize = (size?: number) => {
+    if (!size || !Number.isFinite(size)) return '-'
+    if (size < 1024) return `${size} B`
+    if (size < 1024 * 1024) return `${(size / 1024).toFixed(1)} KB`
+    return `${(size / 1024 / 1024).toFixed(1)} MB`
+  }
 
   const toProjectSummary = React.useCallback((attributes: { [key: string]: any }): MonumentProjectSummary => ({
     objectId: attributes.OBJECTID,
@@ -528,6 +563,199 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
   const getSurveyMonumentRuntimeDataSources = React.useCallback(async () =>
     getRuntimeDataSources(surveyMonumentsUrl, surveyMonumentDataSourceIds),
   [getRuntimeDataSources, surveyMonumentDataSourceIds, surveyMonumentsUrl])
+
+  const getMonumentHistoryLayer = React.useCallback(async () => {
+    if (monumentHistoryLayerRef.current?.url === monumentHistoryUrl) {
+      return monumentHistoryLayerRef.current.layer
+    }
+    const [FeatureLayer] = await loadArcGISJSAPIModules(['esri/layers/FeatureLayer'])
+    const layer = new FeatureLayer({ url: monumentHistoryUrl })
+    await layer.load()
+    monumentHistoryLayerRef.current = { url: monumentHistoryUrl, layer }
+    return layer
+  }, [monumentHistoryUrl])
+
+  const getNumericObjectId = (objectId: string | number) => {
+    const numericObjectId = typeof objectId === 'number' ? objectId : Number(objectId)
+    return Number.isFinite(numericObjectId) ? numericObjectId : null
+  }
+
+  const getAttachmentUrl = (historyItem: MonumentHistorySummary, attachment: AttachmentSummary) =>
+    attachment.url || `${monumentHistoryUrl.replace(/\/+$/, '')}/${historyItem.objectId}/attachments/${attachment.id}`
+
+  const createAttachmentGlobalId = () =>
+    window.crypto?.randomUUID?.() || 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, (char) => {
+      const value = Math.floor(Math.random() * 16)
+      return (char === 'x' ? value : (value & 0x3) | 0x8).toString(16)
+    })
+
+  const revokeStagedAttachmentPreviews = (items: StagedAttachmentFile[]) => {
+    items.forEach((item) => {
+      URL.revokeObjectURL(item.previewUrl)
+    })
+  }
+
+  const clearStagedAttachmentFiles = React.useCallback(() => {
+    setStagedAttachmentFiles((current) => {
+      revokeStagedAttachmentPreviews(current)
+      return []
+    })
+  }, [])
+
+  const loadHistoryAttachments = React.useCallback(async (historyItem?: MonumentHistorySummary | null) => {
+    if (!historyItem) {
+      setAttachmentItems([])
+      setAttachmentError('')
+      return
+    }
+
+    const objectId = getNumericObjectId(historyItem.objectId)
+    if (objectId === null) {
+      setAttachmentItems([])
+      setAttachmentError(m.attachmentSelectHistoryFirst)
+      return
+    }
+
+    setLoadingAttachments(true)
+    setAttachmentError('')
+
+    try {
+      const layer = await getMonumentHistoryLayer()
+      if (!layer.capabilities?.data?.supportsAttachment) {
+        setAttachmentItems([])
+        setAttachmentError(m.attachmentUnsupported)
+        return
+      }
+      const attachmentsByObjectId = await layer.queryAttachments({ objectIds: [objectId] })
+      const nextAttachments = (attachmentsByObjectId?.[String(objectId)] || [])
+        .map((attachment: any): AttachmentSummary => ({
+          id: Number(attachment.id),
+          name: attachment.name || `Attachment ${attachment.id}`,
+          contentType: attachment.contentType,
+          size: attachment.size,
+          url: attachment.url
+        }))
+        .filter((attachment) => Number.isFinite(attachment.id))
+        .sort((left, right) => left.name.localeCompare(right.name, undefined, { numeric: true, sensitivity: 'base' }))
+      setAttachmentItems(nextAttachments)
+    } catch (err) {
+      const message = err instanceof Error ? err.message : m.historyLoadFailed
+      setAttachmentError(message)
+    } finally {
+      setLoadingAttachments(false)
+    }
+  }, [getMonumentHistoryLayer, m.attachmentSelectHistoryFirst, m.attachmentUnsupported, m.historyLoadFailed])
+
+  const stageAttachmentFiles = React.useCallback((files: FileList | File[]) => {
+    const incomingFiles = Array.from(files)
+    const imageFiles = incomingFiles.filter((file) => file.type.toLowerCase().startsWith('image/'))
+    if (imageFiles.length < incomingFiles.length) setStatus(m.attachmentImageOnly)
+    if (imageFiles.length === 0) return
+
+    setStagedAttachmentFiles((current) => [
+      ...current,
+      ...imageFiles.map((file) => ({
+        id: `${file.name}-${file.size}-${file.lastModified}-${Math.random().toString(36).slice(2)}`,
+        file,
+        previewUrl: URL.createObjectURL(file)
+      }))
+    ])
+  }, [m.attachmentImageOnly])
+
+  const removeStagedAttachmentFile = (id: string) => {
+    setStagedAttachmentFiles((current) => {
+      const removed = current.find((item) => item.id === id)
+      if (removed) URL.revokeObjectURL(removed.previewUrl)
+      return current.filter((item) => item.id !== id)
+    })
+  }
+
+  const uploadStagedAttachments = React.useCallback(async (historyItem?: MonumentHistorySummary | null) => {
+    if (!historyItem || stagedAttachmentFiles.length === 0) return
+    const objectId = getNumericObjectId(historyItem.objectId)
+    if (objectId === null) {
+      setAttachmentError(m.attachmentSelectHistoryFirst)
+      return
+    }
+
+    setUploadingAttachments(true)
+    setAttachmentError('')
+
+    try {
+      const layer = await getMonumentHistoryLayer()
+      if (!layer.capabilities?.data?.supportsAttachment) throw new Error(m.attachmentUnsupported)
+      const results = await layer.applyEdits({
+        addAttachments: stagedAttachmentFiles.map((item) => ({
+          feature: { objectId },
+          attachment: {
+            globalId: createAttachmentGlobalId(),
+            name: item.file.name,
+            contentType: item.file.type || 'application/octet-stream',
+            data: item.file
+          }
+        }))
+      }, {
+        globalIdUsed: true,
+        rollbackOnFailureEnabled: true
+      })
+      const failedResult = (results.addAttachmentResults || []).find((result: any) => result?.error)
+      if (failedResult) throw new Error(failedResult.error?.message || m.attachmentUploadFailed)
+      setStatus(`${m.attachmentUploadSuccess}: ${stagedAttachmentFiles.length}`)
+      clearStagedAttachmentFiles()
+      await loadHistoryAttachments(historyItem)
+    } catch (err) {
+      const message = err instanceof Error ? err.message : m.attachmentUploadFailed
+      setAttachmentError(message || m.attachmentUploadFailed)
+      setStatus(m.attachmentUploadFailed)
+    } finally {
+      setUploadingAttachments(false)
+    }
+  }, [clearStagedAttachmentFiles, getMonumentHistoryLayer, loadHistoryAttachments, m.attachmentSelectHistoryFirst, m.attachmentUnsupported, m.attachmentUploadFailed, m.attachmentUploadSuccess, stagedAttachmentFiles])
+
+  const deleteHistoryAttachment = React.useCallback(async (historyItem: MonumentHistorySummary, attachment: AttachmentSummary) => {
+    const objectId = getNumericObjectId(historyItem.objectId)
+    if (objectId === null) return
+
+    setAttachmentError('')
+
+    try {
+      const [Graphic] = await loadArcGISJSAPIModules(['esri/Graphic'])
+      const layer = await getMonumentHistoryLayer()
+      const results = await layer.deleteAttachments(new Graphic({
+        attributes: { OBJECTID: objectId }
+      }), [attachment.id])
+      const failedResult = (results || []).find((result: any) => result?.error)
+      if (failedResult) throw new Error(failedResult.error?.message || m.attachmentDeleteFailed)
+      setStatus(`${m.attachmentDeleted}: ${attachment.name}`)
+      await loadHistoryAttachments(historyItem)
+    } catch (err) {
+      const message = err instanceof Error ? err.message : m.attachmentDeleteFailed
+      setAttachmentError(message || m.attachmentDeleteFailed)
+      setStatus(m.attachmentDeleteFailed)
+    }
+  }, [getMonumentHistoryLayer, loadHistoryAttachments, m.attachmentDeleted, m.attachmentDeleteFailed])
+
+  const openHistoryAttachment = (historyItem: MonumentHistorySummary, attachment: AttachmentSummary) => {
+    window.open(getAttachmentUrl(historyItem, attachment), '_blank', 'noopener,noreferrer')
+  }
+
+  const openAttachmentModal = (historyItem: MonumentHistorySummary) => {
+    const historyKey = getHistoryKey(historyItem)
+    if (mode === 'history') {
+      setActiveHistoryKey(historyKey)
+    } else {
+      setActiveAssignHistoryKey(historyKey)
+    }
+    setAttachmentHistoryItem(historyItem)
+    setAttachmentError('')
+  }
+
+  const closeAttachmentModal = () => {
+    setAttachmentHistoryItem(null)
+    setAttachmentItems([])
+    setAttachmentError('')
+    clearStagedAttachmentFiles()
+  }
 
   const selectMonumentHistoryRecord = React.useCallback(async (objectId?: string | number | null) => {
     const dataSources = await getMonumentHistoryRuntimeDataSources()
@@ -895,6 +1123,110 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
     await selectMonumentHistoryRecord(activeKey ? activeHistoryItem?.objectId : null)
   }, [ensureMonumentGraphicsLayer, monumentGlobalIdField, querySurveyMonumentsByGlobalIds, selectMonumentHistoryRecord])
 
+  const zoomToHistorySurveyMonument = React.useCallback(async (item: MonumentHistorySummary) => {
+    const view = jimuMapView?.view
+    if (!view) {
+      setStatus(m.mapUnavailable)
+      return
+    }
+    if (!item.monumentGlobalId) {
+      setStatus(m.monumentZoomMissingGlobalId)
+      return
+    }
+
+    const itemKey = getHistoryKey(item)
+    setActiveHistoryKey(itemKey)
+    await selectMonumentHistoryRecord(item.objectId)
+
+    try {
+      const [geometryJsonUtils] = await loadArcGISJSAPIModules([
+        'esri/geometry/support/jsonUtils'
+      ])
+      const results = await querySurveyMonumentsByGlobalIds([item.monumentGlobalId])
+      let targetGeometry: any = null
+
+      for (const result of results) {
+        const feature = (result.features || []).find((candidate) => !!candidate.geometry)
+        if (!feature?.geometry) continue
+        targetGeometry = geometryJsonUtils.fromJSON(getGeometryJson(
+          feature.geometry,
+          result.geometryType,
+          result.spatialReference
+        ))
+        break
+      }
+
+      if (!targetGeometry) {
+        setStatus(m.monumentZoomNotFound)
+        return
+      }
+
+      const target = targetGeometry.type === 'point'
+        ? { target: targetGeometry, zoom: Math.max(Number(view.zoom) || 0, 18) }
+        : targetGeometry.extent?.expand ? targetGeometry.extent.expand(2) : targetGeometry
+
+      await view.goTo(target, {
+        duration: 900,
+        padding: { top: 80, right: 80, bottom: 80, left: 80 }
+      })
+      setStatus(`${m.monumentZoomed}: ${item.pointNumber}`)
+    } catch (err) {
+      const message = err instanceof Error ? err.message : m.monumentZoomFailed
+      setStatus(message || m.monumentZoomFailed)
+    }
+  }, [jimuMapView, m.mapUnavailable, m.monumentZoomed, m.monumentZoomFailed, m.monumentZoomMissingGlobalId, m.monumentZoomNotFound, querySurveyMonumentsByGlobalIds, selectMonumentHistoryRecord])
+
+  const zoomToAssignSurveyMonument = React.useCallback(async (item: SurveyMonumentSummary) => {
+    const view = jimuMapView?.view
+    if (!view) {
+      setStatus(m.mapUnavailable)
+      return
+    }
+    if (!item.globalId) {
+      setStatus(m.assignSurveyMissingGlobalId)
+      return
+    }
+
+    setActiveAssignSurveyKey(getSurveyMonumentKey(item))
+
+    try {
+      const [geometryJsonUtils] = await loadArcGISJSAPIModules([
+        'esri/geometry/support/jsonUtils'
+      ])
+      const results = await querySurveyMonumentsByGlobalIds([item.globalId])
+      let targetGeometry: any = null
+
+      for (const result of results) {
+        const feature = (result.features || []).find((candidate) => !!candidate.geometry)
+        if (!feature?.geometry) continue
+        targetGeometry = geometryJsonUtils.fromJSON(getGeometryJson(
+          feature.geometry,
+          result.geometryType,
+          result.spatialReference
+        ))
+        break
+      }
+
+      if (!targetGeometry) {
+        setStatus(m.monumentZoomNotFound)
+        return
+      }
+
+      const target = targetGeometry.type === 'point'
+        ? { target: targetGeometry, zoom: Math.max(Number(view.zoom) || 0, 18) }
+        : targetGeometry.extent?.expand ? targetGeometry.extent.expand(2) : targetGeometry
+
+      await view.goTo(target, {
+        duration: 900,
+        padding: { top: 80, right: 80, bottom: 80, left: 80 }
+      })
+      setStatus(`${m.monumentZoomed}: ${item.pointNumber}`)
+    } catch (err) {
+      const message = err instanceof Error ? err.message : m.monumentZoomFailed
+      setStatus(message || m.monumentZoomFailed)
+    }
+  }, [jimuMapView, m.assignSurveyMissingGlobalId, m.mapUnavailable, m.monumentZoomed, m.monumentZoomFailed, m.monumentZoomNotFound, querySurveyMonumentsByGlobalIds])
+
   const renderAssignSurveyMonumentGraphics = React.useCallback(async (items: SurveyMonumentSummary[], activeKey: string) => {
     const layer = await ensureMonumentGraphicsLayer()
     if (!layer) return
@@ -1228,6 +1560,19 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
   }, [activeAssignSurveyKey, assignSurveyMonuments, loadAssignHistoryForSurveyMonument, m.historyLoadFailed, mode])
 
   React.useEffect(() => {
+    if ((mode !== 'create' && mode !== 'history') || !attachmentHistoryItem) {
+      setAttachmentItems([])
+      setAttachmentError('')
+      clearStagedAttachmentFiles()
+      return
+    }
+    clearStagedAttachmentFiles()
+    loadHistoryAttachments(attachmentHistoryItem).catch(() => {
+      setAttachmentError(m.historyLoadFailed)
+    })
+  }, [attachmentHistoryItem, clearStagedAttachmentFiles, loadHistoryAttachments, m.historyLoadFailed, mode])
+
+  React.useEffect(() => {
     let cancelled = false
 
     const syncAssignGraphics = async () => {
@@ -1321,6 +1666,17 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
     setActiveAssignHistoryKey('')
     monumentGraphicsLayerRef.current?.removeAll?.()
     setStatus(m.historySelectionCleared)
+  }
+
+  const removeAssignSurveyMonument = (item: SurveyMonumentSummary) => {
+    const itemKey = getSurveyMonumentKey(item)
+    setAssignSurveyMonuments((current) => current.filter((surveyMonument) => getSurveyMonumentKey(surveyMonument) !== itemKey))
+    if (activeAssignSurveyKey === itemKey) {
+      setActiveAssignSurveyKey('')
+      setAssignHistoryItems([])
+      setActiveAssignHistoryKey('')
+    }
+    setStatus(`${m.surveyMonumentRemoved}: ${item.pointNumber}`)
   }
 
   const historyRow = (item: MonumentHistorySummary) => {
@@ -1427,13 +1783,25 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
       h(Button, {
         size: 'sm',
         type: 'default',
-        title: m.deleteHistoryFeature,
+        title: m.attachmentsTitle,
         onClick: (evt) => {
           evt.stopPropagation()
-          setStatus(m.deleteHistoryFeaturePending)
+          openAttachmentModal(item)
         },
         style: { width: 32, minWidth: 32, height: 32, padding: 0, display: 'inline-flex', alignItems: 'center', justifyContent: 'center' }
-      }, '🗑️')
+      }, '📎'),
+      h(Button, {
+        size: 'sm',
+        type: 'default',
+        title: m.monumentZoom,
+        onClick: (evt) => {
+          evt.stopPropagation()
+          zoomToHistorySurveyMonument(item).catch(() => {
+            setStatus(m.monumentZoomFailed)
+          })
+        },
+        style: { width: 32, minWidth: 32, height: 32, padding: 0, display: 'inline-flex', alignItems: 'center', justifyContent: 'center' }
+      }, '🔍')
     )
     )
   }
@@ -1473,6 +1841,30 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
     h('span', { style: { minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', fontWeight: 600 } }, `PointID: ${item.pointNumber}`),
     h('span', { style: { opacity: 0.48 } }, '|'),
     h('span', { style: { minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', opacity: 0.78 } }, `ObjectID: ${item.objectId}`)
+    ),
+    h('div', { className: 'd-flex align-items-center', style: { gap: '0.25rem', flex: '0 0 auto' } },
+      h(Button, {
+        size: 'sm',
+        type: 'default',
+        title: m.removeSurveyMonument,
+        onClick: (evt) => {
+          evt.stopPropagation()
+          removeAssignSurveyMonument(item)
+        },
+        style: { width: 32, minWidth: 32, height: 32, padding: 0, display: 'inline-flex', alignItems: 'center', justifyContent: 'center' }
+      }, '🗑️'),
+      h(Button, {
+        size: 'sm',
+        type: 'default',
+        title: m.monumentZoom,
+        onClick: (evt) => {
+          evt.stopPropagation()
+          zoomToAssignSurveyMonument(item).catch(() => {
+            setStatus(m.monumentZoomFailed)
+          })
+        },
+        style: { width: 32, minWidth: 32, height: 32, padding: 0, display: 'inline-flex', alignItems: 'center', justifyContent: 'center' }
+      }, '🔍')
     )
     )
   }
@@ -1557,6 +1949,16 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
       h(Button, {
         size: 'sm',
         type: 'default',
+        title: m.attachmentsTitle,
+        onClick: (evt) => {
+          evt.stopPropagation()
+          openAttachmentModal(item)
+        },
+        style: { width: 32, minWidth: 32, height: 32, padding: 0, display: 'inline-flex', alignItems: 'center', justifyContent: 'center' }
+      }, '📎'),
+      h(Button, {
+        size: 'sm',
+        type: 'default',
         title: m.assignProjectValue,
         onClick: (evt) => {
           evt.stopPropagation()
@@ -1568,23 +1970,224 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
     )
   }
 
+  const attachmentPanel = (historyItem?: MonumentHistorySummary | null, showTitle = true) =>
+    h('div', { className: 'border rounded p-2 d-flex flex-column', style: { minHeight: 160, gap: '0.5rem' } },
+      showTitle && h('div', { className: 'd-flex align-items-center justify-content-between', style: { gap: '0.5rem' } },
+        h('div', { className: 'font-weight-bold', style: { fontSize: 12 } },
+          historyItem
+            ? `${m.attachmentsTitle}: ${historyItem.pointNumber}`
+            : m.attachmentsTitle
+        ),
+        historyItem && h('div', { style: { fontSize: 11, opacity: 0.75 } }, `${attachmentItems.length} ${m.attachmentCountLabel}`)
+      ),
+      !historyItem
+        ? h('div', { style: { fontSize: 12, opacity: 0.75 } }, m.attachmentSelectHistoryFirst)
+        : h(React.Fragment, null,
+          attachmentError && h(Alert, { form: 'basic', type: 'warning', text: attachmentError }),
+          h('input', {
+            ref: attachmentFileInputRef,
+            type: 'file',
+            accept: 'image/*',
+            multiple: true,
+            style: { display: 'none' },
+            onChange: (evt) => {
+              const files = evt.target.files
+              if (files) stageAttachmentFiles(files)
+              evt.target.value = ''
+            }
+          }),
+          h('div', {
+            role: 'button',
+            tabIndex: 0,
+            onClick: () => {
+              attachmentFileInputRef.current?.click()
+            },
+            onKeyDown: (evt) => {
+              if (evt.key === 'Enter' || evt.key === ' ') {
+                evt.preventDefault()
+                attachmentFileInputRef.current?.click()
+              }
+            },
+            onDragOver: (evt) => {
+              evt.preventDefault()
+            },
+            onDrop: (evt) => {
+              evt.preventDefault()
+              stageAttachmentFiles(evt.dataTransfer.files)
+            },
+            style: {
+              border: '1px dashed rgba(0, 0, 0, 0.28)',
+              borderRadius: 4,
+              padding: '0.75rem',
+              textAlign: 'center',
+              cursor: 'pointer',
+              backgroundColor: 'rgba(0, 0, 0, 0.02)'
+            }
+          },
+          h('div', { style: { fontSize: 12, fontWeight: 700 } }, m.attachmentDropPrompt),
+          h('div', { style: { fontSize: 10, opacity: 0.68, marginTop: 2 } }, m.attachmentDropHint)
+          ),
+          stagedAttachmentFiles.length > 0 && h('div', null,
+            h('div', { className: 'd-flex align-items-center justify-content-between mb-1', style: { gap: '0.5rem' } },
+              h('div', { className: 'font-weight-bold', style: { fontSize: 11 } }, m.attachmentPendingUploads),
+              h(Button, {
+                type: 'primary',
+                size: 'sm',
+                disabled: uploadingAttachments,
+                style: { height: 24, padding: '0 8px', fontSize: 11 },
+                onClick: () => {
+                  uploadStagedAttachments(historyItem).catch(() => undefined)
+                }
+              }, `${m.attachmentUpload} ${stagedAttachmentFiles.length}`)
+            ),
+            h('div', { className: 'd-flex flex-column', style: { gap: '0.25rem' } },
+              ...stagedAttachmentFiles.map((item) =>
+                h('div', {
+                  key: item.id,
+                  className: 'd-flex align-items-center justify-content-between',
+                  style: { gap: '0.5rem', fontSize: 11, minWidth: 0 }
+                },
+                h('div', { className: 'd-flex align-items-center', style: { gap: '0.4rem', minWidth: 0, overflow: 'hidden' } },
+                  h('img', {
+                    src: item.previewUrl,
+                    alt: '',
+                    style: { width: 28, height: 28, objectFit: 'cover', borderRadius: 4, flex: '0 0 auto' }
+                  }),
+                  h('span', { title: item.file.name, style: { minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontWeight: 600 } }, item.file.name),
+                  h('span', { style: { opacity: 0.58, flex: '0 0 auto' } }, formatFileSize(item.file.size))
+                ),
+                h(Button, {
+                  size: 'sm',
+                  type: 'tertiary',
+                  title: m.attachmentRemovePending,
+                  disabled: uploadingAttachments,
+                  style: { height: 24, padding: '0 6px', fontSize: 11 },
+                  onClick: () => {
+                    removeStagedAttachmentFile(item.id)
+                  }
+                }, m.attachmentDeleteLabel)
+                )
+              )
+            )
+          ),
+          h('div', null,
+            h('div', { className: 'font-weight-bold mb-1', style: { fontSize: 11 } }, m.attachmentExisting),
+            loadingAttachments
+              ? h('div', { style: { fontSize: 12, opacity: 0.75 } }, m.attachmentLoading)
+              : attachmentItems.length === 0
+                ? h('div', { style: { fontSize: 12, opacity: 0.75 } }, m.attachmentEmpty)
+                : h('div', { className: 'd-flex flex-column', style: { gap: '0.25rem' } },
+                  ...attachmentItems.map((attachment) =>
+                    h('div', {
+                      key: attachment.id,
+                      className: 'd-flex align-items-center justify-content-between',
+                      style: { gap: '0.5rem', fontSize: 11, minWidth: 0 }
+                    },
+                    h('div', { style: { minWidth: 0, overflow: 'hidden' } },
+                      h('div', { title: attachment.name, style: { overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontWeight: 600 } }, attachment.name),
+                      h('div', { style: { opacity: 0.6 } }, `${attachment.contentType || '-'} | ${formatFileSize(attachment.size)}`)
+                    ),
+                    h('div', { className: 'd-flex align-items-center', style: { gap: '0.25rem', flex: '0 0 auto' } },
+                      h(Button, {
+                        size: 'sm',
+                        type: 'tertiary',
+                        title: m.attachmentOpen,
+                        style: { height: 24, padding: '0 6px', fontSize: 11 },
+                        onClick: () => {
+                          openHistoryAttachment(historyItem, attachment)
+                        }
+                      }, 'View'),
+                      h(Button, {
+                        size: 'sm',
+                        type: 'tertiary',
+                        title: m.attachmentDelete,
+                        style: { height: 24, padding: '0 6px', fontSize: 11 },
+                        onClick: () => {
+                          deleteHistoryAttachment(historyItem, attachment).catch(() => undefined)
+                        }
+                      }, m.attachmentDeleteLabel)
+                    )
+                    )
+                  )
+                )
+          )
+        )
+    )
+
+  const attachmentModal = () =>
+    h(Modal, {
+      isOpen: Boolean(attachmentHistoryItem),
+      toggle: closeAttachmentModal,
+      centered: true,
+      backdrop: 'static',
+      style: { width: 560, maxWidth: 'calc(100vw - 2rem)' }
+    },
+    h(ModalHeader, { toggle: closeAttachmentModal },
+      attachmentHistoryItem
+        ? `${m.attachmentsTitle}: ${attachmentHistoryItem.pointNumber}`
+        : m.attachmentsTitle
+    ),
+    h(ModalBody, null,
+      attachmentPanel(attachmentHistoryItem, false)
+    ),
+    h(ModalFooter, null,
+      h(Button, {
+        type: 'default',
+        onClick: closeAttachmentModal
+      }, m.cancel)
+    ))
+
   const viewHistoryPanel = () =>
     h('div', { className: 'd-flex flex-column flex-grow-1', style: { gap: '0.75rem', minHeight: 0 } },
       h('div', { className: 'd-flex align-items-center justify-content-between', style: { gap: '0.5rem' } },
         h('div', { className: 'font-weight-bold' }, m.viewingProjectMonuments),
-        h(Button, {
-          size: 'sm',
-          type: 'tertiary',
-          onClick: () => {
-            setMode('finder')
-          }
-        }, m.cancel)
+        h('div', { className: 'd-flex align-items-center', style: { gap: '0.35rem', flex: '0 0 auto' } },
+          h(Button, {
+            size: 'sm',
+            type: 'default',
+            disabled: loadingHistory || !selectedProject,
+            onClick: () => {
+              if (!selectedProject) return
+              loadProjectHistory(selectedProject).catch(() => undefined)
+            }
+          }, m.refreshList),
+          h(Button, {
+            size: 'sm',
+            type: 'tertiary',
+            onClick: () => {
+              setMode('finder')
+            }
+          }, m.cancel)
+        )
       ),
       selectedProject && h('div', { style: { fontSize: 14, fontWeight: 700, lineHeight: '18px', overflowWrap: 'anywhere' } }, selectedProject.name),
       h('div', { className: 'border rounded p-2 d-flex flex-column flex-grow-1', style: { minHeight: 0 } },
         h('div', { className: 'd-flex align-items-center justify-content-between mb-2', style: { gap: '0.5rem' } },
           h('div', { className: 'font-weight-bold', style: { fontSize: 12 } }, m.monumentHistoryTitle),
-          h('div', { style: { fontSize: 11, opacity: 0.75 } }, `${historyItems.length} ${m.featureCountLabel}`)
+          h('div', { className: 'd-flex align-items-center', style: { gap: '0.35rem', flex: '0 0 auto' } },
+            h('div', { style: { fontSize: 11, opacity: 0.75 } }, `${historyItems.length} ${m.featureCountLabel}`),
+            h(Button, {
+              size: 'sm',
+              type: 'tertiary',
+              disabled: loadingHistory || historyItems.length === 0,
+              style: { height: 24, padding: '0 6px', fontSize: 11 },
+              onClick: () => {
+                const allKeys = historyItems.map(getHistoryKey)
+                setSelectedHistoryKeys(allKeys)
+                setStatus(`${m.selectedHistoryCount}: ${allKeys.length}`)
+              }
+            }, m.selectAll),
+            h(Button, {
+              size: 'sm',
+              type: 'tertiary',
+              disabled: loadingHistory || selectedHistoryKeys.length === 0,
+              style: { height: 24, padding: '0 6px', fontSize: 11 },
+              onClick: () => {
+                setSelectedHistoryKeys([])
+                setStatus(m.historySelectionCleared)
+              }
+            }, m.clear)
+          )
         ),
         historyError && h(Alert, { form: 'basic', type: 'warning', text: historyError }),
         h('div', { className: 'flex-grow-1', style: { minHeight: 0, overflowY: 'auto', overflowX: 'hidden' } },
@@ -1595,25 +2198,6 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
               : historyItems.map(historyRow)
         ),
         h('div', { className: 'd-flex mt-2', style: { gap: '0.35rem' } },
-          h(Button, {
-            type: 'default',
-            size: 'sm',
-            style: modeActionButtonStyle,
-            onClick: () => {
-              const allKeys = historyItems.map(getHistoryKey)
-              setSelectedHistoryKeys(allKeys)
-              setStatus(`${m.selectedHistoryCount}: ${allKeys.length}`)
-            }
-          }, m.selectAll),
-          h(Button, {
-            type: 'default',
-            size: 'sm',
-            style: modeActionButtonStyle,
-            onClick: () => {
-              setSelectedHistoryKeys([])
-              setStatus(m.historySelectionCleared)
-            }
-          }, m.clearSelection),
           h(Button, {
             type: 'primary',
             size: 'sm',
@@ -1696,14 +2280,6 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
         h('div', { className: 'd-flex align-items-center', style: { gap: '0.35rem', flex: '0 0 auto' } },
           h(Button, {
             size: 'sm',
-            type: 'primary',
-            onClick: () => {
-              setMode('create')
-              setStatus(m.createTitle)
-            }
-          }, m.createTitle),
-          h(Button, {
-            size: 'sm',
             type: 'default',
             onClick: () => {
               loadProjects(projectSearchTerm).catch(() => undefined)
@@ -1730,17 +2306,28 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
         !loadingProjects && !projectError && projects.length === 0 && h('div', { style: { fontSize: 12, opacity: 0.72 } }, m.noProjects),
         ...projects.map(projectRow)
       ),
-      h('div', { className: 'd-flex mt-2', style: { gap: '0.35rem' } },
-        ...workflowModes.map((item) =>
-          h(Button, {
-            key: item.id,
-            size: 'sm',
-            type: item.id === 'history' ? 'primary' : 'default',
-            style: modeButtonStyle,
-            onClick: () => {
-              startWorkflowMode(item.id)
-            }
-          }, item.label)
+      h('div', { className: 'd-flex flex-column mt-2', style: { gap: '0.35rem' } },
+        ...workflowModeRows.map((row, rowIndex) =>
+          h('div', { key: `workflow-row-${rowIndex}`, className: 'd-flex', style: { gap: '0.35rem' } },
+            ...row.map((modeId) => {
+              const item = workflowModes.find((modeDefinition) => modeDefinition.id === modeId)
+              if (!item) return null
+              return h(Button, {
+                key: item.id,
+                size: 'sm',
+                type: item.id === 'history' || item.id === 'create' ? 'primary' : 'default',
+                style: modeButtonStyle,
+                onClick: () => {
+                  if (item.id === 'create-project') {
+                    setMode('create-project')
+                    setStatus(m.createTitle)
+                    return
+                  }
+                  startWorkflowMode(item.id)
+                }
+              }, item.label)
+            })
+          )
         )
       )
     )
@@ -1792,7 +2379,8 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
         ),
         h(Alert, { form: 'basic', type: 'info', text: status })
       )
-    )
+    ),
+    attachmentModal()
   )
 }
 
