@@ -81,6 +81,31 @@ interface StagedAttachmentFile {
   previewUrl: string
 }
 
+interface CsvProjectRow {
+  id: string
+  rowNumber: number
+  attributes: { [key: string]: string }
+  pointNumber: string
+  validationMessages: string[]
+  existingMonuments: SurveyMonumentSummary[]
+}
+
+interface TraverseFileSummary {
+  id: string
+  name: string
+  size: number
+  lineCount: number
+  nonEmptyLineCount: number
+  basisOfBearing?: string
+}
+
+interface MergeRollbackAction {
+  label: string
+  run: () => Promise<void>
+}
+
+type MergeOperationType = 'target' | 'mean'
+
 const PROJECT_COMPLETED_FIELD = 'FieldWorkComp'
 const PROJECT_SEARCH_MINIMUM_LENGTH = 3
 const PROJECT_QUERY_LIMIT = 100
@@ -90,6 +115,57 @@ const SURVEY_MONUMENTS_LAYER_ID = '999066'
 const MONUMENT_HISTORY_LAYER_ID = '999069'
 
 const escapeSqlString = (value: string) => value.replace(/'/g, "''")
+
+const parseCsvLine = (line: string) => {
+  const values: string[] = []
+  let current = ''
+  let inQuotes = false
+
+  for (let index = 0; index < line.length; index += 1) {
+    const char = line[index]
+    const nextChar = line[index + 1]
+    if (char === '"' && inQuotes && nextChar === '"') {
+      current += '"'
+      index += 1
+    } else if (char === '"') {
+      inQuotes = !inQuotes
+    } else if (char === ',' && !inQuotes) {
+      values.push(current.trim())
+      current = ''
+    } else {
+      current += char
+    }
+  }
+
+  values.push(current.trim())
+  return values
+}
+
+const parseCsvText = (text: string) => {
+  const lines = text
+    .replace(/^\uFEFF/, '')
+    .split(/\r?\n/)
+    .filter((line) => line.trim().length > 0)
+  if (lines.length === 0) return []
+
+  const headers = parseCsvLine(lines[0]).map((header, index) => header || `Column ${index + 1}`)
+  return lines.slice(1).map((line, index) => {
+    const values = parseCsvLine(line)
+    const attributes = headers.reduce<{ [key: string]: string }>((result, header, headerIndex) => {
+      result[header] = values[headerIndex] || ''
+      return result
+    }, {})
+    return { rowNumber: index + 2, attributes }
+  })
+}
+
+const extractBasisOfBearing = (text: string) => {
+  const lines = text.split(/\r?\n/).map((line) => line.trim()).filter(Boolean)
+  const basisLine = lines.find((line) => /basis\s+of\s+bearing/i.test(line))
+  if (!basisLine) return ''
+  const separatorIndex = basisLine.search(/[:=-]/)
+  return separatorIndex >= 0 ? basisLine.slice(separatorIndex + 1).trim() || basisLine : basisLine
+}
 
 const normalizeUrl = (url?: string) => {
   const rawUrl = (url || '').trim()
@@ -200,12 +276,24 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
   const [loadingHistory, setLoadingHistory] = React.useState(false)
   const [historyError, setHistoryError] = React.useState('')
   const [loadingAssignHistory, setLoadingAssignHistory] = React.useState(false)
+  const [addingAssignHistory, setAddingAssignHistory] = React.useState(false)
   const [attachmentItems, setAttachmentItems] = React.useState<AttachmentSummary[]>([])
   const [stagedAttachmentFiles, setStagedAttachmentFiles] = React.useState<StagedAttachmentFile[]>([])
   const [attachmentError, setAttachmentError] = React.useState('')
   const [attachmentHistoryItem, setAttachmentHistoryItem] = React.useState<MonumentHistorySummary | null>(null)
   const [loadingAttachments, setLoadingAttachments] = React.useState(false)
   const [uploadingAttachments, setUploadingAttachments] = React.useState(false)
+  const [projectCsvFileName, setProjectCsvFileName] = React.useState('')
+  const [newProjectName, setNewProjectName] = React.useState('')
+  const [useSelectedProjectForCreate, setUseSelectedProjectForCreate] = React.useState(false)
+  const [newSearchPointRows, setNewSearchPointRows] = React.useState<CsvProjectRow[]>([])
+  const [existingMonumentRows, setExistingMonumentRows] = React.useState<CsvProjectRow[]>([])
+  const [multipleMonumentRows, setMultipleMonumentRows] = React.useState<CsvProjectRow[]>([])
+  const [loadingProjectCsv, setLoadingProjectCsv] = React.useState(false)
+  const [traverseFiles, setTraverseFiles] = React.useState<TraverseFileSummary[]>([])
+  const [staticFiles, setStaticFiles] = React.useState<TraverseFileSummary[]>([])
+  const [basisOfBearing, setBasisOfBearing] = React.useState('')
+  const [loadingTraverseFiles, setLoadingTraverseFiles] = React.useState(false)
   const [status, setStatus] = React.useState(m.statusReady)
   const searchInitializedRef = React.useRef(false)
   const projectLayerFiltersRef = React.useRef(new Map<string, { layer: any, definitionExpression: string | null | undefined }>())
@@ -214,21 +302,25 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
   const suppressAssignSurveySelectionSyncRef = React.useRef(false)
   const monumentHistoryLayerRef = React.useRef<{ url: string, layer: any } | null>(null)
   const attachmentFileInputRef = React.useRef<HTMLInputElement | null>(null)
+  const projectCsvFileInputRef = React.useRef<HTMLInputElement | null>(null)
+  const traverseFileInputRef = React.useRef<HTMLInputElement | null>(null)
+  const staticFileInputRef = React.useRef<HTMLInputElement | null>(null)
 
   const workflowModes: ModeDefinition[] = [
     { id: 'history', label: m.viewHistoryMode, title: m.viewHistoryTitle },
     { id: 'create', label: m.createMode, title: m.assignProjectTitle },
-    { id: 'create-project', label: m.createTitle, title: m.createTitle },
+    { id: 'create-project', label: m.createTitle, title: m.createProjectWorkflowTitle },
     { id: 'merge-points', label: m.mergePointsMode, title: m.mergePointsTitle },
     { id: 'traverse', label: m.traverseMode, title: m.traverseTitle },
     { id: 'update-xy', label: m.updateXyMode, title: m.updateXyTitle }
   ]
   const workflowModeRows: MonumentMode[][] = [
-    ['history', 'create', 'create-project'],
-    ['merge-points', 'traverse', 'update-xy']
+    ['history', 'create'],
+    ['create-project', 'traverse', 'merge-points']
   ]
 
   const activeMode = workflowModes.find((item) => item.id === mode) || workflowModes[0]
+  const isSurveyHistoryMode = mode === 'create' || mode === 'merge-points'
   const configuredSources = [
     { label: m.surveyMonumentsLayer, value: cfg.surveyMonumentsLayerUrl || DEFAULT_SURVEY_MONUMENTS_LAYER_URL },
     { label: m.monumentProjectsLayer, value: cfg.monumentProjectsLayerUrl || DEFAULT_MONUMENT_PROJECTS_LAYER_URL },
@@ -241,6 +333,7 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
   const projectDisplayField = cfg.projectDisplayField || 'Name'
   const projectGlobalIdField = cfg.projectGlobalIdField || 'GlobalID'
   const monumentGlobalIdField = cfg.monumentGlobalIdField || 'GlobalID'
+  const monumentPointNumberField = cfg.monumentPointNumberField || 'PointNumber'
   const historyMonumentGlobalIdField = cfg.historyMonumentGlobalIdField || 'PointGlobalID'
   const historyProjectGlobalIdField = cfg.historyProjectGlobalIdField || 'ProjectGlobalID'
   const configuredMonumentHistoryDataSourceIds = React.useMemo(
@@ -278,7 +371,7 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
   )
 
   const modeButtonStyle: React.CSSProperties = {
-    flex: '1 1 0',
+    flex: '0 0 calc((100% - 0.7rem) / 3)',
     minWidth: 0,
     height: 32,
     padding: '0 6px',
@@ -353,10 +446,10 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
   const toSurveyMonumentSummary = React.useCallback((attributes: { [key: string]: any }): SurveyMonumentSummary => ({
     objectId: getAttributeValue(attributes, 'OBJECTID'),
     globalId: getStringAttribute(attributes, monumentGlobalIdField),
-    pointNumber: displayOptionalValue(getAttributeValue(attributes, cfg.monumentPointNumberField || 'PointNumber')),
+    pointNumber: displayOptionalValue(getAttributeValue(attributes, monumentPointNumberField)),
     monumentType: displayOptionalValue(getAttributeValue(attributes, 'Type')),
     status: displayOptionalValue(getAttributeValue(attributes, 'Status'))
-  }), [cfg.monumentPointNumberField, monumentGlobalIdField])
+  }), [monumentGlobalIdField, monumentPointNumberField])
 
   const getSurveyMonumentKey = (item: SurveyMonumentSummary) => String(item.objectId)
 
@@ -832,6 +925,109 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
     return monuments
   }, [surveyMonumentsUrl, toSurveyMonumentSummary])
 
+  const getCsvPointNumber = React.useCallback((attributes: { [key: string]: string }) => {
+    const normalizedCandidates = [
+      monumentPointNumberField,
+      'PointNumber',
+      'Point Number',
+      'PointID',
+      'Point ID',
+      'Point'
+    ].map((fieldName) => fieldName.replace(/[^a-z0-9]/gi, '').toLowerCase())
+    const matchingKey = Object.keys(attributes).find((key) =>
+      normalizedCandidates.includes(key.replace(/[^a-z0-9]/gi, '').toLowerCase())
+    )
+    return matchingKey ? attributes[matchingKey].trim() : ''
+  }, [monumentPointNumberField])
+
+  const loadSurveyMonumentsByPointNumbers = React.useCallback(async (pointNumbers: string[]) => {
+    const uniquePointNumbers = Array.from(new Set(pointNumbers.map((pointNumber) => pointNumber.trim()).filter(Boolean)))
+    const monumentsByPointNumber = new Map<string, SurveyMonumentSummary[]>()
+    if (uniquePointNumbers.length === 0) return monumentsByPointNumber
+
+    for (let offset = 0; offset < uniquePointNumbers.length; offset += MONUMENT_GLOBAL_ID_QUERY_CHUNK_SIZE) {
+      const batch = uniquePointNumbers.slice(offset, offset + MONUMENT_GLOBAL_ID_QUERY_CHUNK_SIZE)
+      const query = new URL(`${surveyMonumentsUrl}/query`)
+      query.search = new URLSearchParams({
+        where: `${monumentPointNumberField} IN (${batch.map((pointNumber) => `'${escapeSqlString(pointNumber)}'`).join(',')})`,
+        outFields: '*',
+        returnGeometry: 'false',
+        resultRecordCount: String(HISTORY_QUERY_LIMIT),
+        f: 'json'
+      }).toString()
+
+      const response = await fetch(query.toString())
+      const data = await response.json() as QueryResponse
+      if (!response.ok || data.error) throw new Error(data.error?.message || response.statusText)
+
+      ;(data.features || []).forEach((feature) => {
+        const item = toSurveyMonumentSummary(feature.attributes || {})
+        const key = item.pointNumber.trim().toLowerCase()
+        if (!key || key === '-') return
+        monumentsByPointNumber.set(key, [...(monumentsByPointNumber.get(key) || []), item])
+      })
+    }
+
+    return monumentsByPointNumber
+  }, [monumentPointNumberField, surveyMonumentsUrl, toSurveyMonumentSummary])
+
+  const importProjectCsvFile = React.useCallback(async (file: File) => {
+    setLoadingProjectCsv(true)
+    setProjectCsvFileName(file.name)
+    setNewSearchPointRows([])
+    setExistingMonumentRows([])
+    setMultipleMonumentRows([])
+
+    try {
+      const parsedRows = parseCsvText(await file.text())
+      const rowPointNumbers = parsedRows.map((row) => getCsvPointNumber(row.attributes))
+      const parsedPointCounts = rowPointNumbers.reduce<Map<string, number>>((counts, pointNumber) => {
+        const key = pointNumber.trim().toLowerCase()
+        if (!key) return counts
+        counts.set(key, (counts.get(key) || 0) + 1)
+        return counts
+      }, new Map())
+      const monumentsByPointNumber = await loadSurveyMonumentsByPointNumbers(rowPointNumbers)
+
+      const newRows: CsvProjectRow[] = []
+      const existingRows: CsvProjectRow[] = []
+      const multipleRows: CsvProjectRow[] = []
+
+      parsedRows.forEach((row) => {
+        const pointNumber = getCsvPointNumber(row.attributes)
+        const pointKey = pointNumber.trim().toLowerCase()
+        const existingMonuments = pointKey ? monumentsByPointNumber.get(pointKey) || [] : []
+        const validationMessages = pointNumber ? [] : [m.csvMissingPointNumber]
+        const item: CsvProjectRow = {
+          id: `${row.rowNumber}-${pointNumber || 'missing'}`,
+          rowNumber: row.rowNumber,
+          attributes: row.attributes,
+          pointNumber: pointNumber || '-',
+          validationMessages,
+          existingMonuments
+        }
+
+        if ((pointKey && (parsedPointCounts.get(pointKey) || 0) > 1) || existingMonuments.length > 1) {
+          multipleRows.push(item)
+        } else if (existingMonuments.length === 1) {
+          existingRows.push(item)
+        } else {
+          newRows.push(item)
+        }
+      })
+
+      setNewSearchPointRows(newRows)
+      setExistingMonumentRows(existingRows)
+      setMultipleMonumentRows(multipleRows)
+      setStatus(`${m.csvParsed}: ${parsedRows.length}`)
+    } catch (err) {
+      const message = err instanceof Error ? err.message : m.csvParseFailed
+      setStatus(`${m.csvParseFailed} ${message || ''}`.trim())
+    } finally {
+      setLoadingProjectCsv(false)
+    }
+  }, [getCsvPointNumber, loadSurveyMonumentsByPointNumbers, m.csvMissingPointNumber, m.csvParsed, m.csvParseFailed])
+
   const loadSelectedSurveyMonuments = React.useCallback(async () => {
     if (suppressAssignSurveySelectionSyncRef.current) return
 
@@ -983,6 +1179,60 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
       setLoadingAssignHistory(false)
     }
   }, [historyMonumentGlobalIdField, historyProjectGlobalIdField, loadProjectNamesByGlobalIds, m.assignHistoryLoaded, m.assignSurveyMissingGlobalId, m.historyLoadFailed, monumentHistoryUrl, toHistorySummary])
+
+  const createAssociatedHistoryForSelectedSurveyMonument = React.useCallback(async () => {
+    const monument = assignSurveyMonuments.find((item) => getSurveyMonumentKey(item) === activeAssignSurveyKey)
+    if (!monument) {
+      setStatus(m.selectSurveyMonumentFirst)
+      return
+    }
+    if (!monument.globalId) {
+      setStatus(m.assignSurveyMissingGlobalId)
+      return
+    }
+    if (!selectedProject?.globalId) {
+      setStatus(m.historyMissingProjectId)
+      return
+    }
+
+    setAddingAssignHistory(true)
+    try {
+      const layer = await getMonumentHistoryLayer()
+      const attributes = {
+        [historyMonumentGlobalIdField]: monument.globalId,
+        [historyProjectGlobalIdField]: selectedProject.globalId,
+        PointNumber: monument.pointNumber === '-' ? null : monument.pointNumber,
+        Status: monument.status === '-' ? null : monument.status,
+        Type: monument.monumentType === '-' ? null : monument.monumentType
+      }
+      const results = await layer.applyEdits({
+        addFeatures: [{ attributes }]
+      })
+      const addResult = results.addFeatureResults?.[0]
+      if (!addResult || addResult.error) throw new Error(addResult?.error?.message || m.addHistoryFailed)
+
+      await loadAssignHistoryForSurveyMonument(monument)
+      const newObjectId = addResult.objectId
+      if (newObjectId !== undefined && newObjectId !== null) {
+        const newHistoryKey = String(newObjectId)
+        setActiveAssignHistoryKey(newHistoryKey)
+        suppressAssignSurveySelectionSyncRef.current = true
+        selectMonumentHistoryRecord(newObjectId)
+          .catch(() => undefined)
+          .finally(() => {
+            window.setTimeout(() => {
+              suppressAssignSurveySelectionSyncRef.current = false
+            }, 750)
+          })
+      }
+      setStatus(`${m.addHistorySuccess}: ${monument.pointNumber}`)
+    } catch (err) {
+      const message = err instanceof Error ? err.message : m.addHistoryFailed
+      setStatus(message || m.addHistoryFailed)
+    } finally {
+      setAddingAssignHistory(false)
+    }
+  }, [activeAssignSurveyKey, assignSurveyMonuments, getMonumentHistoryLayer, historyMonumentGlobalIdField, historyProjectGlobalIdField, loadAssignHistoryForSurveyMonument, m.addHistoryFailed, m.addHistorySuccess, m.assignSurveyMissingGlobalId, m.historyMissingProjectId, m.selectSurveyMonumentFirst, selectMonumentHistoryRecord, selectedProject])
 
   const ensureMonumentGraphicsLayer = React.useCallback(async () => {
     if (!jimuMapView?.view?.map) return null
@@ -1519,7 +1769,7 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
     let cancelled = false
 
     const syncMonumentGraphics = async () => {
-      if (mode === 'create') return
+      if (isSurveyHistoryMode) return
       if (mode !== 'history' || !selectedProject) {
         monumentGraphicsLayerRef.current?.removeAll?.()
         if (activeHistoryKey || historyItems.length > 0) {
@@ -1537,17 +1787,17 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
     return () => {
       cancelled = true
     }
-  }, [activeHistoryKey, historyItems, m.monumentGraphicsFailed, mode, renderProjectMonumentGraphics, selectMonumentHistoryRecord, selectedProject])
+  }, [activeHistoryKey, historyItems, isSurveyHistoryMode, m.monumentGraphicsFailed, mode, renderProjectMonumentGraphics, selectMonumentHistoryRecord, selectedProject])
 
   React.useEffect(() => {
-    if (mode !== 'create') return
+    if (!isSurveyHistoryMode) return
     loadSelectedSurveyMonuments().catch(() => {
       setStatus(m.assignSurveySelectionFailed)
     })
-  }, [loadSelectedSurveyMonuments, m.assignSurveySelectionFailed, mode, surveyMonumentSelectionKey])
+  }, [isSurveyHistoryMode, loadSelectedSurveyMonuments, m.assignSurveySelectionFailed, surveyMonumentSelectionKey])
 
   React.useEffect(() => {
-    if (mode !== 'create') return
+    if (!isSurveyHistoryMode) return
     const activeSurveyMonument = assignSurveyMonuments.find((item) => getSurveyMonumentKey(item) === activeAssignSurveyKey)
     if (!activeSurveyMonument) {
       setAssignHistoryItems([])
@@ -1557,10 +1807,10 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
     loadAssignHistoryForSurveyMonument(activeSurveyMonument).catch(() => {
       setStatus(m.historyLoadFailed)
     })
-  }, [activeAssignSurveyKey, assignSurveyMonuments, loadAssignHistoryForSurveyMonument, m.historyLoadFailed, mode])
+  }, [activeAssignSurveyKey, assignSurveyMonuments, isSurveyHistoryMode, loadAssignHistoryForSurveyMonument, m.historyLoadFailed])
 
   React.useEffect(() => {
-    if ((mode !== 'create' && mode !== 'history') || !attachmentHistoryItem) {
+    if ((!isSurveyHistoryMode && mode !== 'history') || !attachmentHistoryItem) {
       setAttachmentItems([])
       setAttachmentError('')
       clearStagedAttachmentFiles()
@@ -1570,13 +1820,13 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
     loadHistoryAttachments(attachmentHistoryItem).catch(() => {
       setAttachmentError(m.historyLoadFailed)
     })
-  }, [attachmentHistoryItem, clearStagedAttachmentFiles, loadHistoryAttachments, m.historyLoadFailed, mode])
+  }, [attachmentHistoryItem, clearStagedAttachmentFiles, isSurveyHistoryMode, loadHistoryAttachments, m.historyLoadFailed, mode])
 
   React.useEffect(() => {
     let cancelled = false
 
     const syncAssignGraphics = async () => {
-      if (mode !== 'create') return
+      if (!isSurveyHistoryMode) return
       await renderAssignSurveyMonumentGraphics(assignSurveyMonuments, activeAssignSurveyKey)
     }
 
@@ -1587,7 +1837,7 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
     return () => {
       cancelled = true
     }
-  }, [activeAssignSurveyKey, assignSurveyMonuments, m.monumentGraphicsFailed, mode, renderAssignSurveyMonumentGraphics])
+  }, [activeAssignSurveyKey, assignSurveyMonuments, isSurveyHistoryMode, m.monumentGraphicsFailed, renderAssignSurveyMonumentGraphics])
 
   React.useEffect(() => () => {
     monumentGraphicsLayerRef.current?.removeAll?.()
@@ -1650,13 +1900,22 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
   }
 
   const startWorkflowMode = (nextMode: MonumentMode) => {
-    if (!selectedProject) {
+    const requiresProject = nextMode !== 'merge-points'
+    if (requiresProject && !selectedProject) {
       setStatus(m.selectProjectFirst)
       return
     }
+    if (nextMode === 'merge-points') {
+      setAssignSurveyMonuments([])
+      setActiveAssignSurveyKey('')
+      setAssignHistoryItems([])
+      setActiveAssignHistoryKey('')
+    }
     setMode(nextMode)
     const workflow = workflowModes.find((item) => item.id === nextMode)
-    setStatus(`${workflow?.label || m.selectedProject}: ${selectedProject.name}`)
+    setStatus(requiresProject && selectedProject
+      ? `${workflow?.label || m.selectedProject}: ${selectedProject.name}`
+      : (workflow?.title || workflow?.label || m.selectedProject))
   }
 
   const clearAssignLists = () => {
@@ -1677,6 +1936,166 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
       setActiveAssignHistoryKey('')
     }
     setStatus(`${m.surveyMonumentRemoved}: ${item.pointNumber}`)
+  }
+
+  const setActiveSurveyMonumentAsTarget = () => {
+    if (!activeAssignSurveyKey || assignSurveyMonuments.length < 2) return
+    setAssignSurveyMonuments((current) => {
+      const targetIndex = current.findIndex((item) => getSurveyMonumentKey(item) === activeAssignSurveyKey)
+      if (targetIndex <= 0) return current
+      const nextItems = [...current]
+      const [targetItem] = nextItems.splice(targetIndex, 1)
+      nextItems.unshift(targetItem)
+      setStatus(`${m.targetSet}: ${targetItem.pointNumber}`)
+      return nextItems
+    })
+  }
+
+  const canMergeSurveyMonuments = assignSurveyMonuments.length > 1
+  const projectCsvRowCount = newSearchPointRows.length + existingMonumentRows.length + multipleMonumentRows.length
+
+  const executeMergeWithRollback = React.useCallback(async (
+    runOperation: (registerRollback: (action: MergeRollbackAction) => void) => void | Promise<void>
+  ) => {
+    const rollbackActions: MergeRollbackAction[] = []
+    const registerRollback = (action: MergeRollbackAction) => {
+      rollbackActions.push(action)
+    }
+
+    try {
+      await runOperation(registerRollback)
+    } catch (err) {
+      for (const action of [...rollbackActions].reverse()) {
+        try {
+          await action.run()
+        } catch (rollbackErr) {
+          const message = rollbackErr instanceof Error ? rollbackErr.message : m.mergeRollbackFailed
+          throw new Error(`${m.mergeRollbackFailed} ${action.label}: ${message}`)
+        }
+      }
+      throw err
+    }
+  }, [m.mergeRollbackFailed])
+
+  const stageMergeAction = async (mergeType: MergeOperationType) => {
+    if (!canMergeSurveyMonuments) {
+      setStatus(m.mergeRequiresMultipleMonuments)
+      return
+    }
+    const targetMonument = assignSurveyMonuments[0]
+    const sourceMonuments = assignSurveyMonuments.slice(1)
+    const actionLabel = mergeType === 'target' ? m.targetMerge : m.meanMerge
+    await executeMergeWithRollback(() => {
+      setStatus(`${actionLabel}: ${targetMonument.pointNumber} <- ${sourceMonuments.length} monuments. ${m.mergeActionPending}`)
+    })
+  }
+
+  const resetProjectCsvImport = () => {
+    setProjectCsvFileName('')
+    setNewProjectName('')
+    setUseSelectedProjectForCreate(false)
+    setNewSearchPointRows([])
+    setExistingMonumentRows([])
+    setMultipleMonumentRows([])
+    setStatus(m.csvImportReset)
+  }
+
+  const analyzeProjectCsvResults = () => {
+    setStatus(`${m.csvAnalysisSummary}: ${m.newSearchPoint} ${newSearchPointRows.length}, ${m.existingMonument} ${existingMonumentRows.length}, ${m.multipleMonuments} ${multipleMonumentRows.length}`)
+  }
+
+  const stageCreateProjectFromCsv = () => {
+    const projectName = newProjectName.trim() || '-'
+    setStatus(`${m.createTitle}: ${projectName}, ${projectCsvRowCount}. ${m.createProjectPending}`)
+  }
+
+  const parseTraverseFile = async (file: File): Promise<TraverseFileSummary> => {
+    const text = await file.text()
+    const lines = text.split(/\r?\n/)
+    return {
+      id: `${file.name}-${file.size}-${file.lastModified}`,
+      name: file.name,
+      size: file.size,
+      lineCount: lines.length,
+      nonEmptyLineCount: lines.filter((line) => line.trim().length > 0).length,
+      basisOfBearing: extractBasisOfBearing(text)
+    }
+  }
+
+  const importTraverseFiles = React.useCallback(async (files: FileList | File[]) => {
+    const incomingFiles = Array.from(files).filter((file) => file.name.toLowerCase().endsWith('.lst'))
+    if (incomingFiles.length === 0) return
+
+    setLoadingTraverseFiles(true)
+    try {
+      const parsedFiles = await Promise.all(incomingFiles.map(parseTraverseFile))
+      setTraverseFiles(parsedFiles)
+      setStatus(`${m.traverseParsed}: ${parsedFiles.length}`)
+    } catch (err) {
+      const message = err instanceof Error ? err.message : m.traverseParseFailed
+      setStatus(`${m.traverseParseFailed} ${message || ''}`.trim())
+    } finally {
+      setLoadingTraverseFiles(false)
+    }
+  }, [m.traverseParsed, m.traverseParseFailed])
+
+  const importStaticFile = React.useCallback(async (file?: File) => {
+    if (!file) return
+
+    setLoadingTraverseFiles(true)
+    try {
+      const parsedFile = await parseTraverseFile(file)
+      setStaticFiles([parsedFile])
+      setBasisOfBearing(parsedFile.basisOfBearing || '')
+      setStatus(`${m.traverseParsed}: 1`)
+    } catch (err) {
+      const message = err instanceof Error ? err.message : m.traverseParseFailed
+      setStatus(`${m.traverseParseFailed} ${message || ''}`.trim())
+    } finally {
+      setLoadingTraverseFiles(false)
+    }
+  }, [m.traverseParsed, m.traverseParseFailed])
+
+  const resetTraverseFiles = () => {
+    setTraverseFiles([])
+    setStatus(m.traverseFilesReset)
+  }
+
+  const stageProcessTraverseFiles = () => {
+    setStatus(`${m.processFiles}: ${traverseFiles.length}. ${m.traverseProcessPending}`)
+  }
+
+  const resetStaticFile = () => {
+    setStaticFiles([])
+    setBasisOfBearing('')
+    setStatus(m.staticFileReset)
+  }
+
+  const stageProcessStaticFile = () => {
+    const staticFileName = staticFiles[0]?.name || '-'
+    setStatus(`${m.processFile}: ${staticFileName}. ${m.staticProcessPending}`)
+  }
+
+  const clearBasisOfBearing = () => {
+    setBasisOfBearing('')
+    setStatus(m.basisOfBearingCleared)
+  }
+
+  const acceptBasisOfBearing = () => {
+    setStatus(`${m.basisOfBearingAccepted} ${basisOfBearing.trim()}`)
+  }
+
+  const toggleUseSelectedProjectForCreate = () => {
+    if (!selectedProject) {
+      setUseSelectedProjectForCreate(false)
+      setStatus(m.selectProjectFirst)
+      return
+    }
+    setUseSelectedProjectForCreate((current) => {
+      const nextValue = !current
+      if (nextValue) setNewProjectName(selectedProject.name)
+      return nextValue
+    })
   }
 
   const historyRow = (item: MonumentHistorySummary) => {
@@ -1852,7 +2271,7 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
           removeAssignSurveyMonument(item)
         },
         style: { width: 32, minWidth: 32, height: 32, padding: 0, display: 'inline-flex', alignItems: 'center', justifyContent: 'center' }
-      }, '🗑️'),
+      }, '×'),
       h(Button, {
         size: 'sm',
         type: 'default',
@@ -1945,7 +2364,7 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
         )
       )
     ),
-    h('div', { className: 'd-flex align-items-center', style: { gap: '0.25rem', flex: '0 0 auto' } },
+    mode === 'create' && h('div', { className: 'd-flex align-items-center', style: { gap: '0.25rem', flex: '0 0 auto' } },
       h(Button, {
         size: 'sm',
         type: 'default',
@@ -2198,7 +2617,7 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
               : historyItems.map(historyRow)
         ),
         h('div', { className: 'd-flex mt-2', style: { gap: '0.35rem' } },
-          h(Button, {
+          mode === 'merge-points' && h(Button, {
             type: 'primary',
             size: 'sm',
             style: modeActionButtonStyle,
@@ -2214,10 +2633,10 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
       )
     )
 
-  const assignProjectPanel = () =>
+  const surveyHistoryPanel = () =>
     h('div', { className: 'd-flex flex-column flex-grow-1', style: { gap: '0.75rem', minHeight: 0 } },
       h('div', { className: 'd-flex align-items-center justify-content-between', style: { gap: '0.5rem' } },
-        h('div', { className: 'font-weight-bold' }, m.assignProjectTitle),
+        h('div', { className: 'font-weight-bold' }, activeMode.title),
         h(Button, {
           size: 'sm',
           type: 'tertiary',
@@ -2226,7 +2645,7 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
           }
         }, m.cancel)
       ),
-      selectedProject && h('div', { style: { fontSize: 14, fontWeight: 700, lineHeight: '18px', overflowWrap: 'anywhere' } }, selectedProject.name),
+      mode === 'create' && selectedProject && h('div', { style: { fontSize: 14, fontWeight: 700, lineHeight: '18px', overflowWrap: 'anywhere' } }, selectedProject.name),
       h('div', { className: 'border rounded p-2 d-flex flex-column', style: { minHeight: 120, flex: '0 0 38%' } },
         h('div', { className: 'd-flex align-items-center justify-content-between mb-2', style: { gap: '0.5rem' } },
           h('div', { className: 'font-weight-bold', style: { fontSize: 12 } }, m.surveyMonumentsTitle),
@@ -2247,7 +2666,14 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
             : assignSurveyMonuments.map(assignSurveyMonumentRow)
         ),
         h('div', { className: 'd-flex mt-2', style: { gap: '0.35rem' } },
-          h(Button, {
+          mode === 'merge-points' && h(Button, {
+            type: 'primary',
+            size: 'sm',
+            style: modeActionButtonStyle,
+            disabled: assignSurveyMonuments.length < 2 || !activeAssignSurveyKey,
+            onClick: setActiveSurveyMonumentAsTarget
+          }, m.setTarget),
+          mode === 'create' && h(Button, {
             type: 'primary',
             size: 'sm',
             style: modeActionButtonStyle,
@@ -2269,6 +2695,43 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
             : assignHistoryItems.length === 0
               ? h('div', { style: { fontSize: 12, opacity: 0.75 } }, m.assignHistoryEmpty)
               : assignHistoryItems.map(assignHistoryRow)
+        ),
+        mode === 'create' && h('div', { className: 'd-flex mt-2', style: { gap: '0.35rem' } },
+          h(Button, {
+            type: 'primary',
+            size: 'sm',
+            style: modeActionButtonStyle,
+            disabled: !activeAssignSurveyKey || addingAssignHistory,
+            onClick: () => {
+              createAssociatedHistoryForSelectedSurveyMonument().catch(() => undefined)
+            }
+          }, m.addHistory)
+        ),
+        mode === 'merge-points' && h('div', { className: 'd-flex mt-2', style: { gap: '0.35rem' } },
+          h(Button, {
+            type: 'primary',
+            size: 'sm',
+            style: modeActionButtonStyle,
+            disabled: !canMergeSurveyMonuments,
+            onClick: () => {
+              stageMergeAction('target').catch((err) => {
+                const message = err instanceof Error ? err.message : m.mergeRollbackFailed
+                setStatus(message || m.mergeRollbackFailed)
+              })
+            }
+          }, m.targetMerge),
+          h(Button, {
+            type: 'primary',
+            size: 'sm',
+            style: modeActionButtonStyle,
+            disabled: !canMergeSurveyMonuments,
+            onClick: () => {
+              stageMergeAction('mean').catch((err) => {
+                const message = err instanceof Error ? err.message : m.mergeRollbackFailed
+                setStatus(message || m.mergeRollbackFailed)
+              })
+            }
+          }, m.meanMerge)
         )
       )
     )
@@ -2320,7 +2783,7 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
                 onClick: () => {
                   if (item.id === 'create-project') {
                     setMode('create-project')
-                    setStatus(m.createTitle)
+                    setStatus(m.createProjectWorkflowTitle)
                     return
                   }
                   startWorkflowMode(item.id)
@@ -2328,6 +2791,299 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
               }, item.label)
             })
           )
+        )
+      )
+    )
+
+  const csvProjectRow = (item: CsvProjectRow) => {
+    const validationText = item.validationMessages.join(' | ')
+    const existingText = item.existingMonuments.length > 0
+      ? `${item.existingMonuments.length} ${m.surveyMonumentsTitle}`
+      : ''
+    return h('div', {
+      key: item.id,
+      className: 'py-1',
+      style: {
+        paddingLeft: '0.5rem',
+        paddingRight: '0.5rem',
+        fontSize: 12,
+        borderBottom: '1px solid rgba(0, 0, 0, 0.06)'
+      }
+    },
+    h('div', { className: 'd-flex align-items-center justify-content-between', style: { gap: '0.5rem', minWidth: 0 } },
+      h('div', {
+        title: `Row ${item.rowNumber}: ${item.pointNumber}`,
+        style: { minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontWeight: 600 }
+      }, `Row ${item.rowNumber}: ${item.pointNumber}`),
+      existingText && h('div', { style: { flex: '0 0 auto', fontSize: 10, opacity: 0.7 } }, existingText)
+    ),
+    validationText && h('div', {
+      style: { marginTop: 2, fontSize: 10, lineHeight: '14px', color: 'var(--danger-600, #c92a2a)' }
+    }, validationText)
+    )
+  }
+
+  const csvProjectList = (title: string, rows: CsvProjectRow[]) =>
+    h('div', { className: 'border rounded p-2 d-flex flex-column', style: { minHeight: 0, flex: '1 1 0' } },
+      h('div', { className: 'd-flex align-items-center justify-content-between mb-2', style: { gap: '0.5rem' } },
+        h('div', { className: 'font-weight-bold', style: { fontSize: 12 } }, title),
+        h('div', { style: { fontSize: 11, opacity: 0.75 } }, `${rows.length} ${m.featureCountLabel}`)
+      ),
+      h('div', { className: 'flex-grow-1', style: { minHeight: 0, overflowY: 'auto', overflowX: 'hidden' } },
+        rows.length === 0
+          ? h('div', { style: { fontSize: 12, opacity: 0.72 } }, '-')
+          : rows.map(csvProjectRow)
+      )
+    )
+
+  const createProjectPanel = () =>
+    h('div', { className: 'd-flex flex-column flex-grow-1', style: { gap: '0.75rem', minHeight: 0 } },
+      h('div', { className: 'd-flex align-items-center justify-content-between', style: { gap: '0.5rem' } },
+        h('div', { className: 'font-weight-bold' }, activeMode.title),
+        h(Button, {
+          size: 'sm',
+          type: 'tertiary',
+          onClick: () => {
+            setMode('finder')
+          }
+        }, m.cancel)
+      ),
+      h('div', { className: 'border rounded p-2', style: { flex: '0 0 auto' } },
+        h('div', { className: 'mb-2' },
+          h('div', { className: 'd-flex align-items-center justify-content-between mb-1', style: { gap: '0.5rem' } },
+            h('div', { style: { fontSize: 11, fontWeight: 700 } }, m.projectNameLabel),
+            h('label', { className: 'd-flex align-items-center mb-0', style: { gap: '0.35rem', fontSize: 11, opacity: selectedProject ? 0.85 : 0.55 } },
+              h(Checkbox, {
+                checked: useSelectedProjectForCreate,
+                disabled: !selectedProject,
+                onChange: toggleUseSelectedProjectForCreate
+              }),
+              h('span', null, m.useSelectedProject)
+            )
+          ),
+          h(TextInput, {
+            value: newProjectName,
+            placeholder: m.projectNamePlaceholder,
+            onChange: (evt) => {
+              if (useSelectedProjectForCreate) setUseSelectedProjectForCreate(false)
+              setNewProjectName(evt.target.value)
+            }
+          })
+        ),
+        h('div', { className: 'd-flex align-items-center justify-content-between', style: { gap: '0.5rem' } },
+          h('div', { className: 'font-weight-bold', style: { fontSize: 12 } }, m.csvImportTitle),
+          h(Button, {
+            type: 'primary',
+            size: 'sm',
+            disabled: loadingProjectCsv,
+            style: modeActionButtonStyle,
+            onClick: () => {
+              projectCsvFileInputRef.current?.click()
+            }
+          }, m.chooseCsv)
+        ),
+        h('input', {
+          ref: projectCsvFileInputRef,
+          type: 'file',
+          accept: '.csv,text/csv',
+          style: { display: 'none' },
+          onChange: (evt) => {
+            const file = evt.target.files?.[0]
+            if (file) importProjectCsvFile(file).catch(() => undefined)
+            evt.target.value = ''
+          }
+        }),
+        h('div', { className: 'mt-1', style: { fontSize: 11, opacity: 0.75, overflowWrap: 'anywhere' } },
+          loadingProjectCsv ? m.searchingProjects : (projectCsvFileName || m.chooseCsv)
+        )
+      ),
+      h('div', { className: 'd-flex flex-column flex-grow-1', style: { gap: '0.5rem', minHeight: 0 } },
+        csvProjectList(m.newSearchPoint, newSearchPointRows),
+        csvProjectList(m.existingMonument, existingMonumentRows),
+        csvProjectList(m.multipleMonuments, multipleMonumentRows)
+      ),
+      h('div', { className: 'd-flex', style: { gap: '0.35rem', flex: '0 0 auto' } },
+        h(Button, {
+          type: 'primary',
+          size: 'sm',
+          style: modeActionButtonStyle,
+          disabled: projectCsvRowCount === 0,
+          onClick: stageCreateProjectFromCsv
+        }, m.createTitle),
+        h(Button, {
+          type: 'default',
+          size: 'sm',
+          style: modeActionButtonStyle,
+          disabled: projectCsvRowCount === 0,
+          onClick: analyzeProjectCsvResults
+        }, m.analyzeResults),
+        h(Button, {
+          type: 'default',
+          size: 'sm',
+          style: modeActionButtonStyle,
+          disabled: projectCsvRowCount === 0 && !projectCsvFileName && !newProjectName.trim(),
+          onClick: resetProjectCsvImport
+        }, m.reset)
+      )
+    )
+
+  const shouldShowStatusAlert = () => {
+    if (mode !== 'create-project') return true
+    return [
+      m.csvParsed,
+      m.csvParseFailed,
+      m.csvAnalysisSummary,
+      m.csvImportReset,
+      m.createTitle
+    ].some((messagePrefix) => status.startsWith(messagePrefix))
+  }
+
+  const traverseFileRow = (file: TraverseFileSummary) =>
+    h('div', {
+      key: file.id,
+      className: 'd-flex align-items-center justify-content-between py-1',
+      style: { gap: '0.5rem', fontSize: 12, borderBottom: '1px solid rgba(0, 0, 0, 0.06)' }
+    },
+    h('div', { style: { minWidth: 0, overflow: 'hidden' } },
+      h('div', { title: file.name, style: { overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontWeight: 600 } }, file.name),
+      h('div', { style: { fontSize: 10, opacity: 0.68 } }, `${file.nonEmptyLineCount}/${file.lineCount} lines`)
+    ),
+    h('div', { style: { flex: '0 0 auto', fontSize: 10, opacity: 0.68 } }, formatFileSize(file.size))
+    )
+
+  const traversePanel = () =>
+    h('div', { className: 'd-flex flex-column flex-grow-1', style: { gap: '0.75rem', minHeight: 0 } },
+      h('div', { className: 'd-flex align-items-center justify-content-between', style: { gap: '0.5rem' } },
+        h('div', { className: 'font-weight-bold' }, activeMode.title),
+        h(Button, {
+          size: 'sm',
+          type: 'tertiary',
+          onClick: () => {
+            setMode('finder')
+          }
+        }, m.cancel)
+      ),
+      selectedProject && h('div', { style: { fontSize: 14, fontWeight: 700, lineHeight: '18px', overflowWrap: 'anywhere' } }, selectedProject.name),
+      h('div', { className: 'border rounded p-2 d-flex flex-column', style: { minHeight: 159, flex: '1.44 1 0' } },
+        h('div', { className: 'd-flex align-items-center justify-content-between mb-2', style: { gap: '0.5rem' } },
+          h('div', { className: 'font-weight-bold', style: { fontSize: 12 } }, m.traverseFilesTitle),
+          h(Button, {
+            size: 'sm',
+            type: 'tertiary',
+            disabled: loadingTraverseFiles || traverseFiles.length === 0,
+            onClick: resetTraverseFiles,
+            style: { height: 24, padding: '0 6px', fontSize: 11 }
+          }, m.clear)
+        ),
+        h('input', {
+          ref: traverseFileInputRef,
+          type: 'file',
+          accept: '.lst',
+          multiple: true,
+          style: { display: 'none' },
+          onChange: (evt) => {
+            const files = evt.target.files
+            if (files) importTraverseFiles(files).catch(() => undefined)
+            evt.target.value = ''
+          }
+        }),
+        h('div', { className: 'flex-grow-1', style: { minHeight: 0, overflowY: 'auto', overflowX: 'hidden' } },
+          loadingTraverseFiles
+            ? h('div', { style: { fontSize: 12, opacity: 0.75 } }, m.loadingTraverseFiles)
+            : traverseFiles.length === 0
+              ? h('div', { style: { fontSize: 12, opacity: 0.72 } }, m.traverseFilesEmpty)
+              : traverseFiles.map(traverseFileRow)
+        ),
+        h('div', { className: 'd-flex mt-2', style: { gap: '0.35rem' } },
+          h(Button, {
+            type: 'primary',
+            size: 'sm',
+            disabled: loadingTraverseFiles,
+            style: modeActionButtonStyle,
+            onClick: () => {
+              traverseFileInputRef.current?.click()
+            }
+          }, m.chooseLstFiles),
+          h(Button, {
+            type: 'primary',
+            size: 'sm',
+            disabled: loadingTraverseFiles || traverseFiles.length === 0,
+            style: modeActionButtonStyle,
+            onClick: stageProcessTraverseFiles
+          }, m.processFiles)
+        )
+      ),
+      h('div', { className: 'border rounded p-2 d-flex flex-column', style: { minHeight: 110, flex: '1 1 0' } },
+        h('div', { className: 'd-flex align-items-center justify-content-between mb-2', style: { gap: '0.5rem' } },
+          h('div', { className: 'font-weight-bold', style: { fontSize: 12 } }, m.selectStaticFileTitle),
+          h(Button, {
+            size: 'sm',
+            type: 'tertiary',
+            disabled: loadingTraverseFiles || staticFiles.length === 0,
+            onClick: resetStaticFile,
+            style: { height: 24, padding: '0 6px', fontSize: 11 }
+          }, m.clear)
+        ),
+        h('input', {
+          ref: staticFileInputRef,
+          type: 'file',
+          accept: '.lst',
+          style: { display: 'none' },
+          onChange: (evt) => {
+            importStaticFile(evt.target.files?.[0]).catch(() => undefined)
+            evt.target.value = ''
+          }
+        }),
+        h('div', { className: 'flex-grow-1', style: { minHeight: 0, overflowY: 'auto', overflowX: 'hidden' } },
+          staticFiles.length === 0
+            ? h('div', { style: { fontSize: 12, opacity: 0.72 } }, m.traverseFilesEmpty)
+            : staticFiles.map(traverseFileRow)
+        ),
+        h('div', { className: 'd-flex mt-2', style: { gap: '0.35rem' } },
+          h(Button, {
+            type: 'primary',
+            size: 'sm',
+            disabled: loadingTraverseFiles,
+            style: modeActionButtonStyle,
+            onClick: () => {
+              staticFileInputRef.current?.click()
+            }
+          }, m.chooseStaticFile),
+          h(Button, {
+            type: 'primary',
+            size: 'sm',
+            disabled: loadingTraverseFiles || staticFiles.length === 0,
+            style: modeActionButtonStyle,
+            onClick: stageProcessStaticFile
+          }, m.processFile)
+        )
+      ),
+      h('div', { className: 'border rounded p-2 d-flex flex-column', style: { minHeight: 83, flex: '0.76 1 0' } },
+        h('div', { className: 'd-flex align-items-center justify-content-between mb-2', style: { gap: '0.5rem' } },
+          h('div', { className: 'font-weight-bold', style: { fontSize: 12 } }, m.basisOfBearingTitle),
+          h(Button, {
+            size: 'sm',
+            type: 'tertiary',
+            disabled: basisOfBearing.trim().length === 0,
+            onClick: clearBasisOfBearing,
+            style: { height: 24, padding: '0 6px', fontSize: 11 }
+          }, m.clear)
+        ),
+        h(TextInput, {
+          value: basisOfBearing,
+          placeholder: m.basisOfBearingPlaceholder,
+          onChange: (evt) => {
+            setBasisOfBearing(evt.target.value)
+          }
+        }),
+        h('div', { className: 'd-flex mt-2', style: { gap: '0.35rem' } },
+          h(Button, {
+            type: 'primary',
+            size: 'sm',
+            style: modeActionButtonStyle,
+            disabled: basisOfBearing.trim().length === 0,
+            onClick: acceptBasisOfBearing
+          }, m.acceptBoB)
         )
       )
     )
@@ -2372,12 +3128,12 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
     h(Card, { className: 'widget-monument-manager h-100 w-100' },
       h(CardHeader, null, m.widgetTitle),
       h(CardBody, { className: 'd-flex flex-column', style: { gap: '0.75rem', minHeight: 0 } },
-        mode === 'finder' ? monumentProjectFinder() : mode === 'history' ? viewHistoryPanel() : mode === 'create' ? assignProjectPanel() : modePanel(),
-        mode !== 'finder' && mode !== 'history' && mode !== 'create' && h('div', { className: 'border rounded p-2 flex-grow-1', style: { minHeight: 110 } },
+        mode === 'finder' ? monumentProjectFinder() : mode === 'history' ? viewHistoryPanel() : isSurveyHistoryMode ? surveyHistoryPanel() : mode === 'create-project' ? createProjectPanel() : mode === 'traverse' ? traversePanel() : modePanel(),
+        mode !== 'finder' && mode !== 'history' && !isSurveyHistoryMode && mode !== 'create-project' && mode !== 'traverse' && h('div', { className: 'border rounded p-2 flex-grow-1', style: { minHeight: 110 } },
           h('div', { className: 'font-weight-bold mb-2', style: { fontSize: 12 } }, m.selectedFeatures),
           h('div', { style: { fontSize: 12, opacity: 0.72 } }, m.selectedFeaturesEmpty)
         ),
-        h(Alert, { form: 'basic', type: 'info', text: status })
+        shouldShowStatusAlert() && h(Alert, { form: 'basic', type: 'info', text: status })
       )
     ),
     attachmentModal()
