@@ -275,6 +275,33 @@ interface PointNumberPlan {
   errorCount: number
 }
 
+type CreateProjectPlanAction = 'create-survey-monument' | 'update-survey-monument' | 'none'
+type CreateProjectPlanSource = 'new-search-point' | 'existing-monument' | 'multiple-monuments'
+
+interface CreateProjectPlanRow {
+  id: string
+  source: CreateProjectPlanSource
+  pointNumber: string
+  description: string
+  x?: number
+  y?: number
+  z?: number
+  surveyObjectId?: number | string
+  currentPointNumber?: string
+  action: CreateProjectPlanAction
+  severity: 'ready' | 'info' | 'warning' | 'error'
+}
+
+interface CreateProjectPlan {
+  rows: CreateProjectPlanRow[]
+  createRows: CreateProjectPlanRow[]
+  updateRows: CreateProjectPlanRow[]
+  projectName: string
+  canCommit: boolean
+  errorCount: number
+  warningCount: number
+}
+
 interface MergeRollbackAction {
   label: string
   run: () => Promise<void>
@@ -292,8 +319,33 @@ const HISTORY_QUERY_LIMIT = 2000
 const MONUMENT_GLOBAL_ID_QUERY_CHUNK_SIZE = 50
 const SURVEY_MONUMENTS_LAYER_ID = '999066'
 const MONUMENT_HISTORY_LAYER_ID = '999069'
+const STANDARD_PROJECT_CSV_FIELDS = ['PointNumber', 'YCoordinate', 'XCoordinate', 'Elevation', 'MonumentDescription'] as const
+const ORANGE_COUNTY_STATE_PLANE_SPATIAL_REFERENCE = { wkid: 102646, latestWkid: 2230 }
+const CSV_SEARCH_POINT_BUFFER_FEET = 0.03
+const CSV_PROJECT_BOUNDARY_PADDING_FEET = 25
+const CSV_SPATIAL_QUERY_CONCURRENCY = 8
 
 const escapeSqlString = (value: string) => value.replace(/'/g, "''")
+
+const mapWithConcurrency = async <T, R>(
+  items: T[],
+  limit: number,
+  mapper: (item: T, index: number) => Promise<R>
+) => {
+  const results: R[] = []
+  let nextIndex = 0
+  const workerCount = Math.min(limit, items.length)
+
+  await Promise.all(Array.from({ length: workerCount }, async () => {
+    while (nextIndex < items.length) {
+      const currentIndex = nextIndex
+      nextIndex += 1
+      results[currentIndex] = await mapper(items[currentIndex], currentIndex)
+    }
+  }))
+
+  return results
+}
 
 const parseCsvLine = (line: string) => {
   const values: string[] = []
@@ -320,6 +372,20 @@ const parseCsvLine = (line: string) => {
   return values
 }
 
+const normalizeCsvHeader = (value: string) => value.replace(/[^a-z0-9]/gi, '').toLowerCase()
+
+const isStandardProjectCsvHeader = (values: string[]) => {
+  const normalizedValues = values.map(normalizeCsvHeader)
+  return normalizedValues.includes('pointnumber') ||
+    normalizedValues.includes('longitude') ||
+    normalizedValues.includes('latitude') ||
+    normalizedValues.includes('xcoordinate') ||
+    normalizedValues.includes('ycoordinate') ||
+    normalizedValues.includes('easting') ||
+    normalizedValues.includes('northing') ||
+    normalizedValues.includes('monumentdescription')
+}
+
 const parseCsvText = (text: string) => {
   const lines = text
     .replace(/^\uFEFF/, '')
@@ -327,14 +393,25 @@ const parseCsvText = (text: string) => {
     .filter((line) => line.trim().length > 0)
   if (lines.length === 0) return []
 
-  const headers = parseCsvLine(lines[0]).map((header, index) => header || `Column ${index + 1}`)
-  return lines.slice(1).map((line, index) => {
+  const firstLineValues = parseCsvLine(lines[0])
+  const hasHeader = isStandardProjectCsvHeader(firstLineValues)
+  const headers = hasHeader
+    ? firstLineValues.map((header, index) => header || `Column ${index + 1}`)
+    : firstLineValues.map((_, index) => `Column ${index + 1}`)
+  const dataLines = hasHeader ? lines.slice(1) : lines
+  const rowNumberOffset = hasHeader ? 2 : 1
+
+  return dataLines.map((line, index) => {
     const values = parseCsvLine(line)
     const attributes = headers.reduce<{ [key: string]: string }>((result, header, headerIndex) => {
       result[header] = values[headerIndex] || ''
       return result
     }, {})
-    return { rowNumber: index + 2, attributes }
+    STANDARD_PROJECT_CSV_FIELDS.forEach((fieldName, fieldIndex) => {
+      if (!attributes[fieldName]) attributes[fieldName] = values[fieldIndex] || ''
+    })
+    attributes.MonumentDescription = attributes.MonumentDescription || values[values.length - 1] || ''
+    return { rowNumber: index + rowNumberOffset, attributes }
   })
 }
 
@@ -353,6 +430,55 @@ const parseLstNumber = (value?: string) => {
   const parsed = Number(value.replace(/,/g, ''))
   return Number.isFinite(parsed) ? parsed : undefined
 }
+
+const parseCsvCoordinate = (value?: string) => {
+  if (!value) return undefined
+  const parsed = Number(value.replace(/,/g, ''))
+  return Number.isFinite(parsed) ? parsed : undefined
+}
+
+const getCsvAttribute = (attributes: { [key: string]: string }, keys: string[]) => {
+  for (const key of keys) {
+    const matchingKey = Object.keys(attributes).find((attributeKey) => attributeKey.toLowerCase() === key.toLowerCase())
+    const value = matchingKey ? attributes[matchingKey] : undefined
+    if (value !== undefined && value !== null && String(value).trim() !== '') return String(value).trim()
+  }
+  return ''
+}
+
+const getCsvProjectRowCoordinates = (item: CsvProjectRow) => {
+  const x = parseCsvCoordinate(getCsvAttribute(item.attributes, ['XCoordinate', 'Longitude', 'Easting']))
+  const y = parseCsvCoordinate(getCsvAttribute(item.attributes, ['YCoordinate', 'Latitude', 'Northing']))
+  if (x === undefined || y === undefined) return null
+  return {
+    x,
+    y,
+    z: parseCsvCoordinate(item.attributes.Elevation)
+  }
+}
+
+const getCsvProjectRowDisplay = (item: CsvProjectRow) => {
+  const x = getCsvAttribute(item.attributes, ['XCoordinate', 'Longitude', 'Easting']) || '-'
+  const y = getCsvAttribute(item.attributes, ['YCoordinate', 'Latitude', 'Northing']) || '-'
+  const z = item.attributes.Elevation || '-'
+  const description = getCsvAttribute(item.attributes, ['MonumentDescription', 'Description']) || '-'
+  return {
+    pointNumber: item.pointNumber || '-',
+    description,
+    coordinateText: `x: ${x} | y: ${y} | z: ${z}`
+  }
+}
+
+const shouldOmitCsvProjectRow = (attributes: { [key: string]: string }) =>
+  getCsvAttribute(attributes, ['MonumentDescription', 'Description']).toUpperCase().includes('GPS_OMIT')
+
+const projectNameFromCsvFileName = (fileName: string) =>
+  fileName
+    .replace(/\.csv$/i, '')
+    .replace(/-/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .replace(/\b\w/g, (char) => char.toUpperCase())
 
 const cleanTraverseDescription = (parts: string[]) => {
   const description = parts.join(' ').trim()
@@ -426,7 +552,7 @@ const calculateBasisOfBearingFromControls = (projectControls: ParsedProjectContr
   const endControl = fixedControls[1]
   const azimuth = calculateTraverseAzimuth(startControl.easting, startControl.northing, endControl.easting, endControl.northing)
   const quadrant = calculateAzimuthQuadrant(azimuth)
-  let northBearing = 0
+  let northBearing: number
   if (quadrant === 1) {
     northBearing = azimuth
   } else if (quadrant === 2) {
@@ -898,13 +1024,18 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
   const [attachmentHistoryItem, setAttachmentHistoryItem] = React.useState<MonumentHistorySummary | null>(null)
   const [loadingAttachments, setLoadingAttachments] = React.useState(false)
   const [uploadingAttachments, setUploadingAttachments] = React.useState(false)
+  const [projectCsvFile, setProjectCsvFile] = React.useState<File | null>(null)
   const [projectCsvFileName, setProjectCsvFileName] = React.useState('')
   const [newProjectName, setNewProjectName] = React.useState('')
   const [useSelectedProjectForCreate, setUseSelectedProjectForCreate] = React.useState(false)
   const [newSearchPointRows, setNewSearchPointRows] = React.useState<CsvProjectRow[]>([])
   const [existingMonumentRows, setExistingMonumentRows] = React.useState<CsvProjectRow[]>([])
   const [multipleMonumentRows, setMultipleMonumentRows] = React.useState<CsvProjectRow[]>([])
+  const [activeNewSearchPointId, setActiveNewSearchPointId] = React.useState('')
   const [loadingProjectCsv, setLoadingProjectCsv] = React.useState(false)
+  const [createProjectPlan, setCreateProjectPlan] = React.useState<CreateProjectPlan | null>(null)
+  const [createProjectModalOpen, setCreateProjectModalOpen] = React.useState(false)
+  const [creatingProject, setCreatingProject] = React.useState(false)
   const [traverseFiles, setTraverseFiles] = React.useState<TraverseFileSummary[]>([])
   const [staticFiles, setStaticFiles] = React.useState<TraverseFileSummary[]>([])
   const [parsedTraverseData, setParsedTraverseData] = React.useState<ParsedTraverseData | null>(null)
@@ -921,6 +1052,7 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
   const projectLayerFiltersRef = React.useRef(new Map<string, { layer: any, definitionExpression: string | null | undefined }>())
   const monumentGraphicsLayerRef = React.useRef<any>(null)
   const monumentGraphicsMapRef = React.useRef<any>(null)
+  const csvProjectGraphicsSignatureRef = React.useRef('')
   const suppressAssignSurveySelectionSyncRef = React.useRef(false)
   const monumentProjectsLayerRef = React.useRef<{ url: string, layer: any } | null>(null)
   const surveyMonumentsLayerRef = React.useRef<{ url: string, layer: any } | null>(null)
@@ -1641,93 +1773,87 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
     return matchingKey ? attributes[matchingKey].trim() : ''
   }, [monumentPointNumberField])
 
-  const loadSurveyMonumentsByPointNumbers = React.useCallback(async (pointNumbers: string[]) => {
-    const uniquePointNumbers = Array.from(new Set(pointNumbers.map((pointNumber) => pointNumber.trim()).filter(Boolean)))
-    const monumentsByPointNumber = new Map<string, SurveyMonumentSummary[]>()
-    if (uniquePointNumbers.length === 0) return monumentsByPointNumber
+  const querySurveyMonumentsByCsvPoint = React.useCallback(async (item: CsvProjectRow) => {
+    const coordinates = getCsvProjectRowCoordinates(item)
+    if (!coordinates) return []
 
-    for (let offset = 0; offset < uniquePointNumbers.length; offset += MONUMENT_GLOBAL_ID_QUERY_CHUNK_SIZE) {
-      const batch = uniquePointNumbers.slice(offset, offset + MONUMENT_GLOBAL_ID_QUERY_CHUNK_SIZE)
-      const query = new URL(`${surveyMonumentsUrl}/query`)
-      query.search = new URLSearchParams({
-        where: `${monumentPointNumberField} IN (${batch.map((pointNumber) => `'${escapeSqlString(pointNumber)}'`).join(',')})`,
-        outFields: '*',
-        returnGeometry: 'false',
-        resultRecordCount: String(HISTORY_QUERY_LIMIT),
-        f: 'json'
-      }).toString()
+    const query = new URL(`${surveyMonumentsUrl}/query`)
+    query.search = new URLSearchParams({
+      geometry: JSON.stringify({
+        x: coordinates.x,
+        y: coordinates.y,
+        spatialReference: ORANGE_COUNTY_STATE_PLANE_SPATIAL_REFERENCE
+      }),
+      geometryType: 'esriGeometryPoint',
+      inSR: String(ORANGE_COUNTY_STATE_PLANE_SPATIAL_REFERENCE.latestWkid),
+      spatialRel: 'esriSpatialRelIntersects',
+      distance: String(CSV_SEARCH_POINT_BUFFER_FEET),
+      units: 'esriSRUnit_Foot',
+      outFields: '*',
+      returnGeometry: 'false',
+      resultRecordCount: String(HISTORY_QUERY_LIMIT),
+      f: 'json'
+    }).toString()
 
-      const response = await fetch(query.toString())
-      const data = await response.json() as QueryResponse
-      if (!response.ok || data.error) throw new Error(data.error?.message || response.statusText)
+    const response = await fetch(query.toString())
+    const data = await response.json() as QueryResponse
+    if (!response.ok || data.error) throw new Error(data.error?.message || response.statusText)
+    return (data.features || []).map((feature) => toSurveyMonumentSummary(feature.attributes || {}))
+  }, [surveyMonumentsUrl, toSurveyMonumentSummary])
 
-      ;(data.features || []).forEach((feature) => {
-        const item = toSurveyMonumentSummary(feature.attributes || {})
-        const key = item.pointNumber.trim().toLowerCase()
-        if (!key || key === '-') return
-        monumentsByPointNumber.set(key, [...(monumentsByPointNumber.get(key) || []), item])
-      })
-    }
-
-    return monumentsByPointNumber
-  }, [monumentPointNumberField, surveyMonumentsUrl, toSurveyMonumentSummary])
-
-  const importProjectCsvFile = React.useCallback(async (file: File) => {
-    setLoadingProjectCsv(true)
-    setProjectCsvFileName(file.name)
+  const clearProjectCsvRows = React.useCallback(() => {
     setNewSearchPointRows([])
     setExistingMonumentRows([])
     setMultipleMonumentRows([])
+    setActiveNewSearchPointId('')
+    setCreateProjectPlan(null)
+    setCreateProjectModalOpen(false)
+  }, [])
+
+  const importProjectCsvFile = React.useCallback(async (file: File, resetProjectName = true) => {
+    setLoadingProjectCsv(true)
+    setProjectCsvFile(file)
+    setProjectCsvFileName(file.name)
+    if (resetProjectName) {
+      setNewProjectName(projectNameFromCsvFileName(file.name))
+      setUseSelectedProjectForCreate(false)
+    }
+    clearProjectCsvRows()
 
     try {
       const parsedRows = parseCsvText(await file.text())
-      const rowPointNumbers = parsedRows.map((row) => getCsvPointNumber(row.attributes))
-      const parsedPointCounts = rowPointNumbers.reduce<Map<string, number>>((counts, pointNumber) => {
-        const key = pointNumber.trim().toLowerCase()
-        if (!key) return counts
-        counts.set(key, (counts.get(key) || 0) + 1)
-        return counts
-      }, new Map())
-      const monumentsByPointNumber = await loadSurveyMonumentsByPointNumbers(rowPointNumbers)
-
-      const newRows: CsvProjectRow[] = []
-      const existingRows: CsvProjectRow[] = []
-      const multipleRows: CsvProjectRow[] = []
-
-      parsedRows.forEach((row) => {
+      const includedRows = parsedRows.filter((row) => !shouldOmitCsvProjectRow(row.attributes))
+      const importedRows = includedRows.map((row) => {
         const pointNumber = getCsvPointNumber(row.attributes)
-        const pointKey = pointNumber.trim().toLowerCase()
-        const existingMonuments = pointKey ? monumentsByPointNumber.get(pointKey) || [] : []
-        const validationMessages = pointNumber ? [] : [m.csvMissingPointNumber]
-        const item: CsvProjectRow = {
+        const validationMessages = [
+          ...(pointNumber ? [] : [m.csvMissingPointNumber]),
+          ...(getCsvProjectRowCoordinates({ id: '', rowNumber: row.rowNumber, attributes: row.attributes, pointNumber, validationMessages: [], existingMonuments: [] }) ? [] : [m.searchPointInvalidCoordinates])
+        ]
+        return {
           id: `${row.rowNumber}-${pointNumber || 'missing'}`,
           rowNumber: row.rowNumber,
           attributes: row.attributes,
           pointNumber: pointNumber || '-',
           validationMessages,
-          existingMonuments
-        }
-
-        if ((pointKey && (parsedPointCounts.get(pointKey) || 0) > 1) || existingMonuments.length > 1) {
-          multipleRows.push(item)
-        } else if (existingMonuments.length === 1) {
-          existingRows.push(item)
-        } else {
-          newRows.push(item)
+          existingMonuments: []
         }
       })
+      const classifiedRows = await mapWithConcurrency(importedRows, CSV_SPATIAL_QUERY_CONCURRENCY, async (item) => ({
+        ...item,
+        existingMonuments: await querySurveyMonumentsByCsvPoint(item)
+      }))
 
-      setNewSearchPointRows(newRows)
-      setExistingMonumentRows(existingRows)
-      setMultipleMonumentRows(multipleRows)
-      setStatus(`${m.csvParsed}: ${parsedRows.length}`)
+      setNewSearchPointRows(classifiedRows.filter((item) => item.existingMonuments.length === 0))
+      setExistingMonumentRows(classifiedRows.filter((item) => item.existingMonuments.length === 1))
+      setMultipleMonumentRows(classifiedRows.filter((item) => item.existingMonuments.length > 1))
+      setStatus(`${m.csvParsed}: ${includedRows.length}`)
     } catch (err) {
       const message = err instanceof Error ? err.message : m.csvParseFailed
       setStatus(`${m.csvParseFailed} ${message || ''}`.trim())
     } finally {
       setLoadingProjectCsv(false)
     }
-  }, [getCsvPointNumber, loadSurveyMonumentsByPointNumbers, m.csvMissingPointNumber, m.csvParsed, m.csvParseFailed])
+  }, [clearProjectCsvRows, getCsvPointNumber, m.csvMissingPointNumber, m.csvParsed, m.csvParseFailed, m.searchPointInvalidCoordinates, querySurveyMonumentsByCsvPoint])
 
   const loadSelectedSurveyMonuments = React.useCallback(async () => {
     if (suppressAssignSurveySelectionSyncRef.current) return
@@ -2265,6 +2391,17 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
     }
   }
 
+  const getCsvProjectBoundarySymbol = () => ({
+    type: 'simple-fill',
+    color: [57, 255, 20, 0.12],
+    style: 'solid',
+    outline: {
+      color: [57, 255, 20, 0.96],
+      width: 3,
+      style: 'dash'
+    }
+  })
+
   const querySurveyMonumentsByGlobalIds = React.useCallback(async (globalIds: string[]): Promise<QueryResponse[]> => {
     const results: QueryResponse[] = []
     const uniqueIds = Array.from(new Set(globalIds.filter(Boolean)))
@@ -2490,6 +2627,129 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
     layer.removeAll()
     if (graphics.length > 0) layer.addMany(graphics)
   }, [ensureMonumentGraphicsLayer, monumentGlobalIdField, querySurveyMonumentsByGlobalIds])
+
+  const getCsvProjectRowPoint = React.useCallback(async (item: CsvProjectRow) => {
+    const coordinates = getCsvProjectRowCoordinates(item)
+    if (!coordinates) return null
+
+    const [Point] = await loadArcGISJSAPIModules(['esri/geometry/Point'])
+    return new Point({
+      x: coordinates.x,
+      y: coordinates.y,
+      z: coordinates.z,
+      spatialReference: ORANGE_COUNTY_STATE_PLANE_SPATIAL_REFERENCE
+    })
+  }, [])
+
+  const getCsvProjectBoundaryPolygon = React.useCallback(async (items: CsvProjectRow[]) => {
+    const coordinates = items
+      .map(getCsvProjectRowCoordinates)
+      .filter((coordinate): coordinate is { x: number, y: number, z?: number } => !!coordinate)
+    if (coordinates.length === 0) return null
+
+    const xs = coordinates.map((coordinate) => coordinate.x)
+    const ys = coordinates.map((coordinate) => coordinate.y)
+    const minX = Math.min(...xs) - CSV_PROJECT_BOUNDARY_PADDING_FEET
+    const maxX = Math.max(...xs) + CSV_PROJECT_BOUNDARY_PADDING_FEET
+    const minY = Math.min(...ys) - CSV_PROJECT_BOUNDARY_PADDING_FEET
+    const maxY = Math.max(...ys) + CSV_PROJECT_BOUNDARY_PADDING_FEET
+
+    const [Polygon] = await loadArcGISJSAPIModules(['esri/geometry/Polygon'])
+    return new Polygon({
+      rings: [[
+        [minX, minY],
+        [minX, maxY],
+        [maxX, maxY],
+        [maxX, minY],
+        [minX, minY]
+      ]],
+      spatialReference: ORANGE_COUNTY_STATE_PLANE_SPATIAL_REFERENCE
+    })
+  }, [])
+
+  const renderCsvProjectGraphics = React.useCallback(async (items: CsvProjectRow[], activeId: string, zoomToGraphics = false) => {
+    const layer = await ensureMonumentGraphicsLayer()
+    if (!layer) return
+
+    if (items.length === 0) {
+      layer.removeAll()
+      return
+    }
+
+    const [Graphic] = await loadArcGISJSAPIModules(['esri/Graphic'])
+    const graphics: any[] = []
+    const boundaryGeometry = await getCsvProjectBoundaryPolygon(items)
+    if (boundaryGeometry) {
+      graphics.push(new Graphic({
+        geometry: boundaryGeometry,
+        attributes: {
+          __monumentManagerCsvBoundary: true
+        },
+        symbol: getCsvProjectBoundarySymbol()
+      }))
+    }
+
+    for (const item of items) {
+      const geometry = await getCsvProjectRowPoint(item)
+      if (!geometry) continue
+      graphics.push(new Graphic({
+        geometry,
+        attributes: {
+          __monumentManagerCsvRowId: item.id,
+          PointNumber: item.pointNumber,
+          MonumentDescription: item.attributes.MonumentDescription
+        },
+        symbol: getMonumentGraphicSymbol(geometry, item.id === activeId)
+      }))
+    }
+
+    layer.removeAll()
+    if (graphics.length > 0) {
+      layer.addMany(graphics)
+      if (zoomToGraphics && jimuMapView?.view) {
+        const view = jimuMapView.view
+        let target: any = graphics
+        if (boundaryGeometry?.extent) {
+          target = boundaryGeometry.extent
+        } else if (graphics.length === 1) {
+          target = { target: graphics[0].geometry, zoom: Math.max(Number(view.zoom) || 0, 18) }
+        }
+        await view.goTo(target, {
+          duration: 900,
+          padding: { top: 80, right: 80, bottom: 80, left: 80 }
+        })
+      }
+    }
+  }, [ensureMonumentGraphicsLayer, getCsvProjectBoundaryPolygon, getCsvProjectRowPoint, jimuMapView])
+
+  const zoomToCsvProjectRow = React.useCallback(async (item: CsvProjectRow) => {
+    const view = jimuMapView?.view
+    if (!view) {
+      setStatus(m.mapUnavailable)
+      return
+    }
+
+    setActiveNewSearchPointId(item.id)
+    const geometry = await getCsvProjectRowPoint(item)
+    if (!geometry) {
+      setStatus(m.searchPointInvalidCoordinates)
+      return
+    }
+
+    try {
+      await view.goTo({
+        target: geometry,
+        zoom: Math.max(Number(view.zoom) || 0, 18)
+      }, {
+        duration: 900,
+        padding: { top: 80, right: 80, bottom: 80, left: 80 }
+      })
+      setStatus(`${m.searchPointZoomed}: ${item.pointNumber}`)
+    } catch (err) {
+      const message = err instanceof Error ? err.message : m.monumentZoomFailed
+      setStatus(message || m.monumentZoomFailed)
+    }
+  }, [getCsvProjectRowPoint, jimuMapView, m.mapUnavailable, m.monumentZoomFailed, m.searchPointInvalidCoordinates, m.searchPointZoomed])
 
   const getProjectWhere = (project: MonumentProjectSummary) => {
     if (project.globalId) return `${projectGlobalIdField} = '${escapeSqlString(project.globalId)}'`
@@ -2737,6 +2997,7 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
 
     const syncMonumentGraphics = async () => {
       if (isSurveyHistoryMode) return
+      if (mode === 'create-project') return
       if (mode !== 'history' || !selectedProject) {
         monumentGraphicsLayerRef.current?.removeAll?.()
         if (activeHistoryKey || historyItems.length > 0) {
@@ -2755,6 +3016,30 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
       cancelled = true
     }
   }, [activeHistoryKey, historyItems, isSurveyHistoryMode, m.monumentGraphicsFailed, mode, renderProjectMonumentGraphics, selectMonumentHistoryRecord, selectedProject])
+
+  React.useEffect(() => {
+    let cancelled = false
+
+    const syncCsvGraphics = async () => {
+      if (mode !== 'create-project') {
+        csvProjectGraphicsSignatureRef.current = ''
+        return
+      }
+      const csvRows = [...newSearchPointRows, ...existingMonumentRows, ...multipleMonumentRows]
+      const rowSignature = csvRows.map((item) => item.id).join('|')
+      const shouldZoomToGraphics = rowSignature !== '' && rowSignature !== csvProjectGraphicsSignatureRef.current
+      await renderCsvProjectGraphics(csvRows, activeNewSearchPointId, shouldZoomToGraphics)
+      csvProjectGraphicsSignatureRef.current = rowSignature
+    }
+
+    syncCsvGraphics().catch(() => {
+      if (!cancelled) setStatus(m.monumentGraphicsFailed)
+    })
+
+    return () => {
+      cancelled = true
+    }
+  }, [activeNewSearchPointId, existingMonumentRows, m.monumentGraphicsFailed, mode, multipleMonumentRows, newSearchPointRows, renderCsvProjectGraphics])
 
   React.useEffect(() => {
     if (!isSurveyHistoryMode) return
@@ -2920,6 +3205,21 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
 
   const canMergeSurveyMonuments = assignSurveyMonuments.length > 1
   const projectCsvRowCount = newSearchPointRows.length + existingMonumentRows.length + multipleMonumentRows.length
+  const createProjectSourceLabel = (source: CreateProjectPlanSource) => {
+    if (source === 'new-search-point') return m.newSearchPoint
+    if (source === 'existing-monument') return m.existingMonument
+    return m.multipleMonuments
+  }
+
+  const createProjectActionLabel = (row: CreateProjectPlanRow) => {
+    if (row.id === 'missing-project-name') return m.projectNamePlaceholder
+    if (row.pointNumber === '-') return m.csvMissingPointNumber
+    if (row.x === undefined || row.y === undefined) return m.searchPointInvalidCoordinates
+    if (row.source === 'multiple-monuments') return m.multipleMonumentsNearby
+    if (row.action === 'create-survey-monument') return m.finalizeCreateSurveyMonument
+    if (row.action === 'update-survey-monument') return m.finalizeUpdateSurveyMonument
+    return m.noSurveyMonumentEdit
+  }
 
   const executeMergeWithRollback = React.useCallback(async (
     runOperation: (registerRollback: (action: MergeRollbackAction) => void) => void | Promise<void>
@@ -2958,22 +3258,238 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
   }
 
   const resetProjectCsvImport = () => {
+    setProjectCsvFile(null)
     setProjectCsvFileName('')
     setNewProjectName('')
     setUseSelectedProjectForCreate(false)
-    setNewSearchPointRows([])
-    setExistingMonumentRows([])
-    setMultipleMonumentRows([])
+    clearProjectCsvRows()
+    if (projectCsvFileInputRef.current) projectCsvFileInputRef.current.value = ''
     setStatus(m.csvImportReset)
   }
 
-  const analyzeProjectCsvResults = () => {
-    setStatus(`${m.csvAnalysisSummary}: ${m.newSearchPoint} ${newSearchPointRows.length}, ${m.existingMonument} ${existingMonumentRows.length}, ${m.multipleMonuments} ${multipleMonumentRows.length}`)
+  const reprocessProjectCsvImport = () => {
+    if (!projectCsvFile) return
+    clearProjectCsvRows()
+    importProjectCsvFile(projectCsvFile, false).catch(() => undefined)
   }
 
-  const stageCreateProjectFromCsv = () => {
-    const projectName = newProjectName.trim() || '-'
-    setStatus(`${m.createTitle}: ${projectName}, ${projectCsvRowCount}. ${m.createProjectPending}`)
+  const removeCsvProjectRow = (item: CsvProjectRow) => {
+    setNewSearchPointRows((current) => current.filter((row) => row.id !== item.id))
+    setExistingMonumentRows((current) => current.filter((row) => row.id !== item.id))
+    setMultipleMonumentRows((current) => current.filter((row) => row.id !== item.id))
+    if (activeNewSearchPointId === item.id) setActiveNewSearchPointId('')
+    setStatus(`${m.searchPointRemoved}: ${item.pointNumber}`)
+  }
+
+  const buildCreateProjectPlan = React.useCallback((): CreateProjectPlan | null => {
+    const projectName = newProjectName.trim()
+    const sourceRows: Array<{ source: CreateProjectPlanSource, items: CsvProjectRow[] }> = [
+      { source: 'new-search-point', items: newSearchPointRows },
+      { source: 'existing-monument', items: existingMonumentRows },
+      { source: 'multiple-monuments', items: multipleMonumentRows }
+    ]
+    const rows = sourceRows.flatMap(({ source, items }) =>
+      items.map((item) => {
+        const coordinates = getCsvProjectRowCoordinates(item)
+        const display = getCsvProjectRowDisplay(item)
+        const missingPointNumber = item.pointNumber === '-'
+        const missingCoordinates = !coordinates
+        const existingMonument = item.existingMonuments[0]
+        const existingPointNumber = existingMonument?.pointNumber === '-' ? '' : existingMonument?.pointNumber.trim()
+        const existingPointNumberMatches = source === 'existing-monument' && !!existingMonument && existingPointNumber === item.pointNumber
+        const canUpdateExistingPointNumber = source === 'existing-monument' && !!existingMonument && !missingPointNumber && !existingPointNumberMatches
+        const action: CreateProjectPlanAction = source === 'existing-monument'
+          ? canUpdateExistingPointNumber ? 'update-survey-monument' : 'none'
+          : 'create-survey-monument'
+        const severity = missingPointNumber || missingCoordinates
+          ? 'error'
+            : source === 'multiple-monuments'
+              ? 'warning'
+              : action === 'update-survey-monument' || action === 'create-survey-monument'
+                ? 'ready'
+                : 'info'
+
+        return {
+          id: item.id,
+          source,
+          pointNumber: item.pointNumber,
+          description: display.description,
+          x: coordinates?.x,
+          y: coordinates?.y,
+          z: coordinates?.z,
+          surveyObjectId: existingMonument?.objectId,
+          currentPointNumber: existingPointNumber || undefined,
+          action,
+          severity
+        }
+      })
+    )
+    if (rows.length === 0) {
+      setStatus(m.createProjectPlanEmpty)
+      return null
+    }
+    if (!projectName) {
+      rows.unshift({
+        id: 'missing-project-name',
+        source: 'new-search-point',
+        pointNumber: '-',
+        description: '-',
+        action: 'none',
+        severity: 'error'
+      })
+    }
+
+    const createRows = rows.filter((row) => row.action === 'create-survey-monument' && row.severity !== 'error')
+    const updateRows = rows.filter((row) => row.action === 'update-survey-monument' && row.severity !== 'error')
+    const errorCount = rows.filter((row) => row.severity === 'error').length
+    const warningCount = rows.filter((row) => row.severity === 'warning').length
+    return {
+      rows,
+      createRows,
+      updateRows,
+      projectName: projectName || '-',
+      canCommit: errorCount === 0,
+      errorCount,
+      warningCount
+    }
+  }, [
+    existingMonumentRows,
+    m.createProjectPlanEmpty,
+    multipleMonumentRows,
+    newProjectName,
+    newSearchPointRows
+  ])
+
+  const analyzeProjectCsvResults = () => {
+    const plan = buildCreateProjectPlan()
+    setCreateProjectPlan(plan)
+    if (!plan) return
+    setCreateProjectModalOpen(true)
+    setStatus(`${m.createProjectPlanReady}: ${plan.createRows.length + plan.updateRows.length}. ${m.errorsLabel}: ${plan.errorCount}. ${m.warningsLabel}: ${plan.warningCount}`)
+  }
+
+  const getCreateProjectCsvRows = React.useCallback(() => [
+    ...newSearchPointRows,
+    ...existingMonumentRows,
+    ...multipleMonumentRows
+  ], [existingMonumentRows, multipleMonumentRows, newSearchPointRows])
+
+  const getFailedEditResult = (results: any, resultKey: string, fallbackMessage: string) => {
+    const failedResult = (results?.[resultKey] || []).find((result: any) => result?.error)
+    return failedResult ? new Error(failedResult.error?.message || fallbackMessage) : null
+  }
+
+  const stageCreateProjectFromCsv = async () => {
+    const plan = createProjectPlan || buildCreateProjectPlan()
+    if (!plan || !plan.canCommit) {
+      setCreateProjectPlan(plan)
+      return
+    }
+
+    setCreatingProject(true)
+    setStatus(m.createProjectApplying)
+
+    const rollbackSteps: Array<() => Promise<void>> = []
+
+    try {
+      const projectLayer = await getMonumentProjectsLayer()
+      const surveyLayer = await getSurveyMonumentsLayer()
+      const projectGeometry = await getCsvProjectBoundaryPolygon(getCreateProjectCsvRows())
+      if (!projectGeometry) throw new Error(m.searchPointInvalidCoordinates)
+
+      const projectResults = await projectLayer.applyEdits({
+        addFeatures: [{
+          geometry: projectGeometry,
+          attributes: {
+            [projectDisplayField]: plan.projectName
+          }
+        }]
+      })
+      const projectError = getFailedEditResult(projectResults, 'addFeatureResults', m.createProjectFailed)
+      if (projectError) throw projectError
+      const projectObjectId = projectResults.addFeatureResults?.[0]?.objectId
+      if (projectObjectId === undefined || projectObjectId === null) throw new Error(m.createProjectFailed)
+      rollbackSteps.push(async () => {
+        await projectLayer.applyEdits({
+          deleteFeatures: [{ attributes: { OBJECTID: projectObjectId } }]
+        })
+      })
+
+      if (plan.createRows.length > 0) {
+        const createFeatures = plan.createRows.map((row) => ({
+          geometry: {
+            type: 'point',
+            x: row.x,
+            y: row.y,
+            z: row.z,
+            spatialReference: ORANGE_COUNTY_STATE_PLANE_SPATIAL_REFERENCE
+          },
+          attributes: {
+            [monumentPointNumberField]: row.pointNumber === '-' ? null : row.pointNumber,
+            Description: row.description === '-' ? null : row.description
+          }
+        }))
+        const surveyCreateResults = await surveyLayer.applyEdits({ addFeatures: createFeatures })
+        const createdSurveyObjectIds = (surveyCreateResults.addFeatureResults || [])
+          .map((result: any) => result?.objectId)
+          .filter((objectId: any) => objectId !== undefined && objectId !== null)
+        rollbackSteps.push(async () => {
+          if (createdSurveyObjectIds.length === 0) return
+          await surveyLayer.applyEdits({
+            deleteFeatures: createdSurveyObjectIds.map((objectId: number | string) => ({ attributes: { OBJECTID: objectId } }))
+          })
+        })
+        const surveyCreateError = getFailedEditResult(surveyCreateResults, 'addFeatureResults', m.createProjectFailed)
+        if (surveyCreateError) throw surveyCreateError
+      }
+
+      if (plan.updateRows.length > 0) {
+        const updateRows = plan.updateRows.filter((row) => row.surveyObjectId !== undefined && row.surveyObjectId !== null)
+        const surveyUpdateResults = await surveyLayer.applyEdits({
+          updateFeatures: updateRows.map((row) => ({
+            attributes: {
+              OBJECTID: row.surveyObjectId,
+              [monumentPointNumberField]: row.pointNumber === '-' ? null : row.pointNumber
+            }
+          }))
+        }, {
+          rollbackOnFailureEnabled: true
+        })
+        rollbackSteps.push(async () => {
+          if (updateRows.length === 0) return
+          await surveyLayer.applyEdits({
+            updateFeatures: updateRows.map((row) => ({
+              attributes: {
+                OBJECTID: row.surveyObjectId,
+                [monumentPointNumberField]: row.currentPointNumber || null
+              }
+            }))
+          }, {
+            rollbackOnFailureEnabled: true
+          })
+        })
+        const surveyUpdateError = getFailedEditResult(surveyUpdateResults, 'updateFeatureResults', m.createProjectFailed)
+        if (surveyUpdateError) throw surveyUpdateError
+      }
+
+      setCreateProjectModalOpen(false)
+      setStatus(`${m.createProjectSuccess}: ${plan.projectName}. ${m.surveyMonumentsToCreate}: ${plan.createRows.length}. ${m.surveyMonumentsToUpdate}: ${plan.updateRows.length}`)
+      loadProjects().catch(() => undefined)
+    } catch (err) {
+      try {
+        for (const rollbackStep of [...rollbackSteps].reverse()) {
+          await rollbackStep()
+        }
+      } catch (rollbackErr) {
+        const message = rollbackErr instanceof Error ? rollbackErr.message : m.createProjectRollbackFailed
+        setStatus(`${m.createProjectRollbackFailed} ${message || ''}`.trim())
+        return
+      }
+      const message = err instanceof Error ? err.message : m.createProjectFailed
+      setStatus(`${m.createProjectFailed} ${message || ''}`.trim())
+    } finally {
+      setCreatingProject(false)
+    }
   }
 
   const queryFinalizeHistoryByPointNumbers = React.useCallback(async (
@@ -4310,30 +4826,113 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
     )
 
   const csvProjectRow = (item: CsvProjectRow) => {
+    const active = activeNewSearchPointId === item.id
     const validationText = item.validationMessages.join(' | ')
     const existingText = item.existingMonuments.length > 0
       ? `${item.existingMonuments.length} ${m.surveyMonumentsTitle}`
       : ''
+    const display = getCsvProjectRowDisplay(item)
+    const primaryText = `${display.pointNumber} | ${display.description}`
+    const rowIconButtonStyle = {
+      width: 32,
+      minWidth: 32,
+      height: 32,
+      padding: 0,
+      display: 'inline-flex',
+      alignItems: 'center',
+      justifyContent: 'center'
+    }
     return h('div', {
       key: item.id,
-      className: 'py-1',
+      className: 'd-flex align-items-center justify-content-between py-1',
+      onClick: () => {
+        setActiveNewSearchPointId(item.id)
+        setStatus(`${m.selectedSearchPoint}: ${item.pointNumber}`)
+      },
       style: {
+        gap: '0.5rem',
         paddingLeft: '0.5rem',
         paddingRight: '0.5rem',
-        fontSize: 12,
+        cursor: 'pointer',
+        backgroundColor: active ? 'rgba(105, 220, 255, 0.18)' : undefined,
         borderBottom: '1px solid rgba(0, 0, 0, 0.06)'
       }
     },
-    h('div', { className: 'd-flex align-items-center justify-content-between', style: { gap: '0.5rem', minWidth: 0 } },
+    h('div', { style: { flex: '1 1 auto', minWidth: 0, overflow: 'hidden' } },
       h('div', {
-        title: `Row ${item.rowNumber}: ${item.pointNumber}`,
-        style: { minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontWeight: 600 }
-      }, `Row ${item.rowNumber}: ${item.pointNumber}`),
-      existingText && h('div', { style: { flex: '0 0 auto', fontSize: 10, opacity: 0.7 } }, existingText)
+        title: primaryText,
+        style: {
+          display: 'flex',
+          alignItems: 'center',
+          gap: '0.35rem',
+          minWidth: 0,
+          overflow: 'hidden',
+          fontSize: 12,
+          whiteSpace: 'nowrap'
+        }
+      },
+      h('span', { style: { minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', fontWeight: 600 } }, display.pointNumber),
+      h('span', { style: { opacity: 0.48 } }, '|'),
+      h('span', {
+        style: {
+          flex: '0 1 auto',
+          minWidth: 0,
+          overflow: 'hidden',
+          textOverflow: 'ellipsis',
+          padding: '1px 6px',
+          borderRadius: 4,
+          backgroundColor: 'rgba(105, 220, 255, 0.16)',
+          color: 'var(--sys-color-primary-dark)'
+        }
+      }, display.description)
+      ),
+      h('div', {
+        title: display.coordinateText,
+        style: {
+          display: 'flex',
+          flexWrap: 'wrap',
+          gap: '0.2rem 0.65rem',
+          minWidth: 0,
+          overflow: 'hidden',
+          fontSize: 10,
+          lineHeight: '14px'
+        }
+      },
+      display.coordinateText.split(' | ').map((part, index) =>
+        h(React.Fragment, { key: part },
+          index > 0 && h('span', { style: { opacity: 0.42 } }, '|'),
+          h('span', { style: { minWidth: 0, maxWidth: '100%', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', opacity: 0.78 } }, part)
+        )
+      )),
+      validationText && h('div', {
+        style: { marginTop: 2, fontSize: 10, lineHeight: '14px', color: 'var(--danger-600, #c92a2a)' }
+      }, validationText)
     ),
-    validationText && h('div', {
-      style: { marginTop: 2, fontSize: 10, lineHeight: '14px', color: 'var(--danger-600, #c92a2a)' }
-    }, validationText)
+    h('div', { className: 'd-flex align-items-center', style: { gap: '0.25rem', flex: '0 0 auto' } },
+      existingText && h('div', { style: { flex: '0 0 auto', fontSize: 10, opacity: 0.7 } }, existingText),
+      h(Button, {
+        size: 'sm',
+        type: 'default',
+        title: m.removeSearchPoint,
+        onClick: (evt) => {
+          evt.stopPropagation()
+          removeCsvProjectRow(item)
+        },
+        style: rowIconButtonStyle
+      }, '×'),
+      h(Button, {
+        size: 'sm',
+        type: 'default',
+        title: m.zoomSearchPoint,
+        onClick: (evt) => {
+          evt.stopPropagation()
+          zoomToCsvProjectRow(item).catch(() => {
+            setStatus(m.monumentZoomFailed)
+          })
+        },
+        style: rowIconButtonStyle
+      }, '🔍')
+    )
     )
   }
 
@@ -4421,21 +5020,21 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
           type: 'primary',
           size: 'sm',
           style: modeActionButtonStyle,
-          disabled: projectCsvRowCount === 0,
-          onClick: stageCreateProjectFromCsv
-        }, m.createTitle),
-        h(Button, {
-          type: 'default',
-          size: 'sm',
-          style: modeActionButtonStyle,
-          disabled: projectCsvRowCount === 0,
+          disabled: loadingProjectCsv || projectCsvRowCount === 0,
           onClick: analyzeProjectCsvResults
         }, m.analyzeResults),
         h(Button, {
           type: 'default',
           size: 'sm',
           style: modeActionButtonStyle,
-          disabled: projectCsvRowCount === 0 && !projectCsvFileName && !newProjectName.trim(),
+          disabled: loadingProjectCsv || !projectCsvFile,
+          onClick: reprocessProjectCsvImport
+        }, m.reprocessCsv),
+        h(Button, {
+          type: 'default',
+          size: 'sm',
+          style: modeActionButtonStyle,
+          disabled: loadingProjectCsv || (projectCsvRowCount === 0 && !projectCsvFile && !projectCsvFileName && !newProjectName.trim() && !useSelectedProjectForCreate),
           onClick: resetProjectCsvImport
         }, m.reset)
       )
@@ -4446,7 +5045,12 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
     return [
       m.csvParsed,
       m.csvParseFailed,
-      m.csvAnalysisSummary,
+      m.createProjectPlanReady,
+      m.createProjectPlanEmpty,
+      m.createProjectApplying,
+      m.createProjectSuccess,
+      m.createProjectFailed,
+      m.createProjectRollbackFailed,
       m.csvImportReset,
       m.createTitle
     ].some((messagePrefix) => status.startsWith(messagePrefix))
@@ -4644,6 +5248,72 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
           applyPointNumberPlan().catch(() => undefined)
         }
       }, applyingPointNumbers ? m.updatePointNumber : m.applyPointNumbers)
+    ))
+
+  const createProjectValidationModal = () =>
+    h(Modal, {
+      isOpen: createProjectModalOpen,
+      toggle: () => {
+        if (creatingProject) return
+        setCreateProjectModalOpen(false)
+      },
+      centered: true,
+      backdrop: 'static',
+      style: { width: 900, maxWidth: 'calc(100vw - 2rem)' }
+    },
+    h(ModalHeader, {
+      toggle: () => {
+        if (creatingProject) return
+        setCreateProjectModalOpen(false)
+      }
+    }, m.reviewCreateProjectTitle),
+    h(ModalBody, null,
+      h('div', { className: 'd-flex flex-column', style: { gap: '0.75rem', maxHeight: '68vh', minHeight: 360 } },
+        !createProjectPlan
+          ? h('div', { style: { fontSize: 12, opacity: 0.75 } }, m.createProjectPlanEmpty)
+          : h(React.Fragment, null,
+            h('div', { className: 'd-flex flex-wrap', style: { gap: '0.5rem' } },
+              validationCountTile(m.projectNameLabel, createProjectPlan.projectName),
+              validationCountTile(m.newSearchPoint, newSearchPointRows.length),
+              validationCountTile(m.existingMonument, existingMonumentRows.length),
+              validationCountTile(m.multipleMonuments, multipleMonumentRows.length),
+              validationCountTile(m.surveyMonumentsToCreate, createProjectPlan.createRows.length),
+              validationCountTile(m.surveyMonumentsToUpdate, createProjectPlan.updateRows.length),
+              validationCountTile(m.errorsLabel, createProjectPlan.errorCount),
+              validationCountTile(m.warningsLabel, createProjectPlan.warningCount)
+            ),
+            h('div', { className: 'flex-grow-1', style: { minHeight: 0, overflowY: 'auto', overflowX: 'auto' } },
+              validationHeaderRow([m.sourceListLabel, m.pointNumberLabel, m.descriptionLabel, 'x', 'y', 'z', m.actionLabel]),
+              ...createProjectPlan.rows.map((row) =>
+                validationDataRow([
+                  createProjectSourceLabel(row.source),
+                  row.pointNumber,
+                  row.description,
+                  row.x,
+                  row.y,
+                  row.z,
+                  createProjectActionLabel(row)
+                ], row.id)
+              )
+            )
+          )
+      )
+    ),
+    h(ModalFooter, null,
+      h(Button, {
+        type: 'default',
+        disabled: creatingProject,
+        onClick: () => {
+          setCreateProjectModalOpen(false)
+        }
+      }, m.close),
+      h(Button, {
+        type: 'primary',
+        disabled: creatingProject || !createProjectPlan || !createProjectPlan.canCommit,
+        onClick: () => {
+          stageCreateProjectFromCsv().catch(() => undefined)
+        }
+      }, creatingProject ? m.createProjectApplying : m.createTitle)
     ))
 
   const validationModalBody = () => {
@@ -5049,6 +5719,7 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
     attachmentModal(),
     autoAssignModal(),
     pointNumberModal(),
+    createProjectValidationModal(),
     validationModal()
   )
 }
