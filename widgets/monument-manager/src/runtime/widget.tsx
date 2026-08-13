@@ -90,6 +90,12 @@ interface CsvProjectRow {
   existingMonuments: SurveyMonumentSummary[]
 }
 
+interface CsvProjectCoordinate {
+  x: number
+  y: number
+  z?: number
+}
+
 interface TraverseFileSummary {
   id: string
   name: string
@@ -290,6 +296,7 @@ interface CreateProjectPlanRow {
   currentPointNumber?: string
   action: CreateProjectPlanAction
   severity: 'ready' | 'info' | 'warning' | 'error'
+  validationLabel?: string
 }
 
 interface CreateProjectPlan {
@@ -297,6 +304,7 @@ interface CreateProjectPlan {
   createRows: CreateProjectPlanRow[]
   updateRows: CreateProjectPlanRow[]
   projectName: string
+  useSelectedProject: boolean
   canCommit: boolean
   errorCount: number
   warningCount: number
@@ -318,6 +326,7 @@ const PROJECT_QUERY_LIMIT = 100
 const HISTORY_QUERY_LIMIT = 2000
 const MONUMENT_GLOBAL_ID_QUERY_CHUNK_SIZE = 50
 const SURVEY_MONUMENTS_LAYER_ID = '999066'
+const MONUMENT_PROJECTS_LAYER_ID = '999068'
 const MONUMENT_HISTORY_LAYER_ID = '999069'
 const STANDARD_PROJECT_CSV_FIELDS = ['PointNumber', 'YCoordinate', 'XCoordinate', 'Elevation', 'MonumentDescription'] as const
 const ORANGE_COUNTY_STATE_PLANE_SPATIAL_REFERENCE = { wkid: 102646, latestWkid: 2230 }
@@ -326,6 +335,23 @@ const CSV_PROJECT_BOUNDARY_PADDING_FEET = 25
 const CSV_SPATIAL_QUERY_CONCURRENCY = 8
 
 const escapeSqlString = (value: string) => value.replace(/'/g, "''")
+
+const getEditErrorMessage = (result: any, fallbackMessage: string) => {
+  const error = result?.error || result
+  const details = error?.details || {}
+  const detailMessages = Array.isArray(details)
+    ? details.filter(Boolean).join(' ')
+    : Array.isArray(details.messages)
+      ? details.messages.filter(Boolean).join(' ')
+      : ''
+  const codeMessage = error?.code ? `Code ${error.code}` : ''
+  return error?.message || error?.description || detailMessages || details.message || codeMessage || fallbackMessage
+}
+
+const getUnknownErrorMessage = (err: unknown, fallbackMessage: string) =>
+  err instanceof Error
+    ? err.message
+    : getEditErrorMessage(err, fallbackMessage)
 
 const mapWithConcurrency = async <T, R>(
   items: T[],
@@ -446,15 +472,17 @@ const getCsvAttribute = (attributes: { [key: string]: string }, keys: string[]) 
   return ''
 }
 
-const getCsvProjectRowCoordinates = (item: CsvProjectRow) => {
+const getCsvProjectRowCoordinates = (item: CsvProjectRow): CsvProjectCoordinate | null => {
   const x = parseCsvCoordinate(getCsvAttribute(item.attributes, ['XCoordinate', 'Longitude', 'Easting']))
   const y = parseCsvCoordinate(getCsvAttribute(item.attributes, ['YCoordinate', 'Latitude', 'Northing']))
   if (x === undefined || y === undefined) return null
-  return {
+  const coordinate: CsvProjectCoordinate = {
     x,
-    y,
-    z: parseCsvCoordinate(item.attributes.Elevation)
+    y
   }
+  const z = parseCsvCoordinate(item.attributes.Elevation)
+  if (z !== undefined) coordinate.z = z
+  return coordinate
 }
 
 const getCsvProjectRowDisplay = (item: CsvProjectRow) => {
@@ -939,6 +967,14 @@ const getStringAttribute = (attributes: { [key: string]: any }, key: string) => 
   return String(value)
 }
 
+const formatGuidForEdit = (value?: string) => {
+  const trimmed = (value || '').trim()
+  const match = trimmed.match(/^\{?([0-9a-f]{8})-([0-9a-f]{4})-([0-9a-f]{4})-([0-9a-f]{4})-([0-9a-f]{12})\}?$/i)
+  return match
+    ? `{${match.slice(1).join('-').toUpperCase()}}`
+    : trimmed
+}
+
 const collectMatchingDataSourceIds = (
   appConfig: any,
   targetUrl: string,
@@ -1010,6 +1046,7 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
   const [loadingAssignHistory, setLoadingAssignHistory] = React.useState(false)
   const [addingAssignHistory, setAddingAssignHistory] = React.useState(false)
   const [assigningHistoryProjectKey, setAssigningHistoryProjectKey] = React.useState('')
+  const [pendingAssignHistoryProjectKey, setPendingAssignHistoryProjectKey] = React.useState('')
   const [buildingAutoAssignPlan, setBuildingAutoAssignPlan] = React.useState(false)
   const [autoAssigningHistory, setAutoAssigningHistory] = React.useState(false)
   const [autoAssignPlan, setAutoAssignPlan] = React.useState<AutoAssignPlan | null>(null)
@@ -1022,8 +1059,10 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
   const [stagedAttachmentFiles, setStagedAttachmentFiles] = React.useState<StagedAttachmentFile[]>([])
   const [attachmentError, setAttachmentError] = React.useState('')
   const [attachmentHistoryItem, setAttachmentHistoryItem] = React.useState<MonumentHistorySummary | null>(null)
+  const [attachmentPendingDelete, setAttachmentPendingDelete] = React.useState<AttachmentSummary | null>(null)
   const [loadingAttachments, setLoadingAttachments] = React.useState(false)
   const [uploadingAttachments, setUploadingAttachments] = React.useState(false)
+  const [deletingAttachment, setDeletingAttachment] = React.useState(false)
   const [projectCsvFile, setProjectCsvFile] = React.useState<File | null>(null)
   const [projectCsvFileName, setProjectCsvFileName] = React.useState('')
   const [newProjectName, setNewProjectName] = React.useState('')
@@ -1117,6 +1156,14 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
   const surveyMonumentDataSourceIds = React.useMemo(
     () => surveyMonumentDataSourceIdsKey ? surveyMonumentDataSourceIdsKey.split('|') : [],
     [surveyMonumentDataSourceIdsKey]
+  )
+  const monumentProjectDataSourceIdsKey = ReactRedux.useSelector((state: IMState) => {
+    const appConfig: any = (state as any).appConfig || (state as any).appStateInBuilder?.appConfig
+    return collectMatchingDataSourceIds(appConfig, monumentProjectsUrl, /monument projects?/i, MONUMENT_PROJECTS_LAYER_ID)
+  })
+  const monumentProjectDataSourceIds = React.useMemo(
+    () => monumentProjectDataSourceIdsKey ? monumentProjectDataSourceIdsKey.split('|') : [],
+    [monumentProjectDataSourceIdsKey]
   )
   const surveyMonumentSelectionKey = ReactRedux.useSelector((state: IMState) =>
     surveyMonumentDataSourceIds
@@ -1407,7 +1454,9 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
       }
     }
 
-    dataSourceManager.getDataSourcesAsArray?.().forEach(addDataSource)
+    dataSourceManager.getDataSourcesAsArray?.().forEach((dataSource: any) => {
+      addDataSource(dataSource)
+    })
 
     await jimuMapView?.whenAllJimuLayerViewLoaded?.()
     const layerViews = jimuMapView?.getAllLoadedJimuLayerViews?.() || []
@@ -1498,6 +1547,7 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
     if (!historyItem) {
       setAttachmentItems([])
       setAttachmentError('')
+      setAttachmentPendingDelete(null)
       return
     }
 
@@ -1530,6 +1580,9 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
         .filter((attachment) => Number.isFinite(attachment.id))
         .sort((left, right) => left.name.localeCompare(right.name, undefined, { numeric: true, sensitivity: 'base' }))
       setAttachmentItems(nextAttachments)
+      setAttachmentPendingDelete((current) =>
+        current && nextAttachments.some((attachment) => attachment.id === current.id) ? current : null
+      )
     } catch (err) {
       const message = err instanceof Error ? err.message : m.historyLoadFailed
       setAttachmentError(message)
@@ -1576,29 +1629,38 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
     try {
       const layer = await getMonumentHistoryLayer()
       if (!layer.capabilities?.data?.supportsAttachment) throw new Error(m.attachmentUnsupported)
-      const results = await layer.applyEdits({
-        addAttachments: stagedAttachmentFiles.map((item) => ({
-          feature: { objectId },
-          attachment: {
-            globalId: createAttachmentGlobalId(),
-            name: item.file.name,
-            contentType: item.file.type || 'application/octet-stream',
-            data: item.file
-          }
-        }))
-      }, {
-        globalIdUsed: true,
-        rollbackOnFailureEnabled: true
+      const [Graphic] = await loadArcGISJSAPIModules(['esri/Graphic'])
+      const feature = new Graphic({
+        attributes: { OBJECTID: objectId }
       })
-      const failedResult = (results.addAttachmentResults || []).find((result: any) => result?.error)
-      if (failedResult) throw new Error(failedResult.error?.message || m.attachmentUploadFailed)
+      const uploadedAttachmentIds: number[] = []
+      try {
+        for (const item of stagedAttachmentFiles) {
+          const formData = new FormData()
+          formData.append('attachment', item.file, item.file.name)
+          formData.append('globalId', createAttachmentGlobalId())
+          const result = await layer.addAttachment(feature, formData)
+          if (result?.error) throw new Error(result.error?.message || m.attachmentUploadFailed)
+          const attachmentId = Number(result?.objectId ?? result?.attachmentId)
+          if (Number.isFinite(attachmentId)) uploadedAttachmentIds.push(attachmentId)
+        }
+      } catch (uploadErr) {
+        if (uploadedAttachmentIds.length > 0) {
+          try {
+            await layer.deleteAttachments(feature, uploadedAttachmentIds)
+          } catch {
+            // Keep the original upload failure visible.
+          }
+        }
+        throw uploadErr
+      }
       setStatus(`${m.attachmentUploadSuccess}: ${stagedAttachmentFiles.length}`)
       clearStagedAttachmentFiles()
       await loadHistoryAttachments(historyItem)
     } catch (err) {
       const message = err instanceof Error ? err.message : m.attachmentUploadFailed
       setAttachmentError(message || m.attachmentUploadFailed)
-      setStatus(m.attachmentUploadFailed)
+      setStatus(`${m.attachmentUploadFailed} ${message || ''}`.trim())
     } finally {
       setUploadingAttachments(false)
     }
@@ -1609,6 +1671,7 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
     if (objectId === null) return
 
     setAttachmentError('')
+    setDeletingAttachment(true)
 
     try {
       const [Graphic] = await loadArcGISJSAPIModules(['esri/Graphic'])
@@ -1623,7 +1686,9 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
     } catch (err) {
       const message = err instanceof Error ? err.message : m.attachmentDeleteFailed
       setAttachmentError(message || m.attachmentDeleteFailed)
-      setStatus(m.attachmentDeleteFailed)
+      setStatus(`${m.attachmentDeleteFailed} ${message || ''}`.trim())
+    } finally {
+      setDeletingAttachment(false)
     }
   }, [getMonumentHistoryLayer, loadHistoryAttachments, m.attachmentDeleted, m.attachmentDeleteFailed])
 
@@ -1640,12 +1705,14 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
     }
     setAttachmentHistoryItem(historyItem)
     setAttachmentError('')
+    setAttachmentPendingDelete(null)
   }
 
   const closeAttachmentModal = () => {
     setAttachmentHistoryItem(null)
     setAttachmentItems([])
     setAttachmentError('')
+    setAttachmentPendingDelete(null)
     clearStagedAttachmentFiles()
   }
 
@@ -2177,6 +2244,7 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
   const applyAutoAssignPlan = React.useCallback(async () => {
     if (!autoAssignPlan || !selectedProject?.globalId) return
     const selectedCandidates = autoAssignPlan.assignableRows.filter((row) => row.historyObjectId !== undefined)
+    const projectGlobalId = formatGuidForEdit(selectedProject.globalId)
 
     setAutoAssigningHistory(true)
     try {
@@ -2185,15 +2253,15 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
         return
       }
       const layer = await getMonumentHistoryLayer()
+      const [Graphic] = await loadArcGISJSAPIModules(['esri/Graphic'])
+      const objectIdField = layer.objectIdField || 'OBJECTID'
       const results = await layer.applyEdits({
-        updateFeatures: selectedCandidates.map((row) => ({
+        updateFeatures: selectedCandidates.map((row) => new Graphic({
           attributes: {
-            OBJECTID: row.historyObjectId,
-            [historyProjectGlobalIdField]: selectedProject.globalId
+            [objectIdField]: row.historyObjectId,
+            [historyProjectGlobalIdField]: projectGlobalId
           }
         }))
-      }, {
-        rollbackOnFailureEnabled: true
       })
       const failedResult = (results.updateFeatureResults || []).find((result: any) => result?.error)
       if (failedResult) throw new Error(failedResult.error?.message || m.autoAssignFailed)
@@ -2237,16 +2305,15 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
       setStatus(m.historyMissingProjectId)
       return
     }
+    const projectGlobalId = formatGuidForEdit(selectedProject.globalId)
 
     setAddingAssignHistory(true)
     try {
       const layer = await getMonumentHistoryLayer()
       const attributes = {
         [historyMonumentGlobalIdField]: monument.globalId,
-        [historyProjectGlobalIdField]: selectedProject.globalId,
-        PointNumber: monument.pointNumber === '-' ? null : monument.pointNumber,
-        Status: monument.status === '-' ? null : monument.status,
-        Type: monument.monumentType === '-' ? null : monument.monumentType
+        [historyProjectGlobalIdField]: projectGlobalId,
+        PointNumber: monument.pointNumber === '-' ? null : monument.pointNumber
       }
       const results = await layer.applyEdits({
         addFeatures: [{ attributes }]
@@ -2277,11 +2344,21 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
     }
   }, [activeAssignSurveyKey, assignSurveyMonuments, getMonumentHistoryLayer, historyMonumentGlobalIdField, historyProjectGlobalIdField, loadAssignHistoryForSurveyMonument, m.addHistoryFailed, m.addHistorySuccess, m.assignSurveyMissingGlobalId, m.historyMissingProjectId, m.selectSurveyMonumentFirst, selectMonumentHistoryRecord, selectedProject])
 
+  const refreshAssignHistory = React.useCallback(async () => {
+    const monument = assignSurveyMonuments.find((item) => getSurveyMonumentKey(item) === activeAssignSurveyKey)
+    if (!monument) {
+      setStatus(m.selectSurveyMonumentFirst)
+      return
+    }
+    await loadAssignHistoryForSurveyMonument(monument)
+  }, [activeAssignSurveyKey, assignSurveyMonuments, loadAssignHistoryForSurveyMonument, m.selectSurveyMonumentFirst])
+
   const assignProjectToHistoryItem = React.useCallback(async (item: MonumentHistorySummary) => {
     if (!selectedProject?.globalId) {
       setStatus(m.historyMissingProjectId)
       return
     }
+    const projectGlobalId = formatGuidForEdit(selectedProject.globalId)
 
     const objectId = getNumericObjectId(item.objectId)
     if (objectId === null) {
@@ -2293,24 +2370,48 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
     setAssigningHistoryProjectKey(itemKey)
     try {
       const layer = await getMonumentHistoryLayer()
-      const results = await layer.applyEdits({
-        updateFeatures: [{
-          attributes: {
-            OBJECTID: objectId,
-            [historyProjectGlobalIdField]: selectedProject.globalId
-          }
-        }]
-      }, {
-        rollbackOnFailureEnabled: true
-      })
-      const failedResult = (results.updateFeatureResults || []).find((result: any) => result?.error)
-      if (failedResult) throw new Error(failedResult.error?.message || m.assignProjectValueFailed)
+      const [Graphic] = await loadArcGISJSAPIModules(['esri/Graphic'])
+      const objectIdField = layer.objectIdField || 'OBJECTID'
+      let updateError: unknown = null
+      try {
+        const results = await layer.applyEdits({
+          updateFeatures: [new Graphic({
+            attributes: {
+              [objectIdField]: objectId,
+              [historyProjectGlobalIdField]: projectGlobalId
+            }
+          })]
+        })
+        const failedResult = (results.updateFeatureResults || []).find((result: any) => result?.error)
+        if (failedResult) updateError = failedResult
+      } catch (err) {
+        updateError = err
+      }
+      if (updateError && item.globalId) {
+        try {
+          const globalIdResults = await layer.applyEdits({
+            updateFeatures: [new Graphic({
+              attributes: {
+                GlobalID: formatGuidForEdit(item.globalId),
+                [historyProjectGlobalIdField]: projectGlobalId
+              }
+            })]
+          }, {
+            globalIdUsed: true
+          })
+          updateError = (globalIdResults.updateFeatureResults || []).find((result: any) => result?.error) || null
+        } catch (err) {
+          updateError = err
+        }
+      }
+      if (updateError) throw new Error(getUnknownErrorMessage(updateError, m.assignProjectValueFailed))
 
+      setPendingAssignHistoryProjectKey('')
       setStatus(`${m.assignProjectValueSuccess}: ${item.pointNumber}`)
       const activeMonument = assignSurveyMonuments.find((monument) => getSurveyMonumentKey(monument) === activeAssignSurveyKey)
       if (activeMonument) await loadAssignHistoryForSurveyMonument(activeMonument)
     } catch (err) {
-      const message = err instanceof Error ? err.message : m.assignProjectValueFailed
+      const message = getUnknownErrorMessage(err, m.assignProjectValueFailed)
       setStatus(`${m.assignProjectValueFailed} ${message || ''}`.trim())
     } finally {
       setAssigningHistoryProjectKey('')
@@ -2756,6 +2857,29 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
     return `OBJECTID = ${project.objectId}`
   }
 
+  const addMatchingProjectLayer = React.useCallback((
+    layers: any[],
+    layer: any,
+    extraCandidates: string[] = []
+  ) => {
+    if (!layer) return
+    const layerId = layer.layerId ?? layer.sourceJSON?.id
+    const candidates = [
+      layer.url,
+      layer.parsedUrl?.path,
+      layer.sourceJSON?.url,
+      ...extraCandidates
+    ].filter(Boolean).map(String)
+
+    if (layerId !== undefined) {
+      candidates.push(...candidates.map((url) => `${url.replace(/\/+$/, '')}/${layerId}`))
+    }
+
+    if (urlCandidatesMatch(monumentProjectsUrl, candidates) && !layers.includes(layer)) {
+      layers.push(layer)
+    }
+  }, [monumentProjectsUrl])
+
   const getProjectMapLayers = async () => {
     if (!jimuMapView) return []
 
@@ -2773,21 +2897,38 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
           layerDataSource = null
         }
       }
-      const layerId = layerDataSource?.layerId ?? layer.layerId
-      const candidates = [
-        layer.url,
-        layer.parsedUrl?.path,
-        layer.sourceJSON?.url,
-        layerDataSource?.url,
-        layerDataSource?.getDataSourceJson?.()?.url
-      ].filter(Boolean).map(String)
+      const dataSourceJson = layerDataSource?.getDataSourceJson?.()
+      const dataSourceLayerId = dataSourceJson?.layerId ?? layerDataSource?.layerId
+      const dataSourceUrl = dataSourceJson?.url || layerDataSource?.url
+      addMatchingProjectLayer(layers, layer, [
+        dataSourceUrl,
+        dataSourceUrl && dataSourceLayerId !== undefined ? `${String(dataSourceUrl).replace(/\/+$/, '')}/${dataSourceLayerId}` : ''
+      ])
+    }
 
-      if (layerId !== undefined) {
-        candidates.push(...candidates.map((url) => `${url.replace(/\/+$/, '')}/${layerId}`))
-      }
+    const mapLayers = jimuMapView.view?.map?.allLayers?.toArray?.() || jimuMapView.view?.map?.layers?.toArray?.() || []
+    mapLayers.forEach((layer: any) => {
+      addMatchingProjectLayer(layers, layer)
+      ;(layer.allSublayers?.toArray?.() || layer.sublayers?.toArray?.() || []).forEach((sublayer: any) => {
+        addMatchingProjectLayer(layers, sublayer, [layer.url])
+      })
+    })
 
-      if (urlCandidatesMatch(monumentProjectsUrl, candidates) && !layers.includes(layer)) {
-        layers.push(layer)
+    const dataSourceManager = DataSourceManager.getInstance()
+    for (const dataSourceId of monumentProjectDataSourceIds) {
+      try {
+        const dataSource: any = dataSourceManager.getDataSource(dataSourceId) || await dataSourceManager.createDataSource(dataSourceId)
+        const layer = dataSource?.layer || dataSource?.getLayer?.()
+        if (layer) {
+          const dataSourceJson = dataSource?.getDataSourceJson?.()
+          addMatchingProjectLayer(layers, layer, [
+            dataSourceJson?.url || dataSource?.url,
+            dataSourceJson?.sourceLabel,
+            dataSourceJson?.label
+          ])
+        }
+      } catch {
+        // Keep using any map layers already discovered.
       }
     }
 
@@ -3282,13 +3423,15 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
   }
 
   const buildCreateProjectPlan = React.useCallback((): CreateProjectPlan | null => {
-    const projectName = newProjectName.trim()
+    const projectName = useSelectedProjectForCreate && selectedProject
+      ? selectedProject.name
+      : newProjectName.trim()
     const sourceRows: Array<{ source: CreateProjectPlanSource, items: CsvProjectRow[] }> = [
       { source: 'new-search-point', items: newSearchPointRows },
       { source: 'existing-monument', items: existingMonumentRows },
       { source: 'multiple-monuments', items: multipleMonumentRows }
     ]
-    const rows = sourceRows.flatMap(({ source, items }) =>
+    const rows: CreateProjectPlanRow[] = sourceRows.flatMap(({ source, items }) =>
       items.map((item) => {
         const coordinates = getCsvProjectRowCoordinates(item)
         const display = getCsvProjectRowDisplay(item)
@@ -3301,7 +3444,7 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
         const action: CreateProjectPlanAction = source === 'existing-monument'
           ? canUpdateExistingPointNumber ? 'update-survey-monument' : 'none'
           : 'create-survey-monument'
-        const severity = missingPointNumber || missingCoordinates
+        const severity: CreateProjectPlanRow['severity'] = missingPointNumber || missingCoordinates
           ? 'error'
             : source === 'multiple-monuments'
               ? 'warning'
@@ -3320,7 +3463,8 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
           surveyObjectId: existingMonument?.objectId,
           currentPointNumber: existingPointNumber || undefined,
           action,
-          severity
+          severity,
+          validationLabel: item.validationMessages.join(' | ') || undefined
         }
       })
     )
@@ -3348,6 +3492,7 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
       createRows,
       updateRows,
       projectName: projectName || '-',
+      useSelectedProject: useSelectedProjectForCreate,
       canCommit: errorCount === 0,
       errorCount,
       warningCount
@@ -3357,15 +3502,102 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
     m.createProjectPlanEmpty,
     multipleMonumentRows,
     newProjectName,
-    newSearchPointRows
+    newSearchPointRows,
+    selectedProject,
+    useSelectedProjectForCreate
   ])
 
+  const updateCreateProjectPlanCounts = (plan: CreateProjectPlan): CreateProjectPlan => {
+    const createRows = plan.rows.filter((row) => row.action === 'create-survey-monument' && row.severity !== 'error')
+    const updateRows = plan.rows.filter((row) => row.action === 'update-survey-monument' && row.severity !== 'error')
+    const errorCount = plan.rows.filter((row) => row.severity === 'error').length
+    const warningCount = plan.rows.filter((row) => row.severity === 'warning').length
+    return {
+      ...plan,
+      createRows,
+      updateRows,
+      canCommit: errorCount === 0,
+      errorCount,
+      warningCount
+    }
+  }
+
+  const analyzeSelectedProjectBoundary = React.useCallback(async (plan: CreateProjectPlan): Promise<CreateProjectPlan> => {
+    if (!plan.useSelectedProject) return plan
+    if (!selectedProject) {
+      return updateCreateProjectPlanCounts({
+        ...plan,
+        rows: [{
+          id: 'missing-selected-project',
+          source: 'new-search-point',
+          pointNumber: '-',
+          description: '-',
+          action: 'none',
+          severity: 'error',
+          validationLabel: m.selectProjectFirst
+        }, ...plan.rows]
+      })
+    }
+
+    try {
+      const projectLayer = await getMonumentProjectsLayer()
+      const query = projectLayer.createQuery ? projectLayer.createQuery() : {}
+      query.where = getProjectWhere(selectedProject)
+      query.outFields = ['OBJECTID']
+      query.returnGeometry = true
+      query.num = 1
+      const result = await projectLayer.queryFeatures(query)
+      const projectGeometry = result?.features?.[0]?.geometry
+      if (!projectGeometry) throw new Error(m.selectedProjectBoundaryFailed)
+
+      const [Point, geometryEngine] = await loadArcGISJSAPIModules([
+        'esri/geometry/Point',
+        'esri/geometry/geometryEngine'
+      ])
+
+      return updateCreateProjectPlanCounts({
+        ...plan,
+        rows: plan.rows.map((row) => {
+          if (row.severity === 'error' || row.x === undefined || row.y === undefined) return row
+          const point = new Point({
+            x: row.x,
+            y: row.y,
+            spatialReference: ORANGE_COUNTY_STATE_PLANE_SPATIAL_REFERENCE
+          })
+          const insideProject = geometryEngine.contains(projectGeometry, point) || geometryEngine.intersects(projectGeometry, point)
+          return {
+            ...row,
+            severity: insideProject || row.severity === 'warning' ? row.severity : 'warning',
+            validationLabel: insideProject ? m.selectedProjectBoundaryInside : m.selectedProjectBoundaryOutside
+          }
+        })
+      })
+    } catch {
+      return updateCreateProjectPlanCounts({
+        ...plan,
+        rows: plan.rows.map((row) => ({
+          ...row,
+          severity: row.severity === 'error' ? row.severity : 'warning',
+          validationLabel: row.validationLabel || m.selectedProjectBoundaryFailed
+        }))
+      })
+    }
+  }, [getMonumentProjectsLayer, m.selectProjectFirst, m.selectedProjectBoundaryFailed, m.selectedProjectBoundaryInside, m.selectedProjectBoundaryOutside, selectedProject])
+
   const analyzeProjectCsvResults = () => {
-    const plan = buildCreateProjectPlan()
-    setCreateProjectPlan(plan)
-    if (!plan) return
-    setCreateProjectModalOpen(true)
-    setStatus(`${m.createProjectPlanReady}: ${plan.createRows.length + plan.updateRows.length}. ${m.errorsLabel}: ${plan.errorCount}. ${m.warningsLabel}: ${plan.warningCount}`)
+    const basePlan = buildCreateProjectPlan()
+    setCreateProjectPlan(basePlan)
+    const analyzePlan = async () => {
+      const plan = basePlan ? await analyzeSelectedProjectBoundary(basePlan) : null
+      setCreateProjectPlan(plan)
+      if (!plan) return
+      setCreateProjectModalOpen(true)
+      setStatus(`${m.createProjectPlanReady}: ${plan.createRows.length + plan.updateRows.length}. ${m.errorsLabel}: ${plan.errorCount}. ${m.warningsLabel}: ${plan.warningCount}`)
+    }
+    analyzePlan().catch((err) => {
+      const message = err instanceof Error ? err.message : m.createProjectFailed
+      setStatus(message || m.createProjectFailed)
+    })
   }
 
   const getCreateProjectCsvRows = React.useCallback(() => [
@@ -3376,7 +3608,7 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
 
   const getFailedEditResult = (results: any, resultKey: string, fallbackMessage: string) => {
     const failedResult = (results?.[resultKey] || []).find((result: any) => result?.error)
-    return failedResult ? new Error(failedResult.error?.message || fallbackMessage) : null
+    return failedResult ? new Error(getEditErrorMessage(failedResult, fallbackMessage)) : null
   }
 
   const stageCreateProjectFromCsv = async () => {
@@ -3392,28 +3624,30 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
     const rollbackSteps: Array<() => Promise<void>> = []
 
     try {
-      const projectLayer = await getMonumentProjectsLayer()
       const surveyLayer = await getSurveyMonumentsLayer()
-      const projectGeometry = await getCsvProjectBoundaryPolygon(getCreateProjectCsvRows())
-      if (!projectGeometry) throw new Error(m.searchPointInvalidCoordinates)
+      if (!plan.useSelectedProject) {
+        const projectLayer = await getMonumentProjectsLayer()
+        const projectGeometry = await getCsvProjectBoundaryPolygon(getCreateProjectCsvRows())
+        if (!projectGeometry) throw new Error(m.searchPointInvalidCoordinates)
 
-      const projectResults = await projectLayer.applyEdits({
-        addFeatures: [{
-          geometry: projectGeometry,
-          attributes: {
-            [projectDisplayField]: plan.projectName
-          }
-        }]
-      })
-      const projectError = getFailedEditResult(projectResults, 'addFeatureResults', m.createProjectFailed)
-      if (projectError) throw projectError
-      const projectObjectId = projectResults.addFeatureResults?.[0]?.objectId
-      if (projectObjectId === undefined || projectObjectId === null) throw new Error(m.createProjectFailed)
-      rollbackSteps.push(async () => {
-        await projectLayer.applyEdits({
-          deleteFeatures: [{ attributes: { OBJECTID: projectObjectId } }]
+        const projectResults = await projectLayer.applyEdits({
+          addFeatures: [{
+            geometry: projectGeometry,
+            attributes: {
+              [projectDisplayField]: plan.projectName
+            }
+          }]
         })
-      })
+        const projectError = getFailedEditResult(projectResults, 'addFeatureResults', m.createProjectFailed)
+        if (projectError) throw projectError
+        const projectObjectId = projectResults.addFeatureResults?.[0]?.objectId
+        if (projectObjectId === undefined || projectObjectId === null) throw new Error(m.createProjectFailed)
+        rollbackSteps.push(async () => {
+          await projectLayer.applyEdits({
+            deleteFeatures: [{ attributes: { OBJECTID: projectObjectId } }]
+          })
+        })
+      }
 
       if (plan.createRows.length > 0) {
         const createFeatures = plan.createRows.map((row) => ({
@@ -3473,7 +3707,7 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
       }
 
       setCreateProjectModalOpen(false)
-      setStatus(`${m.createProjectSuccess}: ${plan.projectName}. ${m.surveyMonumentsToCreate}: ${plan.createRows.length}. ${m.surveyMonumentsToUpdate}: ${plan.updateRows.length}`)
+      setStatus(`${plan.useSelectedProject ? m.selectedProjectSearchPointsSuccess : m.createProjectSuccess}: ${plan.projectName}. ${m.surveyMonumentsToCreate}: ${plan.createRows.length}. ${m.surveyMonumentsToUpdate}: ${plan.updateRows.length}`)
       loadProjects().catch(() => undefined)
     } catch (err) {
       try {
@@ -3785,7 +4019,7 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
       selectedHistoryItems.map((item) => item.monumentGlobalId || '')
     )
 
-    const rows = selectedHistoryItems.map((item) => {
+    const rows: PointNumberPlanRow[] = selectedHistoryItems.map((item) => {
       const pointGlobalId = (item.monumentGlobalId || '').trim()
       const pointGlobalIdKey = pointGlobalId.toLowerCase()
       const historyPointNumber = item.pointNumber === '-' ? '' : item.pointNumber.trim()
@@ -3910,8 +4144,10 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
     }
 
     setApplyingPointNumbers(true)
+    let layer: any = null
+    const rollbackRows = updateRows.filter((row) => row.surveyObjectId !== undefined)
     try {
-      const layer = await getSurveyMonumentsLayer()
+      layer = await getSurveyMonumentsLayer()
       const results = await layer.applyEdits({
         updateFeatures: updateRows.map((row) => ({
           attributes: {
@@ -3929,6 +4165,24 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
       setPointNumberModalOpen(false)
       if (selectedProject) await loadProjectHistory(selectedProject)
     } catch (err) {
+      if (layer && rollbackRows.length > 0) {
+        try {
+          await layer.applyEdits({
+            updateFeatures: rollbackRows.map((row) => ({
+              attributes: {
+                OBJECTID: row.surveyObjectId,
+                [monumentPointNumberField]: row.currentPointNumber || null
+              }
+            }))
+          }, {
+            rollbackOnFailureEnabled: true
+          })
+        } catch (rollbackErr) {
+          const rollbackMessage = rollbackErr instanceof Error ? rollbackErr.message : m.pointNumberRollbackFailed
+          setStatus(`${m.pointNumberRollbackFailed} ${rollbackMessage || ''}`.trim())
+          return
+        }
+      }
       const message = err instanceof Error ? err.message : m.pointNumberApplyFailed
       setStatus(`${m.pointNumberApplyFailed} ${message || ''}`.trim())
     } finally {
@@ -3940,6 +4194,7 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
     m.applyPointNumbers,
     m.pointNumberApplyComplete,
     m.pointNumberApplyFailed,
+    m.pointNumberRollbackFailed,
     monumentPointNumberField,
     pointNumberPlan,
     selectedProject
@@ -4323,6 +4578,8 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
   const assignHistoryRow = (item: MonumentHistorySummary) => {
     const itemKey = getHistoryKey(item)
     const active = activeAssignHistoryKey === itemKey
+    const pendingAssign = pendingAssignHistoryProjectKey === itemKey
+    const hasCurrentProject = Boolean(item.projectGlobalId)
     const activateHistoryItem = () => {
       setActiveAssignHistoryKey(itemKey)
       suppressAssignSurveySelectionSyncRef.current = true
@@ -4337,87 +4594,140 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
     }
     const primaryText = `${item.pointNumber} | ${item.status} | ${item.monumentType}`
     const projectText = item.projectName || '-'
+    const assignValidationText = hasCurrentProject
+      ? m.assignProjectOverwriteConfirm
+      : m.assignProjectConfirm
 
     return h('div', {
       key: item.objectId,
-      className: 'd-flex align-items-center justify-content-between py-1',
+      className: 'py-1',
       onClick: activateHistoryItem,
       style: {
-        gap: '0.5rem',
         paddingLeft: '0.5rem',
         paddingRight: '0.5rem',
         cursor: 'pointer',
         backgroundColor: active ? 'rgba(105, 220, 255, 0.18)' : undefined
       }
     },
-    h('div', { className: 'd-flex align-items-center', style: { gap: '0.5rem', minWidth: 0, overflow: 'hidden' } },
-      h('div', { style: { minWidth: 0, overflow: 'hidden' } },
-        h('div', {
-          title: primaryText,
-          style: {
-            display: 'flex',
-            alignItems: 'center',
-            gap: '0.35rem',
-            minWidth: 0,
-            overflow: 'hidden',
-            fontSize: 12,
-            whiteSpace: 'nowrap'
-          }
-        },
-        h('span', { style: { minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', fontWeight: 600 } }, item.pointNumber),
-        h('span', { style: { opacity: 0.48 } }, '|'),
-        h('span', {
-          style: {
-            flex: '0 1 auto',
-            minWidth: 0,
-            overflow: 'hidden',
-            textOverflow: 'ellipsis',
-            padding: '1px 6px',
-            borderRadius: 4,
-            backgroundColor: 'rgba(105, 220, 255, 0.16)',
-            color: 'var(--sys-color-primary-dark)'
-          }
-        }, item.status),
-        h('span', { style: { opacity: 0.48 } }, '|'),
-        h('span', { style: { minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', opacity: 0.78 } }, item.monumentType)
-        ),
-        h('div', {
-          title: projectText,
-          style: {
-            minWidth: 0,
-            overflow: 'hidden',
-            fontSize: 10,
-            lineHeight: '14px',
-            textOverflow: 'ellipsis',
-            whiteSpace: 'nowrap'
-          }
-        },
-        h('span', { style: { opacity: 0.78 } }, projectText)
+    h('div', { className: 'd-flex align-items-center justify-content-between', style: { gap: '0.5rem' } },
+      h('div', { className: 'd-flex align-items-center', style: { gap: '0.5rem', minWidth: 0, overflow: 'hidden' } },
+        h('div', { style: { minWidth: 0, overflow: 'hidden' } },
+          h('div', {
+            title: primaryText,
+            style: {
+              display: 'flex',
+              alignItems: 'center',
+              gap: '0.35rem',
+              minWidth: 0,
+              overflow: 'hidden',
+              fontSize: 12,
+              whiteSpace: 'nowrap'
+            }
+          },
+          h('span', { style: { minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', fontWeight: 600 } }, item.pointNumber),
+          h('span', { style: { opacity: 0.48 } }, '|'),
+          h('span', {
+            style: {
+              flex: '0 1 auto',
+              minWidth: 0,
+              overflow: 'hidden',
+              textOverflow: 'ellipsis',
+              padding: '1px 6px',
+              borderRadius: 4,
+              backgroundColor: 'rgba(105, 220, 255, 0.16)',
+              color: 'var(--sys-color-primary-dark)'
+            }
+          }, item.status),
+          h('span', { style: { opacity: 0.48 } }, '|'),
+          h('span', { style: { minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', opacity: 0.78 } }, item.monumentType)
+          ),
+          h('div', {
+            title: projectText,
+            style: {
+              minWidth: 0,
+              overflow: 'hidden',
+              fontSize: 10,
+              lineHeight: '14px',
+              textOverflow: 'ellipsis',
+              whiteSpace: 'nowrap'
+            }
+          },
+          h('span', { style: { opacity: 0.78 } }, projectText)
+          )
         )
+      ),
+      mode === 'create' && h('div', { className: 'd-flex align-items-center', style: { gap: '0.25rem', flex: '0 0 auto' } },
+        h(Button, {
+          size: 'sm',
+          type: 'default',
+          title: m.attachmentsTitle,
+          onClick: (evt) => {
+            evt.stopPropagation()
+            openAttachmentModal(item)
+          },
+          style: { width: 32, minWidth: 32, height: 32, padding: 0, display: 'inline-flex', alignItems: 'center', justifyContent: 'center' }
+        }, '📎'),
+        h(Button, {
+          size: 'sm',
+          type: 'default',
+          title: m.assignProjectValue,
+          disabled: assigningHistoryProjectKey === itemKey || !selectedProject,
+          onClick: (evt) => {
+            evt.stopPropagation()
+            setPendingAssignHistoryProjectKey((current) => current === itemKey ? '' : itemKey)
+            setActiveAssignHistoryKey(itemKey)
+          },
+          style: { width: 32, minWidth: 32, height: 32, padding: 0, display: 'inline-flex', alignItems: 'center', justifyContent: 'center' }
+        }, '↗')
       )
     ),
-    mode === 'create' && h('div', { className: 'd-flex align-items-center', style: { gap: '0.25rem', flex: '0 0 auto' } },
+    mode === 'create' && pendingAssign && h('div', {
+      className: 'd-flex align-items-center mt-1',
+      onClick: (evt) => {
+        evt.stopPropagation()
+      },
+      style: { gap: '0.35rem' }
+    } as any,
+      h('div', {
+        role: 'status',
+        style: {
+          flex: '0 1 auto',
+          minWidth: 0,
+          maxWidth: '100%',
+          overflow: 'hidden',
+          padding: '3px 8px',
+          borderRadius: 3,
+          border: hasCurrentProject ? '1px solid rgba(194, 111, 0, 0.32)' : '1px solid rgba(0, 105, 170, 0.28)',
+          backgroundColor: hasCurrentProject ? 'rgba(255, 248, 232, 0.96)' : 'rgba(235, 248, 255, 0.96)',
+          boxShadow: '0 1px 2px rgba(0, 0, 0, 0.08)',
+          color: hasCurrentProject ? '#6f4300' : '#073f63',
+          fontWeight: 600,
+          fontSize: 10,
+          lineHeight: '14px',
+          whiteSpace: 'nowrap',
+          textOverflow: 'ellipsis'
+        }
+      },
+      assignValidationText
+      ),
       h(Button, {
         size: 'sm',
-        type: 'default',
-        title: m.attachmentsTitle,
-        onClick: (evt) => {
-          evt.stopPropagation()
-          openAttachmentModal(item)
-        },
-        style: { width: 32, minWidth: 32, height: 32, padding: 0, display: 'inline-flex', alignItems: 'center', justifyContent: 'center' }
-      }, '📎'),
-      h(Button, {
-        size: 'sm',
-        type: 'default',
-        title: m.assignProjectValue,
-        disabled: assigningHistoryProjectKey === itemKey || !selectedProject,
-        onClick: (evt) => {
-          evt.stopPropagation()
+        type: hasCurrentProject ? 'default' : 'primary',
+        disabled: assigningHistoryProjectKey === itemKey,
+        style: { height: 28, padding: '0 8px', fontSize: 11 },
+        onClick: () => {
           assignProjectToHistoryItem(item).catch(() => undefined)
-        },
-        style: { width: 32, minWidth: 32, height: 32, padding: 0, display: 'inline-flex', alignItems: 'center', justifyContent: 'center' }
-      }, '↗')
+        }
+      }, m.confirm),
+      h(Button, {
+        size: 'sm',
+        type: 'tertiary',
+        disabled: assigningHistoryProjectKey === itemKey,
+        style: { height: 28, padding: '0 8px', fontSize: 11 },
+        onClick: () => {
+          setPendingAssignHistoryProjectKey('')
+        }
+      }, m.cancel)
     )
     )
   }
@@ -4475,7 +4785,7 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
               cursor: 'pointer',
               backgroundColor: 'rgba(0, 0, 0, 0.02)'
             }
-          },
+          } as any,
           h('div', { style: { fontSize: 12, fontWeight: 700 } }, m.attachmentDropPrompt),
           h('div', { style: { fontSize: 10, opacity: 0.68, marginTop: 2 } }, m.attachmentDropHint)
           ),
@@ -4553,9 +4863,11 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
                         size: 'sm',
                         type: 'tertiary',
                         title: m.attachmentDelete,
+                        disabled: deletingAttachment || attachmentPendingDelete?.id === attachment.id,
                         style: { height: 24, padding: '0 6px', fontSize: 11 },
                         onClick: () => {
-                          deleteHistoryAttachment(historyItem, attachment).catch(() => undefined)
+                          setAttachmentPendingDelete(attachment)
+                          setAttachmentError('')
                         }
                       }, m.attachmentDeleteLabel)
                     )
@@ -4582,11 +4894,31 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
     h(ModalBody, null,
       attachmentPanel(attachmentHistoryItem, false)
     ),
-    h(ModalFooter, null,
-      h(Button, {
-        type: 'default',
-        onClick: closeAttachmentModal
-      }, m.cancel)
+    h(ModalFooter, {
+      className: 'd-flex align-items-center justify-content-between',
+      style: { gap: '0.75rem' }
+    },
+    h('div', { style: { flex: '1 1 auto', minWidth: 0 } },
+      attachmentPendingDelete && h(Alert, {
+        form: 'basic',
+        type: 'warning',
+        text: `${m.attachmentDeletePending}: ${attachmentPendingDelete.name}`,
+        style: { marginBottom: 0 }
+      } as any)
+    ),
+    h('div', { className: 'd-flex align-items-center', style: { gap: '0.35rem', flex: '0 0 auto' } },
+        attachmentHistoryItem && attachmentPendingDelete && h(Button, {
+          type: 'danger',
+          disabled: deletingAttachment,
+          onClick: () => {
+            deleteHistoryAttachment(attachmentHistoryItem, attachmentPendingDelete).catch(() => undefined)
+          }
+        }, m.attachmentConfirmDelete),
+        h(Button, {
+          type: 'default',
+          onClick: closeAttachmentModal
+        }, m.cancel)
+      )
     ))
 
   const viewHistoryPanel = () =>
@@ -4717,7 +5049,22 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
       h('div', { className: 'border rounded p-2 d-flex flex-column flex-grow-1', style: { minHeight: 0 } },
         h('div', { className: 'd-flex align-items-center justify-content-between mb-2', style: { gap: '0.5rem' } },
           h('div', { className: 'font-weight-bold', style: { fontSize: 12 } }, m.monumentHistoryTitle),
-          h('div', { style: { fontSize: 11, opacity: 0.75 } }, `${assignHistoryItems.length} ${m.featureCountLabel}`)
+          h('div', { className: 'd-flex align-items-center', style: { gap: '0.35rem', flex: '0 0 auto' } },
+            h('div', { style: { fontSize: 11, opacity: 0.75 } }, `${assignHistoryItems.length} ${m.featureCountLabel}`),
+            h(Button, {
+              size: 'sm',
+              type: 'tertiary',
+              title: m.refreshHistory,
+              disabled: !activeAssignSurveyKey || loadingAssignHistory,
+              onClick: () => {
+                refreshAssignHistory().catch((err) => {
+                  const message = getUnknownErrorMessage(err, m.historyLoadFailed)
+                  setStatus(message || m.historyLoadFailed)
+                })
+              },
+              style: { height: 24, padding: '0 6px', fontSize: 11 }
+            }, m.refreshHistory)
+          )
         ),
         h('div', { className: 'flex-grow-1', style: { minHeight: 0, overflowY: 'auto', overflowX: 'hidden' } },
           loadingAssignHistory
@@ -4977,6 +5324,7 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
           h(TextInput, {
             value: newProjectName,
             placeholder: m.projectNamePlaceholder,
+            disabled: useSelectedProjectForCreate,
             onChange: (evt) => {
               if (useSelectedProjectForCreate) setUseSelectedProjectForCreate(false)
               setNewProjectName(evt.target.value)
@@ -5055,6 +5403,11 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
       m.createTitle
     ].some((messagePrefix) => status.startsWith(messagePrefix))
   }
+
+  const getStatusAlertType = () =>
+    status === m.projectFileNameMismatch || status.startsWith(m.assignProjectValueFailed)
+      ? 'warning'
+      : 'info'
 
   const traverseFileRow = (file: TraverseFileSummary) =>
     h('div', {
@@ -5274,6 +5627,7 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
           : h(React.Fragment, null,
             h('div', { className: 'd-flex flex-wrap', style: { gap: '0.5rem' } },
               validationCountTile(m.projectNameLabel, createProjectPlan.projectName),
+              validationCountTile(m.projectEditModeLabel, createProjectPlan.useSelectedProject ? m.projectEditUseSelected : m.projectEditCreate),
               validationCountTile(m.newSearchPoint, newSearchPointRows.length),
               validationCountTile(m.existingMonument, existingMonumentRows.length),
               validationCountTile(m.multipleMonuments, multipleMonumentRows.length),
@@ -5283,7 +5637,7 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
               validationCountTile(m.warningsLabel, createProjectPlan.warningCount)
             ),
             h('div', { className: 'flex-grow-1', style: { minHeight: 0, overflowY: 'auto', overflowX: 'auto' } },
-              validationHeaderRow([m.sourceListLabel, m.pointNumberLabel, m.descriptionLabel, 'x', 'y', 'z', m.actionLabel]),
+              validationHeaderRow([m.sourceListLabel, m.pointNumberLabel, m.descriptionLabel, 'x', 'y', 'z', m.actionLabel, m.validationLabel]),
               ...createProjectPlan.rows.map((row) =>
                 validationDataRow([
                   createProjectSourceLabel(row.source),
@@ -5292,7 +5646,8 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
                   row.x,
                   row.y,
                   row.z,
-                  createProjectActionLabel(row)
+                  createProjectActionLabel(row),
+                  row.validationLabel || '-'
                 ], row.id)
               )
             )
@@ -5711,7 +6066,7 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
         ),
         shouldShowStatusAlert() && h(Alert, {
           form: 'basic',
-          type: status === m.projectFileNameMismatch ? 'warning' : 'info',
+          type: getStatusAlertType(),
           text: status
         })
       )

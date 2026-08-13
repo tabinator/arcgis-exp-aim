@@ -13,8 +13,7 @@ import type { IMConfig } from '../config'
 import defaultMessages from './translations/default'
 
 const monumentHistoryDataSourceTypes = Immutable([
-  DataSourceTypes.FeatureLayer,
-  DataSourceTypes.Table
+  DataSourceTypes.FeatureLayer
 ])
 
 const Setting = (props: AllWidgetSettingProps<IMConfig>) => {
