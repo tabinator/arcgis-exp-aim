@@ -168,12 +168,18 @@ interface ParsedStaticFileResult {
   validations: FinalizeValidationMessage[]
 }
 
+interface ExistingTraverseConnectionSummary {
+  objectId: number | string
+  geometry?: any
+}
+
 type FinalizeEditKind =
   'update-history'
   | 'create-history'
   | 'update-survey-monument'
   | 'create-survey-monument'
   | 'backfill-history-relationship'
+  | 'delete-traverse-connection'
   | 'create-traverse-connection'
 
 interface PlannedFinalizeEdit {
@@ -183,7 +189,7 @@ interface PlannedFinalizeEdit {
   objectId?: string | number
   globalId?: string
   attributes?: { [key: string]: any }
-  geometry?: { x: number, y: number }
+  geometry?: any
 }
 
 interface FinalizeValidationMessage {
@@ -197,6 +203,7 @@ interface FinalizePlan {
   validations: FinalizeValidationMessage[]
   counts: { [key in FinalizeEditKind]: number }
   canCommit: boolean
+  existingTraverseConnections: ExistingTraverseConnectionSummary[]
 }
 
 interface FinalizeRollbackStep {
@@ -210,6 +217,7 @@ interface FinalizeHistoryRecord {
   globalId: string
   pointGlobalId: string
   pointNumber: string
+  remarks: string
 }
 
 interface FinalizeSurveyMonumentRecord {
@@ -310,9 +318,36 @@ interface CreateProjectPlan {
   warningCount: number
 }
 
-interface MergeRollbackAction {
-  label: string
-  run: () => Promise<void>
+interface MergeHistoryReassignment {
+  objectId: number | string
+  pointNumber: string
+  sourceGlobalId: string
+  sourcePointNumber: string
+  sourceObjectId: number | string
+}
+
+interface TargetMergeSourceRow {
+  monument: SurveyMonumentSummary
+  historyRows: MergeHistoryReassignment[]
+}
+
+interface TargetMergePlan {
+  target: SurveyMonumentSummary
+  sources: TargetMergeSourceRow[]
+  validations: FinalizeValidationMessage[]
+  canCommit: boolean
+  historyUpdateCount: number
+  sourceDeleteCount: number
+  zeroHistoryCount: number
+}
+
+interface MeanMergePlan extends TargetMergePlan {
+  targetOriginalGeometry: any
+  meanGeometry: any
+  meanX: number
+  meanY: number
+  targetOriginalX: number
+  targetOriginalY: number
 }
 
 type MergeOperationType = 'target' | 'mean'
@@ -328,6 +363,7 @@ const MONUMENT_GLOBAL_ID_QUERY_CHUNK_SIZE = 50
 const SURVEY_MONUMENTS_LAYER_ID = '999066'
 const MONUMENT_PROJECTS_LAYER_ID = '999068'
 const MONUMENT_HISTORY_LAYER_ID = '999069'
+const TRAVERSE_CONNECTIONS_LAYER_ID = '999082'
 const STANDARD_PROJECT_CSV_FIELDS = ['PointNumber', 'YCoordinate', 'XCoordinate', 'Elevation', 'MonumentDescription'] as const
 const ORANGE_COUNTY_STATE_PLANE_SPATIAL_REFERENCE = { wkid: 102646, latestWkid: 2230 }
 const CSV_SEARCH_POINT_BUFFER_FEET = 0.03
@@ -634,12 +670,42 @@ const enrichTraverseConnections = (
     return enrichedConnection
   })
 
+const buildParsedTraverseDataFromFiles = (files: TraverseFileSummary[], parseControllingStations: boolean): ParsedTraverseData => {
+  const fileResults = files.map((file) => parseTraverseText(file.text, file.id, file.name, parseControllingStations))
+  const monumentsByPointId = new Map<string, ParsedTraverseMonument>()
+  const fixedStations = new Set<string>()
+
+  fileResults.forEach((result) => {
+    result.fixedStations.forEach((pointId) => fixedStations.add(pointId))
+    result.monuments.forEach((monument) => {
+      if (!monumentsByPointId.has(monument.pointId)) monumentsByPointId.set(monument.pointId, monument)
+    })
+  })
+  fixedStations.forEach((pointId) => {
+    const monument = monumentsByPointId.get(pointId)
+    if (monument) monument.fixedStation = true
+  })
+
+  const enrichedFileResults = fileResults.map((result) => ({
+    ...result,
+    connections: enrichTraverseConnections(result.connections, monumentsByPointId)
+  }))
+
+  return {
+    monuments: Array.from(monumentsByPointId.values()),
+    connections: enrichedFileResults.flatMap((result) => result.connections),
+    fixedStations: Array.from(fixedStations),
+    files: enrichedFileResults
+  }
+}
+
 const emptyFinalizeCounts = (): { [key in FinalizeEditKind]: number } => ({
   'update-history': 0,
   'create-history': 0,
   'update-survey-monument': 0,
   'create-survey-monument': 0,
   'backfill-history-relationship': 0,
+  'delete-traverse-connection': 0,
   'create-traverse-connection': 0
 })
 
@@ -975,6 +1041,29 @@ const formatGuidForEdit = (value?: string) => {
     : trimmed
 }
 
+const normalizeGuidKey = (value?: string) => (value || '').replace(/[{}]/g, '').trim().toLowerCase()
+
+const appendDelimitedText = (existingValue?: string, nextValue?: string, delimiter = ' | ') => {
+  const existingText = (existingValue || '').trim()
+  const nextText = (nextValue || '').trim()
+  if (!existingText) return nextText
+  if (!nextText) return existingText
+  const existingParts = existingText.split(delimiter).map((part) => part.trim()).filter(Boolean)
+  if (existingParts.some((part) => part.toLowerCase() === nextText.toLowerCase())) return existingText
+  return `${existingText}${delimiter}${nextText}`
+}
+
+const stripSystemEditAttributes = (attributes: { [key: string]: any } = {}, layer: any) => {
+  const objectIdField = String(layer?.objectIdField || 'OBJECTID').toLowerCase()
+  const globalIdField = String(layer?.globalIdField || 'GlobalID').toLowerCase()
+  return Object.keys(attributes).reduce<{ [key: string]: any }>((result, key) => {
+    const normalizedKey = key.toLowerCase()
+    if (normalizedKey === objectIdField || normalizedKey === globalIdField) return result
+    result[key] = attributes[key]
+    return result
+  }, {})
+}
+
 const collectMatchingDataSourceIds = (
   appConfig: any,
   targetUrl: string,
@@ -1055,6 +1144,14 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
   const [applyingPointNumbers, setApplyingPointNumbers] = React.useState(false)
   const [pointNumberPlan, setPointNumberPlan] = React.useState<PointNumberPlan | null>(null)
   const [pointNumberModalOpen, setPointNumberModalOpen] = React.useState(false)
+  const [buildingTargetMergePlan, setBuildingTargetMergePlan] = React.useState(false)
+  const [applyingTargetMerge, setApplyingTargetMerge] = React.useState(false)
+  const [targetMergePlan, setTargetMergePlan] = React.useState<TargetMergePlan | null>(null)
+  const [targetMergeModalOpen, setTargetMergeModalOpen] = React.useState(false)
+  const [buildingMeanMergePlan, setBuildingMeanMergePlan] = React.useState(false)
+  const [applyingMeanMerge, setApplyingMeanMerge] = React.useState(false)
+  const [meanMergePlan, setMeanMergePlan] = React.useState<MeanMergePlan | null>(null)
+  const [meanMergeModalOpen, setMeanMergeModalOpen] = React.useState(false)
   const [attachmentItems, setAttachmentItems] = React.useState<AttachmentSummary[]>([])
   const [stagedAttachmentFiles, setStagedAttachmentFiles] = React.useState<StagedAttachmentFile[]>([])
   const [attachmentError, setAttachmentError] = React.useState('')
@@ -1081,21 +1178,27 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
   const [parsedStaticData, setParsedStaticData] = React.useState<ParsedStaticFileResult | null>(null)
   const [finalizePlan, setFinalizePlan] = React.useState<FinalizePlan | null>(null)
   const [validationModalOpen, setValidationModalOpen] = React.useState(false)
+  const [finalizeConfirmOpen, setFinalizeConfirmOpen] = React.useState(false)
   const [validationTab, setValidationTab] = React.useState<FinalizeValidationTab>('summary')
   const [validationReviewMode, setValidationReviewMode] = React.useState<ValidationReviewMode>('traverse')
   const [basisOfBearing, setBasisOfBearing] = React.useState('')
   const [acceptingBasisOfBearing, setAcceptingBasisOfBearing] = React.useState(false)
   const [loadingTraverseFiles, setLoadingTraverseFiles] = React.useState(false)
+  const [finalizingProject, setFinalizingProject] = React.useState(false)
   const [status, setStatus] = React.useState(m.statusReady)
   const searchInitializedRef = React.useRef(false)
   const projectLayerFiltersRef = React.useRef(new Map<string, { layer: any, definitionExpression: string | null | undefined }>())
   const monumentGraphicsLayerRef = React.useRef<any>(null)
   const monumentGraphicsMapRef = React.useRef<any>(null)
+  const traversePreviewGraphicsLayerRef = React.useRef<any>(null)
+  const traversePreviewGraphicsMapRef = React.useRef<any>(null)
   const csvProjectGraphicsSignatureRef = React.useRef('')
+  const traverseConnectionsPreviewSignatureRef = React.useRef('')
   const suppressAssignSurveySelectionSyncRef = React.useRef(false)
   const monumentProjectsLayerRef = React.useRef<{ url: string, layer: any } | null>(null)
   const surveyMonumentsLayerRef = React.useRef<{ url: string, layer: any } | null>(null)
   const monumentHistoryLayerRef = React.useRef<{ url: string, layer: any } | null>(null)
+  const traverseConnectionsLayerRef = React.useRef<{ url: string, layer: any } | null>(null)
   const attachmentFileInputRef = React.useRef<HTMLInputElement | null>(null)
   const projectCsvFileInputRef = React.useRef<HTMLInputElement | null>(null)
   const traverseFileInputRef = React.useRef<HTMLInputElement | null>(null)
@@ -1132,6 +1235,9 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
   const monumentPointNumberField = cfg.monumentPointNumberField || 'PointNumber'
   const historyMonumentGlobalIdField = cfg.historyMonumentGlobalIdField || 'PointGlobalID'
   const historyProjectGlobalIdField = cfg.historyProjectGlobalIdField || 'ProjectGlobalID'
+  const traverseProjectGlobalIdField = cfg.traverseProjectGlobalIdField || 'ProjectID'
+  const traverseFromPointNumberField = cfg.traverseFromPointNumberField || 'FromPointNum'
+  const traverseToPointNumberField = cfg.traverseToPointNumberField || 'ToPointNum'
   const configuredMonumentHistoryDataSourceIds = React.useMemo(
     () => (props.useDataSources || [])
       .map((useDataSource: any) => useDataSource?.dataSourceId)
@@ -1164,6 +1270,14 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
   const monumentProjectDataSourceIds = React.useMemo(
     () => monumentProjectDataSourceIdsKey ? monumentProjectDataSourceIdsKey.split('|') : [],
     [monumentProjectDataSourceIdsKey]
+  )
+  const traverseConnectionDataSourceIdsKey = ReactRedux.useSelector((state: IMState) => {
+    const appConfig: any = (state as any).appConfig || (state as any).appStateInBuilder?.appConfig
+    return collectMatchingDataSourceIds(appConfig, traverseConnectionsUrl, /traverse connections?/i, TRAVERSE_CONNECTIONS_LAYER_ID)
+  })
+  const traverseConnectionDataSourceIds = React.useMemo(
+    () => traverseConnectionDataSourceIdsKey ? traverseConnectionDataSourceIdsKey.split('|') : [],
+    [traverseConnectionDataSourceIdsKey]
   )
   const surveyMonumentSelectionKey = ReactRedux.useSelector((state: IMState) =>
     surveyMonumentDataSourceIds
@@ -1516,6 +1630,17 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
     return layer
   }, [surveyMonumentsUrl])
 
+  const getTraverseConnectionsLayer = React.useCallback(async () => {
+    if (traverseConnectionsLayerRef.current?.url === traverseConnectionsUrl) {
+      return traverseConnectionsLayerRef.current.layer
+    }
+    const [FeatureLayer] = await loadArcGISJSAPIModules(['esri/layers/FeatureLayer'])
+    const layer = new FeatureLayer({ url: traverseConnectionsUrl })
+    await layer.load()
+    traverseConnectionsLayerRef.current = { url: traverseConnectionsUrl, layer }
+    return layer
+  }, [traverseConnectionsUrl])
+
   const getNumericObjectId = (objectId: string | number) => {
     const numericObjectId = typeof objectId === 'number' ? objectId : Number(objectId)
     return Number.isFinite(numericObjectId) ? numericObjectId : null
@@ -1743,11 +1868,6 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
     const errorCount = parsedStaticFile.validations.filter((validation) => validation.severity === 'error').length
     const warningCount = parsedStaticFile.validations.filter((validation) => validation.severity === 'warning').length
     setStatus(`${m.staticValidationReady}: ${parsedStaticFile.projectControls.length} ${m.projectControlsLabel}, ${errorCount} ${m.errorsLabel}, ${warningCount} ${m.warningsLabel}`)
-  }
-
-  const stageFinalizeProjectEdits = () => {
-    if (!finalizePlan) return
-    setStatus(`${m.traverseMode}: ${finalizePlan.edits.length} ${m.plannedEditsLabel}. ${m.finalizeProjectPending}`)
   }
 
   const selectMonumentHistoryRecord = React.useCallback(async (objectId?: string | number | null) => {
@@ -2452,6 +2572,30 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
     return monumentGraphicsLayerRef.current
   }, [jimuMapView, props.id])
 
+  const ensureTraversePreviewGraphicsLayer = React.useCallback(async () => {
+    if (!jimuMapView?.view?.map) return null
+    if (traversePreviewGraphicsLayerRef.current && traversePreviewGraphicsMapRef.current !== jimuMapView.view.map) {
+      traversePreviewGraphicsMapRef.current?.remove?.(traversePreviewGraphicsLayerRef.current)
+      traversePreviewGraphicsLayerRef.current = null
+      traversePreviewGraphicsMapRef.current = null
+    }
+    if (!traversePreviewGraphicsLayerRef.current) {
+      const [GraphicsLayer] = await loadArcGISJSAPIModules(['esri/layers/GraphicsLayer'])
+      traversePreviewGraphicsLayerRef.current = new GraphicsLayer({
+        id: `${props.id}-generated-traverse-connections`,
+        title: 'Generated traverse connection preview',
+        listMode: 'hide'
+      })
+      jimuMapView.view.map.add(traversePreviewGraphicsLayerRef.current)
+      traversePreviewGraphicsMapRef.current = jimuMapView.view.map
+    }
+    const layerIndex = jimuMapView.view.map.layers?.length
+    if (typeof layerIndex === 'number' && layerIndex > 0) {
+      jimuMapView.view.map.reorder?.(traversePreviewGraphicsLayerRef.current, layerIndex - 1)
+    }
+    return traversePreviewGraphicsLayerRef.current
+  }, [jimuMapView, props.id])
+
   const getGeometryJson = (geometry: any, geometryType?: string, spatialReference?: any) => {
     const geometryJson = { ...geometry }
     if (geometryType && !geometryJson.type) {
@@ -2491,6 +2635,13 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
       outline: { color: fillOutlineColor, width: 3 }
     }
   }
+
+  const getGeneratedTraverseConnectionSymbol = React.useCallback(() => ({
+    type: 'simple-line',
+    color: [0, 197, 255, 0.92],
+    width: 3,
+    style: 'dash'
+  }), [])
 
   const getCsvProjectBoundarySymbol = () => ({
     type: 'simple-fill',
@@ -2823,6 +2974,56 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
     }
   }, [ensureMonumentGraphicsLayer, getCsvProjectBoundaryPolygon, getCsvProjectRowPoint, jimuMapView])
 
+  const renderGeneratedTraverseConnectionGraphics = React.useCallback(async (connections: ParsedTraverseConnection[], zoomToGraphics = false) => {
+    const layer = await ensureTraversePreviewGraphicsLayer()
+    if (!layer) return 0
+
+    const drawableConnections = connections.filter((connection) =>
+      connection.fromPointE !== undefined &&
+      connection.fromPointN !== undefined &&
+      connection.toPointE !== undefined &&
+      connection.toPointN !== undefined
+    )
+    if (drawableConnections.length === 0) {
+      layer.removeAll()
+      return 0
+    }
+
+    const [Graphic, Polyline] = await loadArcGISJSAPIModules([
+      'esri/Graphic',
+      'esri/geometry/Polyline'
+    ])
+    const graphics = drawableConnections.map((connection) => new Graphic({
+      geometry: new Polyline({
+        paths: [[
+          [connection.fromPointE, connection.fromPointN],
+          [connection.toPointE, connection.toPointN]
+        ]],
+        spatialReference: ORANGE_COUNTY_STATE_PLANE_SPATIAL_REFERENCE
+      }),
+      attributes: {
+        FromPointNum: connection.fromPointNum,
+        ToPointNum: connection.toPointNum,
+        Distance: connection.distance,
+        Direction: connection.direction,
+        sourceFileName: connection.sourceFileName
+      },
+      symbol: getGeneratedTraverseConnectionSymbol()
+    }))
+
+    layer.removeAll()
+    layer.addMany(graphics)
+
+    if (zoomToGraphics && jimuMapView?.view) {
+      await jimuMapView.view.goTo(graphics, {
+        duration: 900,
+        padding: { top: 80, right: 80, bottom: 80, left: 80 }
+      })
+    }
+
+    return graphics.length
+  }, [ensureTraversePreviewGraphicsLayer, getGeneratedTraverseConnectionSymbol, jimuMapView])
+
   const zoomToCsvProjectRow = React.useCallback(async (item: CsvProjectRow) => {
     const view = jimuMapView?.view
     if (!view) {
@@ -2852,10 +3053,10 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
     }
   }, [getCsvProjectRowPoint, jimuMapView, m.mapUnavailable, m.monumentZoomFailed, m.searchPointInvalidCoordinates, m.searchPointZoomed])
 
-  const getProjectWhere = (project: MonumentProjectSummary) => {
+  const getProjectWhere = React.useCallback((project: MonumentProjectSummary) => {
     if (project.globalId) return `${projectGlobalIdField} = '${escapeSqlString(project.globalId)}'`
     return `OBJECTID = ${project.objectId}`
-  }
+  }, [projectGlobalIdField])
 
   const addMatchingProjectLayer = React.useCallback((
     layers: any[],
@@ -2934,6 +3135,170 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
 
     return layers
   }
+
+  const addMatchingTraverseConnectionLayer = React.useCallback((layers: any[], layer: any, extraCandidates: string[] = []) => {
+    const layerId = layer?.layerId ?? layer?.id
+    const candidates = [
+      layer?.url,
+      layer?.source?.url,
+      layer?.parent?.url,
+      layer?.title,
+      layer?.name,
+      layerId !== undefined ? String(layerId) : '',
+      ...extraCandidates
+    ].filter(Boolean).map(String)
+    candidates.push(...candidates.map((url) => `${url.replace(/\/+$/, '')}/${layerId}`))
+
+    if (urlCandidatesMatch(traverseConnectionsUrl, candidates) && !layers.includes(layer)) {
+      layers.push(layer)
+    }
+  }, [traverseConnectionsUrl])
+
+  const getTraverseConnectionMapLayers = React.useCallback(async () => {
+    if (!jimuMapView) return []
+
+    await jimuMapView.whenAllJimuLayerViewLoaded?.()
+    const layerViews = jimuMapView.getAllLoadedJimuLayerViews?.() || []
+    const layers: any[] = []
+
+    for (const layerView of layerViews) {
+      const layer = layerView.layer || {}
+      let layerDataSource = layerView.getLayerDataSource?.()
+      if (!layerDataSource && layerView.createLayerDataSource) {
+        try {
+          layerDataSource = await layerView.createLayerDataSource()
+        } catch {
+          layerDataSource = null
+        }
+      }
+      const dataSourceJson = layerDataSource?.getDataSourceJson?.()
+      const dataSourceLayerId = dataSourceJson?.layerId ?? layerDataSource?.layerId
+      const dataSourceUrl = dataSourceJson?.url || layerDataSource?.url
+      addMatchingTraverseConnectionLayer(layers, layer, [
+        dataSourceUrl,
+        dataSourceUrl && dataSourceLayerId !== undefined ? `${String(dataSourceUrl).replace(/\/+$/, '')}/${dataSourceLayerId}` : ''
+      ])
+    }
+
+    const mapLayers = jimuMapView.view?.map?.allLayers?.toArray?.() || jimuMapView.view?.map?.layers?.toArray?.() || []
+    mapLayers.forEach((layer: any) => {
+      addMatchingTraverseConnectionLayer(layers, layer)
+      ;(layer.allSublayers?.toArray?.() || layer.sublayers?.toArray?.() || []).forEach((sublayer: any) => {
+        addMatchingTraverseConnectionLayer(layers, sublayer, [layer.url])
+      })
+    })
+
+    const dataSourceManager = DataSourceManager.getInstance()
+    for (const dataSourceId of traverseConnectionDataSourceIds) {
+      try {
+        const dataSource: any = dataSourceManager.getDataSource(dataSourceId) || await dataSourceManager.createDataSource(dataSourceId)
+        const layer = dataSource?.layer || dataSource?.getLayer?.()
+        if (layer) {
+          const dataSourceJson = dataSource?.getDataSourceJson?.()
+          addMatchingTraverseConnectionLayer(layers, layer, [
+            dataSourceJson?.url || dataSource?.url,
+            dataSourceJson?.sourceLabel,
+            dataSourceJson?.label
+          ])
+        }
+      } catch {
+        // Keep using any map layers already discovered.
+      }
+    }
+
+    return layers
+  }, [addMatchingTraverseConnectionLayer, jimuMapView, traverseConnectionDataSourceIds])
+
+  const getTraverseConnectionWhere = React.useCallback((projectGlobalId: string) =>
+    `${traverseProjectGlobalIdField} = '${escapeSqlString(projectGlobalId)}'`,
+  [traverseProjectGlobalIdField])
+
+  const queryExistingTraverseConnections = React.useCallback(async (projectGlobalId: string) => {
+    if (!projectGlobalId) return []
+
+    const query = new URL(`${traverseConnectionsUrl}/query`)
+    query.search = new URLSearchParams({
+      where: getTraverseConnectionWhere(projectGlobalId),
+      outFields: 'OBJECTID',
+      returnGeometry: 'true',
+      resultRecordCount: String(HISTORY_QUERY_LIMIT),
+      f: 'json'
+    }).toString()
+
+    const response = await fetch(query.toString())
+    const data = await response.json() as QueryResponse
+    if (!response.ok || data.error) throw new Error(data.error?.message || response.statusText)
+
+    return (data.features || []).map((feature) => ({
+      objectId: getAttributeValue(feature.attributes || {}, 'OBJECTID'),
+      geometry: feature.geometry
+    })).filter((feature) => feature.objectId !== undefined && feature.objectId !== null)
+  }, [getTraverseConnectionWhere, traverseConnectionsUrl])
+
+  const queryTraverseConnectionExtent = React.useCallback(async (projectGlobalId: string) => {
+    if (!projectGlobalId) return null
+
+    const query = new URL(`${traverseConnectionsUrl}/query`)
+    query.search = new URLSearchParams({
+      where: getTraverseConnectionWhere(projectGlobalId),
+      returnExtentOnly: 'true',
+      f: 'json'
+    }).toString()
+
+    const response = await fetch(query.toString())
+    const data = await response.json() as QueryResponse & { extent?: any }
+    if (!response.ok || data.error) throw new Error(data.error?.message || response.statusText)
+    return data.extent || null
+  }, [getTraverseConnectionWhere, traverseConnectionsUrl])
+
+  const revealExistingTraverseConnections = React.useCallback(async (connections: ExistingTraverseConnectionSummary[], projectGlobalId: string) => {
+    if (connections.length === 0) return { layerFound: false, zoomed: false }
+
+    const view = jimuMapView?.view
+    if (!view) return { layerFound: false, zoomed: false }
+
+    const layers = await getTraverseConnectionMapLayers()
+    layers.forEach((layer) => {
+      layer.visible = true
+      if (layer.parent) layer.parent.visible = true
+    })
+
+    try {
+      const dataSources = await getRuntimeDataSources(traverseConnectionsUrl, traverseConnectionDataSourceIds)
+      const objectIds = connections.map((connection) => String(connection.objectId))
+      for (const dataSource of dataSources) {
+        try {
+          const jimuLayerView = jimuMapView?.getJimuLayerViewByDataSourceId?.(dataSource.id) ||
+            (dataSource ? await jimuMapView?.whenJimuLayerViewLoadedByDataSource?.(dataSource) : null)
+          jimuLayerView?.selectFeaturesByIds?.(objectIds)
+        } catch {
+          // Selection is helpful, but visibility and zoom are enough for preview.
+        }
+      }
+    } catch {
+      // Keep the preview path moving if table/map selection is unavailable.
+    }
+
+    const rawExtent = await queryTraverseConnectionExtent(projectGlobalId)
+    if (!rawExtent) return { layerFound: layers.length > 0, zoomed: false }
+
+    const [Extent] = await loadArcGISJSAPIModules(['esri/geometry/Extent'])
+    const extent = new Extent(rawExtent)
+    const target = extent.expand ? extent.expand(1.75) : extent
+    await view.goTo(target, {
+      duration: 1200,
+      padding: { top: 80, right: 80, bottom: 80, left: 80 }
+    })
+
+    return { layerFound: layers.length > 0, zoomed: true }
+  }, [
+    getRuntimeDataSources,
+    getTraverseConnectionMapLayers,
+    jimuMapView,
+    queryTraverseConnectionExtent,
+    traverseConnectionDataSourceIds,
+    traverseConnectionsUrl
+  ])
 
   const restoreProjectLayerFilters = () => {
     projectLayerFiltersRef.current.forEach((entry) => {
@@ -3111,6 +3476,63 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
   React.useEffect(() => {
     let cancelled = false
 
+    const previewExistingTraverseConnections = async () => {
+      if (mode !== 'traverse' || !selectedProject?.globalId) {
+        traverseConnectionsPreviewSignatureRef.current = ''
+        return
+      }
+
+      const signature = [
+        selectedProject.globalId,
+        traverseConnectionsUrl,
+        traverseProjectGlobalIdField
+      ].join('|')
+      if (traverseConnectionsPreviewSignatureRef.current === signature) return
+      traverseConnectionsPreviewSignatureRef.current = signature
+
+      try {
+        const existingTraverseConnections = await queryExistingTraverseConnections(selectedProject.globalId)
+        if (cancelled) return
+
+        if (existingTraverseConnections.length === 0) {
+          setStatus(m.existingTraverseConnectionsEmpty)
+          return
+        }
+
+        const revealResult = await revealExistingTraverseConnections(existingTraverseConnections, selectedProject.globalId)
+        if (cancelled) return
+
+        let existingConnectionStatus = `${m.existingTraverseConnectionsFound}: ${existingTraverseConnections.length}.`
+        if (!revealResult.layerFound) existingConnectionStatus += ` ${m.existingTraverseConnectionsLayerNotFound}`
+        setStatus(existingConnectionStatus)
+      } catch (err) {
+        if (cancelled) return
+        const message = err instanceof Error ? err.message : ''
+        setStatus(`${m.existingTraverseConnectionsQueryFailed} ${message || ''}`.trim())
+      }
+    }
+
+    previewExistingTraverseConnections().catch(() => undefined)
+
+    return () => {
+      cancelled = true
+    }
+  }, [
+    m.existingTraverseConnectionsEmpty,
+    m.existingTraverseConnectionsFound,
+    m.existingTraverseConnectionsLayerNotFound,
+    m.existingTraverseConnectionsQueryFailed,
+    mode,
+    queryExistingTraverseConnections,
+    revealExistingTraverseConnections,
+    selectedProject?.globalId,
+    traverseConnectionsUrl,
+    traverseProjectGlobalIdField
+  ])
+
+  React.useEffect(() => {
+    let cancelled = false
+
     const updateSelectedMapFeatures = async () => {
       if (!jimuMapView?.getSelectedFeatures) {
         setSelectedMapFeatures([])
@@ -3183,6 +3605,11 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
   }, [activeNewSearchPointId, existingMonumentRows, m.monumentGraphicsFailed, mode, multipleMonumentRows, newSearchPointRows, renderCsvProjectGraphics])
 
   React.useEffect(() => {
+    if (mode === 'traverse') return
+    traversePreviewGraphicsLayerRef.current?.removeAll?.()
+  }, [mode])
+
+  React.useEffect(() => {
     if (!isSurveyHistoryMode) return
     loadSelectedSurveyMonuments().catch(() => {
       setStatus(m.assignSurveySelectionFailed)
@@ -3235,6 +3662,8 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
   React.useEffect(() => () => {
     monumentGraphicsLayerRef.current?.removeAll?.()
     monumentGraphicsMapRef.current?.remove?.(monumentGraphicsLayerRef.current)
+    traversePreviewGraphicsLayerRef.current?.removeAll?.()
+    traversePreviewGraphicsMapRef.current?.remove?.(traversePreviewGraphicsLayerRef.current)
   }, [])
 
   const projectRow = (project: MonumentProjectSummary) => {
@@ -3362,40 +3791,405 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
     return m.noSurveyMonumentEdit
   }
 
-  const executeMergeWithRollback = React.useCallback(async (
-    runOperation: (registerRollback: (action: MergeRollbackAction) => void) => void | Promise<void>
-  ) => {
-    const rollbackActions: MergeRollbackAction[] = []
-    const registerRollback = (action: MergeRollbackAction) => {
-      rollbackActions.push(action)
+  const queryMergeHistoryBySourceGlobalIds = React.useCallback(async (sourceMonuments: SurveyMonumentSummary[]) => {
+    const sourceGlobalIds = sourceMonuments
+      .map((monument) => monument.globalId)
+      .filter((globalId): globalId is string => !!globalId)
+    const historyRowsBySourceGlobalId = new Map<string, MergeHistoryReassignment[]>()
+    if (sourceGlobalIds.length === 0) return historyRowsBySourceGlobalId
+
+    for (let offset = 0; offset < sourceGlobalIds.length; offset += MONUMENT_GLOBAL_ID_QUERY_CHUNK_SIZE) {
+      const batch = sourceGlobalIds.slice(offset, offset + MONUMENT_GLOBAL_ID_QUERY_CHUNK_SIZE)
+      const query = new URL(`${monumentHistoryUrl}/query`)
+      query.search = new URLSearchParams({
+        where: `${historyMonumentGlobalIdField} IN (${batch.map((globalId) => `'${escapeSqlString(formatGuidForEdit(globalId))}'`).join(',')})`,
+        outFields: [
+          'OBJECTID',
+          'PointNumber',
+          historyMonumentGlobalIdField
+        ].join(','),
+        returnGeometry: 'false',
+        resultRecordCount: String(HISTORY_QUERY_LIMIT),
+        f: 'json'
+      }).toString()
+
+      const response = await fetch(query.toString())
+      const data = await response.json() as QueryResponse
+      if (!response.ok || data.error) throw new Error(data.error?.message || response.statusText)
+
+      ;(data.features || []).forEach((feature) => {
+        const attributes = feature.attributes || {}
+        const sourceGlobalId = getStringAttribute(attributes, historyMonumentGlobalIdField)
+        const sourceKey = normalizeGuidKey(sourceGlobalId)
+        const sourceMonument = sourceMonuments.find((monument) => normalizeGuidKey(monument.globalId) === sourceKey)
+        if (!sourceMonument) return
+        historyRowsBySourceGlobalId.set(sourceKey, [
+          ...(historyRowsBySourceGlobalId.get(sourceKey) || []),
+          {
+            objectId: getAttributeValue(attributes, 'OBJECTID'),
+            pointNumber: getStringAttribute(attributes, 'PointNumber') || '-',
+            sourceGlobalId,
+            sourcePointNumber: sourceMonument.pointNumber,
+            sourceObjectId: sourceMonument.objectId
+          }
+        ])
+      })
     }
 
-    try {
-      await runOperation(registerRollback)
-    } catch (err) {
-      for (const action of [...rollbackActions].reverse()) {
-        try {
-          await action.run()
-        } catch (rollbackErr) {
-          const message = rollbackErr instanceof Error ? rollbackErr.message : m.mergeRollbackFailed
-          throw new Error(`${m.mergeRollbackFailed} ${action.label}: ${message}`)
-        }
-      }
-      throw err
-    }
-  }, [m.mergeRollbackFailed])
+    return historyRowsBySourceGlobalId
+  }, [historyMonumentGlobalIdField, monumentHistoryUrl])
 
-  const stageMergeAction = async (mergeType: MergeOperationType) => {
+  const buildTargetMergePlan = React.useCallback(async (): Promise<TargetMergePlan | null> => {
     if (!canMergeSurveyMonuments) {
       setStatus(m.mergeRequiresMultipleMonuments)
+      return null
+    }
+
+    const target = assignSurveyMonuments[0]
+    const sources = assignSurveyMonuments.slice(1)
+    const validations: FinalizeValidationMessage[] = []
+    if (!target.globalId) {
+      validations.push({ severity: 'error', pointId: target.pointNumber, message: m.targetMergeMissingTargetGlobalId })
+    }
+
+    sources.forEach((source) => {
+      if (!source.globalId) {
+        validations.push({ severity: 'error', pointId: source.pointNumber, message: m.targetMergeMissingSourceGlobalId })
+      }
+      if (source.objectId === undefined || source.objectId === null || source.objectId === '') {
+        validations.push({ severity: 'error', pointId: source.pointNumber, message: m.targetMergeMissingSourceObjectId })
+      }
+    })
+
+    const historiesBySourceGlobalId = await queryMergeHistoryBySourceGlobalIds(sources)
+    const sourceRows = sources.map((source) => {
+      const historyRows = historiesBySourceGlobalId.get(normalizeGuidKey(source.globalId)) || []
+      if (historyRows.length === 0) {
+        validations.push({ severity: 'warning', pointId: source.pointNumber, message: m.targetMergeZeroHistory })
+      }
+      return {
+        monument: source,
+        historyRows
+      }
+    })
+
+    const historyUpdateCount = sourceRows.reduce((total, row) => total + row.historyRows.length, 0)
+    const plan = {
+      target,
+      sources: sourceRows,
+      validations,
+      canCommit: validations.every((validation) => validation.severity !== 'error'),
+      historyUpdateCount,
+      sourceDeleteCount: sources.length,
+      zeroHistoryCount: sourceRows.filter((row) => row.historyRows.length === 0).length
+    }
+    return plan
+  }, [
+    assignSurveyMonuments,
+    canMergeSurveyMonuments,
+    m.mergeRequiresMultipleMonuments,
+    m.targetMergeMissingSourceGlobalId,
+    m.targetMergeMissingSourceObjectId,
+    m.targetMergeMissingTargetGlobalId,
+    m.targetMergeZeroHistory,
+    queryMergeHistoryBySourceGlobalIds
+  ])
+
+  const openTargetMergeReview = React.useCallback(async () => {
+    setBuildingTargetMergePlan(true)
+    setTargetMergeModalOpen(true)
+    try {
+      const plan = await buildTargetMergePlan()
+      setTargetMergePlan(plan)
+      if (plan) setStatus(`${m.targetMergePlanReady}: ${plan.sourceDeleteCount} ${m.surveyMonumentsLayer}, ${plan.historyUpdateCount} ${m.historyCountLabel}`)
+    } catch (err) {
+      const message = err instanceof Error ? err.message : m.targetMergePlanFailed
+      setTargetMergePlan(null)
+      setStatus(`${m.targetMergePlanFailed} ${message || ''}`.trim())
+    } finally {
+      setBuildingTargetMergePlan(false)
+    }
+  }, [buildTargetMergePlan, m.historyCountLabel, m.surveyMonumentsLayer, m.targetMergePlanFailed, m.targetMergePlanReady])
+
+  const applyTargetMergePlan = React.useCallback(async () => {
+    if (!targetMergePlan || !targetMergePlan.canCommit) return
+    const targetGlobalId = formatGuidForEdit(targetMergePlan.target.globalId)
+    const historyRows = targetMergePlan.sources.flatMap((row) => row.historyRows)
+    const sourceObjectIds = targetMergePlan.sources.map((row) => row.monument.objectId)
+
+    setApplyingTargetMerge(true)
+    try {
+      const historyLayer = await getMonumentHistoryLayer()
+      const surveyLayer = await getSurveyMonumentsLayer()
+
+      if (historyRows.length > 0) {
+        setStatus(m.targetMergeApplyingHistory)
+        const updateResults = await historyLayer.applyEdits({
+          updateFeatures: historyRows.map((row) => ({
+            attributes: {
+              OBJECTID: row.objectId,
+              [historyMonumentGlobalIdField]: targetGlobalId
+            }
+          }))
+        }, {
+          rollbackOnFailureEnabled: true
+        })
+        const updateError = getFailedEditResult(updateResults, 'updateFeatureResults', m.targetMergeFailed)
+        if (updateError) throw updateError
+      }
+
+      setStatus(m.targetMergeDeletingSources)
+      const deleteResults = await surveyLayer.applyEdits({
+        deleteFeatures: sourceObjectIds.map((objectId) => ({ attributes: { OBJECTID: objectId } }))
+      }, {
+        rollbackOnFailureEnabled: true
+      })
+      const deleteError = getFailedEditResult(deleteResults, 'deleteFeatureResults', m.targetMergeFailed)
+      if (deleteError) throw deleteError
+
+      setStatus(`${m.targetMergeComplete}: ${targetMergePlan.sourceDeleteCount} ${m.surveyMonumentsLayer}, ${targetMergePlan.historyUpdateCount} ${m.historyCountLabel}`)
+      setTargetMergeModalOpen(false)
+      setAssignSurveyMonuments([targetMergePlan.target])
+      setActiveAssignSurveyKey(getSurveyMonumentKey(targetMergePlan.target))
+      setAssignHistoryItems([])
+      await renderAssignSurveyMonumentGraphics([targetMergePlan.target], getSurveyMonumentKey(targetMergePlan.target))
+    } catch (err) {
+      const message = err instanceof Error ? err.message : m.targetMergeFailed
+      setStatus(`${m.targetMergeFailed} ${message || ''}`.trim())
+    } finally {
+      setApplyingTargetMerge(false)
+    }
+  }, [
+    getMonumentHistoryLayer,
+    getSurveyMonumentsLayer,
+    historyMonumentGlobalIdField,
+    m.historyCountLabel,
+    m.surveyMonumentsLayer,
+    m.targetMergeApplyingHistory,
+    m.targetMergeComplete,
+    m.targetMergeDeletingSources,
+    m.targetMergeFailed,
+    renderAssignSurveyMonumentGraphics,
+    targetMergePlan
+  ])
+
+  const queryMergeSurveyGeometriesByObjectIds = React.useCallback(async (monuments: SurveyMonumentSummary[]) => {
+    const objectIds = Array.from(new Set(monuments
+      .map((monument) => typeof monument.objectId === 'number' ? monument.objectId : Number(monument.objectId))
+      .filter((objectId) => Number.isFinite(objectId))))
+    const featuresByObjectId = new Map<string, { attributes: { [key: string]: any }, geometry?: any, spatialReference?: any }>()
+    if (objectIds.length === 0) return featuresByObjectId
+
+    for (let offset = 0; offset < objectIds.length; offset += MONUMENT_GLOBAL_ID_QUERY_CHUNK_SIZE) {
+      const ids = objectIds.slice(offset, offset + MONUMENT_GLOBAL_ID_QUERY_CHUNK_SIZE)
+      const query = new URL(`${surveyMonumentsUrl}/query`)
+      query.search = new URLSearchParams({
+        objectIds: ids.join(','),
+        outFields: 'OBJECTID',
+        returnGeometry: 'true',
+        f: 'json'
+      }).toString()
+
+      const response = await fetch(query.toString())
+      const data = await response.json() as QueryResponse
+      if (!response.ok || data.error) throw new Error(data.error?.message || response.statusText)
+
+      ;(data.features || []).forEach((feature) => {
+        const attributes = feature.attributes || {}
+        const objectId = getAttributeValue(attributes, 'OBJECTID')
+        if (objectId === undefined || objectId === null) return
+        featuresByObjectId.set(String(objectId), {
+          attributes,
+          geometry: feature.geometry,
+          spatialReference: data.spatialReference
+        })
+      })
+    }
+
+    return featuresByObjectId
+  }, [surveyMonumentsUrl])
+
+  const buildMeanMergePlan = React.useCallback(async (): Promise<MeanMergePlan | null> => {
+    const targetPlan = await buildTargetMergePlan()
+    if (!targetPlan) return null
+
+    const selectedMonuments = [targetPlan.target, ...targetPlan.sources.map((row) => row.monument)]
+    const featuresByObjectId = await queryMergeSurveyGeometriesByObjectIds(selectedMonuments)
+    const pointGeometries = selectedMonuments.map((monument) => {
+      const feature = featuresByObjectId.get(String(monument.objectId))
+      const geometry = feature?.geometry
+      if (!geometry) {
+        targetPlan.validations.push({ severity: 'error', pointId: monument.pointNumber, message: m.meanMergeMissingGeometry })
+        return null
+      }
+      const x = Number(geometry.x)
+      const y = Number(geometry.y)
+      if (!Number.isFinite(x) || !Number.isFinite(y)) {
+        targetPlan.validations.push({ severity: 'error', pointId: monument.pointNumber, message: m.meanMergeInvalidGeometry })
+        return null
+      }
+      return {
+        monument,
+        geometry,
+        x,
+        y,
+        spatialReference: geometry.spatialReference || feature?.spatialReference
+      }
+    })
+
+    const usableGeometries = pointGeometries.filter((item): item is NonNullable<typeof item> => !!item)
+    const targetGeometry = pointGeometries[0]
+    const meanX = usableGeometries.reduce((total, item) => total + item.x, 0) / Math.max(usableGeometries.length, 1)
+    const meanY = usableGeometries.reduce((total, item) => total + item.y, 0) / Math.max(usableGeometries.length, 1)
+    const meanGeometry = targetGeometry
+      ? {
+          ...targetGeometry.geometry,
+          x: meanX,
+          y: meanY,
+          spatialReference: targetGeometry.spatialReference || targetGeometry.geometry.spatialReference
+        }
+      : null
+
+    return {
+      ...targetPlan,
+      canCommit: targetPlan.validations.every((validation) => validation.severity !== 'error') && !!targetGeometry && !!meanGeometry,
+      targetOriginalGeometry: targetGeometry?.geometry,
+      meanGeometry,
+      meanX,
+      meanY,
+      targetOriginalX: targetGeometry?.x ?? Number.NaN,
+      targetOriginalY: targetGeometry?.y ?? Number.NaN
+    }
+  }, [
+    buildTargetMergePlan,
+    m.meanMergeInvalidGeometry,
+    m.meanMergeMissingGeometry,
+    queryMergeSurveyGeometriesByObjectIds
+  ])
+
+  const openMeanMergeReview = React.useCallback(async () => {
+    setBuildingMeanMergePlan(true)
+    setMeanMergeModalOpen(true)
+    try {
+      const plan = await buildMeanMergePlan()
+      setMeanMergePlan(plan)
+      if (plan) setStatus(`${m.meanMergePlanReady}: ${plan.sourceDeleteCount + 1} ${m.surveyMonumentsLayer}, ${plan.historyUpdateCount} ${m.historyCountLabel}`)
+    } catch (err) {
+      const message = err instanceof Error ? err.message : m.meanMergePlanFailed
+      setMeanMergePlan(null)
+      setStatus(`${m.meanMergePlanFailed} ${message || ''}`.trim())
+    } finally {
+      setBuildingMeanMergePlan(false)
+    }
+  }, [buildMeanMergePlan, m.historyCountLabel, m.meanMergePlanFailed, m.meanMergePlanReady, m.surveyMonumentsLayer])
+
+  const applyMeanMergePlan = React.useCallback(async () => {
+    if (!meanMergePlan || !meanMergePlan.canCommit) return
+    const targetGlobalId = formatGuidForEdit(meanMergePlan.target.globalId)
+    const historyRows = meanMergePlan.sources.flatMap((row) => row.historyRows)
+    const sourceObjectIds = meanMergePlan.sources.map((row) => row.monument.objectId)
+
+    setApplyingMeanMerge(true)
+    let targetMoved = false
+    let historyUpdated = false
+    try {
+      const historyLayer = await getMonumentHistoryLayer()
+      const surveyLayer = await getSurveyMonumentsLayer()
+
+      setStatus(m.meanMergeApplyingTarget)
+      const targetUpdateResults = await surveyLayer.applyEdits({
+        updateFeatures: [{
+          attributes: { OBJECTID: meanMergePlan.target.objectId },
+          geometry: meanMergePlan.meanGeometry
+        }]
+      }, {
+        rollbackOnFailureEnabled: true
+      })
+      const targetUpdateError = getFailedEditResult(targetUpdateResults, 'updateFeatureResults', m.meanMergeFailed)
+      if (targetUpdateError) throw targetUpdateError
+      targetMoved = true
+
+      if (historyRows.length > 0) {
+        setStatus(m.targetMergeApplyingHistory)
+        const updateResults = await historyLayer.applyEdits({
+          updateFeatures: historyRows.map((row) => ({
+            attributes: {
+              OBJECTID: row.objectId,
+              [historyMonumentGlobalIdField]: targetGlobalId
+            }
+          }))
+        }, {
+          rollbackOnFailureEnabled: true
+        })
+        const updateError = getFailedEditResult(updateResults, 'updateFeatureResults', m.meanMergeFailed)
+        if (updateError) throw updateError
+        historyUpdated = true
+      }
+
+      setStatus(m.targetMergeDeletingSources)
+      const deleteResults = await surveyLayer.applyEdits({
+        deleteFeatures: sourceObjectIds.map((objectId) => ({ attributes: { OBJECTID: objectId } }))
+      }, {
+        rollbackOnFailureEnabled: true
+      })
+      const deleteError = getFailedEditResult(deleteResults, 'deleteFeatureResults', m.meanMergeFailed)
+      if (deleteError) throw deleteError
+
+      const mergedTarget = { ...meanMergePlan.target }
+      setStatus(`${m.meanMergeComplete}: ${meanMergePlan.sourceDeleteCount} ${m.surveyMonumentsLayer}, ${meanMergePlan.historyUpdateCount} ${m.historyCountLabel}`)
+      setMeanMergeModalOpen(false)
+      setAssignSurveyMonuments([mergedTarget])
+      setActiveAssignSurveyKey(getSurveyMonumentKey(mergedTarget))
+      setAssignHistoryItems([])
+      await renderAssignSurveyMonumentGraphics([mergedTarget], getSurveyMonumentKey(mergedTarget))
+    } catch (err) {
+      if (targetMoved && !historyUpdated) {
+        try {
+          const surveyLayer = await getSurveyMonumentsLayer()
+          const rollbackResults = await surveyLayer.applyEdits({
+            updateFeatures: [{
+              attributes: { OBJECTID: meanMergePlan.target.objectId },
+              geometry: meanMergePlan.targetOriginalGeometry
+            }]
+          }, {
+            rollbackOnFailureEnabled: true
+          })
+          const rollbackError = getFailedEditResult(rollbackResults, 'updateFeatureResults', m.meanMergeTargetRollbackFailed)
+          if (rollbackError) throw rollbackError
+        } catch (rollbackErr) {
+          const message = rollbackErr instanceof Error ? rollbackErr.message : m.meanMergeTargetRollbackFailed
+          setStatus(`${m.meanMergeTargetRollbackFailed} ${message || ''}`.trim())
+          return
+        }
+      }
+
+      const message = err instanceof Error ? err.message : m.meanMergeFailed
+      setStatus(`${m.meanMergeFailed} ${message || ''}`.trim())
+    } finally {
+      setApplyingMeanMerge(false)
+    }
+  }, [
+    getMonumentHistoryLayer,
+    getSurveyMonumentsLayer,
+    historyMonumentGlobalIdField,
+    m.historyCountLabel,
+    m.meanMergeApplyingTarget,
+    m.meanMergeComplete,
+    m.meanMergeFailed,
+    m.meanMergeTargetRollbackFailed,
+    m.surveyMonumentsLayer,
+    m.targetMergeApplyingHistory,
+    m.targetMergeDeletingSources,
+    meanMergePlan,
+    renderAssignSurveyMonumentGraphics
+  ])
+
+  const stageMergeAction = async (mergeType: MergeOperationType) => {
+    if (mergeType === 'target') {
+      await openTargetMergeReview()
       return
     }
-    const targetMonument = assignSurveyMonuments[0]
-    const sourceMonuments = assignSurveyMonuments.slice(1)
-    const actionLabel = mergeType === 'target' ? m.targetMerge : m.meanMerge
-    await executeMergeWithRollback(() => {
-      setStatus(`${actionLabel}: ${targetMonument.pointNumber} <- ${sourceMonuments.length} monuments. ${m.mergeActionPending}`)
-    })
+    await openMeanMergeReview()
   }
 
   const resetProjectCsvImport = () => {
@@ -3582,7 +4376,7 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
         }))
       })
     }
-  }, [getMonumentProjectsLayer, m.selectProjectFirst, m.selectedProjectBoundaryFailed, m.selectedProjectBoundaryInside, m.selectedProjectBoundaryOutside, selectedProject])
+  }, [getMonumentProjectsLayer, getProjectWhere, m.selectProjectFirst, m.selectedProjectBoundaryFailed, m.selectedProjectBoundaryInside, m.selectedProjectBoundaryOutside, selectedProject])
 
   const analyzeProjectCsvResults = () => {
     const basePlan = buildCreateProjectPlan()
@@ -3610,6 +4404,42 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
     const failedResult = (results?.[resultKey] || []).find((result: any) => result?.error)
     return failedResult ? new Error(getEditErrorMessage(failedResult, fallbackMessage)) : null
   }
+
+  const getEditResultObjectIds = (results: any, resultKey: string) =>
+    (results?.[resultKey] || [])
+      .map((result: any) => result?.objectId)
+      .filter((objectId: any) => objectId !== undefined && objectId !== null)
+
+  const queryLayerFeaturesByObjectIds = async (layer: any, objectIds: Array<string | number>, returnGeometry = true) => {
+    const numericObjectIds = Array.from(new Set(objectIds
+      .map((objectId) => typeof objectId === 'number' ? objectId : Number(objectId))
+      .filter((objectId) => Number.isFinite(objectId))))
+    if (numericObjectIds.length === 0) return []
+    const query = layer.createQuery ? layer.createQuery() : {}
+    query.objectIds = numericObjectIds
+    query.outFields = ['*']
+    query.returnGeometry = returnGeometry
+    const result = await layer.queryFeatures(query)
+    return result?.features || []
+  }
+
+  const getLayerEditCapabilityIssues = React.useCallback((layer: any, label: string, requirements: { add?: boolean, update?: boolean, delete?: boolean }) => {
+    const operations = layer?.capabilities?.operations || {}
+    const issues: FinalizeValidationMessage[] = []
+    const addIssue = (operationLabel?: string) => {
+      issues.push({
+        severity: 'error',
+        message: `${m.finalizeProjectLayerNotEditable}: ${label}${operationLabel ? ` (${operationLabel})` : ''}`
+      })
+    }
+
+    if (!layer?.loaded) addIssue('not loaded')
+    if (layer?.editingEnabled === false || operations.supportsEditing === false) addIssue()
+    if (requirements.add && operations.supportsAdd === false) addIssue('add')
+    if (requirements.update && operations.supportsUpdate === false) addIssue('update')
+    if (requirements.delete && operations.supportsDelete === false) addIssue('delete')
+    return issues
+  }, [m.finalizeProjectLayerNotEditable])
 
   const stageCreateProjectFromCsv = async () => {
     const plan = createProjectPlan || buildCreateProjectPlan()
@@ -3743,7 +4573,8 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
           'OBJECTID',
           'GlobalID',
           historyMonumentGlobalIdField,
-          'PointNumber'
+          'PointNumber',
+          'Remarks'
         ].join(','),
         returnGeometry: 'false',
         resultRecordCount: String(HISTORY_QUERY_LIMIT),
@@ -3765,7 +4596,8 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
             objectId: getAttributeValue(attributes, 'OBJECTID'),
             globalId: getStringAttribute(attributes, 'GlobalID'),
             pointGlobalId: getStringAttribute(attributes, historyMonumentGlobalIdField),
-            pointNumber
+            pointNumber,
+            remarks: getStringAttribute(attributes, 'Remarks')
           }
         ])
       })
@@ -3821,7 +4653,23 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
 
     if (!projectGlobalId) {
       validations.push({ severity: 'error', message: m.selectProjectFirst })
-      return { edits, validations, counts, canCommit: false }
+      return { edits, validations, counts, canCommit: false, existingTraverseConnections: [] }
+    }
+
+    try {
+      const [traverseLayer, surveyLayer, historyLayer] = await Promise.all([
+        getTraverseConnectionsLayer(),
+        getSurveyMonumentsLayer(),
+        getMonumentHistoryLayer()
+      ])
+      validations.push(
+        ...getLayerEditCapabilityIssues(traverseLayer, m.traverseConnectionsLayer, { add: true, delete: true }),
+        ...getLayerEditCapabilityIssues(surveyLayer, m.surveyMonumentsLayer, { add: true, update: true }),
+        ...getLayerEditCapabilityIssues(historyLayer, m.monumentHistoryTable, { add: true, update: true })
+      )
+    } catch (err) {
+      const message = err instanceof Error ? err.message : m.finalizeProjectPreflightFailed
+      validations.push({ severity: 'error', message: `${m.finalizeProjectPreflightFailed} ${message || ''}`.trim() })
     }
 
     traverseData.monuments.forEach((monument) => {
@@ -3852,6 +4700,16 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
       .map((history) => history.pointGlobalId)
       .filter(Boolean)
     const surveyMonumentsByGlobalId = await queryFinalizeSurveyMonumentsByGlobalIds(historyPointGlobalIds)
+    const existingTraverseConnections = await queryExistingTraverseConnections(projectGlobalId)
+
+    existingTraverseConnections.forEach((connection) => {
+      edits.push({
+        kind: 'delete-traverse-connection',
+        label: `${m.finalizeDeleteTraverseConnection}: ${connection.objectId}`,
+        objectId: connection.objectId
+      })
+      countFinalizeEdit(counts, 'delete-traverse-connection')
+    })
 
     traverseData.monuments.forEach((monument) => {
       const historyRecords = historiesByPointNumber.get(monument.pointId.trim().toLowerCase()) || []
@@ -3863,19 +4721,27 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
         })
       }
 
-      const historyAttributes = {
-        PointNumber: monument.pointId,
+      const historyUpdateAttributes = {
         StdDevN: monument.stdDevN,
         StdDevE: monument.stdDevE,
         StdDevElev: monument.stdDevElev,
         FixedStation: monument.fixedStation ? 1 : 0,
         XCoordinate: monument.easting,
         YCoordinate: monument.northing,
-        ProjectGlobalID: projectGlobalId,
+        ProjectGlobalID: projectGlobalId
+      }
+      const historyCreateAttributes = {
+        ...historyUpdateAttributes,
+        PointNumber: monument.pointId,
         Remarks: monument.description
       }
       const geometry = hasCoordinatePair(monument)
-        ? { x: monument.easting, y: monument.northing }
+        ? {
+            type: 'point',
+            x: monument.easting,
+            y: monument.northing,
+            spatialReference: ORANGE_COUNTY_STATE_PLANE_SPATIAL_REFERENCE
+          }
         : undefined
 
       if (historyRecords.length > 0) {
@@ -3886,7 +4752,10 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
             pointId: monument.pointId,
             objectId: history.objectId,
             globalId: history.globalId,
-            attributes: historyAttributes
+            attributes: {
+              ...historyUpdateAttributes,
+              Remarks: appendDelimitedText(history.remarks, monument.description)
+            }
           })
           countFinalizeEdit(counts, 'update-history')
         })
@@ -3926,7 +4795,7 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
           kind: 'create-history',
           label: `${m.finalizeCreateHistory}: ${monument.pointId}`,
           pointId: monument.pointId,
-          attributes: historyAttributes
+          attributes: historyCreateAttributes
         })
         countFinalizeEdit(counts, 'create-history')
         if (geometry) {
@@ -3953,10 +4822,23 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
         kind: 'create-traverse-connection',
         label: `${m.finalizeCreateTraverseConnection}: ${connection.fromPointNum}-${connection.toPointNum}`,
         pointId: `${connection.fromPointNum}-${connection.toPointNum}`,
+        geometry: connection.fromPointE !== undefined &&
+          connection.fromPointN !== undefined &&
+          connection.toPointE !== undefined &&
+          connection.toPointN !== undefined
+          ? {
+              type: 'polyline',
+              paths: [[
+                [connection.fromPointE, connection.fromPointN],
+                [connection.toPointE, connection.toPointN]
+              ]],
+              spatialReference: ORANGE_COUNTY_STATE_PLANE_SPATIAL_REFERENCE
+            }
+          : undefined,
         attributes: {
-          ProjectID: projectGlobalId,
-          FromPointNum: connection.fromPointNum,
-          ToPointNum: connection.toPointNum,
+          [traverseProjectGlobalIdField]: projectGlobalId,
+          [traverseFromPointNumberField]: connection.fromPointNum,
+          [traverseToPointNumberField]: connection.toPointNum,
           FromPointN: connection.fromPointN,
           FromPointE: connection.fromPointE,
           ToPointN: connection.toPointN,
@@ -3977,25 +4859,309 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
       edits,
       validations,
       counts,
-      canCommit: validations.every((validation) => validation.severity !== 'error')
+      canCommit: validations.every((validation) => validation.severity !== 'error'),
+      existingTraverseConnections
     }
   }, [
     m.finalizeBackfillHistory,
     m.finalizeCreateHistory,
     m.finalizeCreateSurveyMonument,
     m.finalizeCreateTraverseConnection,
+    m.finalizeDeleteTraverseConnection,
     m.finalizeDryRunOnly,
     m.finalizeDuplicateHistory,
+    m.finalizeProjectPreflightFailed,
     m.finalizeUpdateHistory,
     m.finalizeUpdateSurveyMonument,
+    m.monumentHistoryTable,
     m.selectProjectFirst,
+    m.surveyMonumentsLayer,
+    m.traverseConnectionsLayer,
     m.traverseConnectionMissingCoordinates,
     m.traverseMissingCoordinates,
+    getLayerEditCapabilityIssues,
+    getMonumentHistoryLayer,
+    getSurveyMonumentsLayer,
+    getTraverseConnectionsLayer,
     monumentPointNumberField,
+    queryExistingTraverseConnections,
     queryFinalizeHistoryByPointNumbers,
     queryFinalizeSurveyMonumentsByGlobalIds,
     selectedProject?.globalId,
+    traverseFromPointNumberField,
+    traverseProjectGlobalIdField,
+    traverseToPointNumberField,
     traverseConnectionsUrl
+  ])
+
+  const applyFinalizeProjectEdits = React.useCallback(async () => {
+    if (!finalizePlan || !finalizePlan.canCommit || !selectedProject) {
+      setStatus(m.finalizePlanEmpty)
+      return
+    }
+
+    const traverseRollbackSteps: Array<() => Promise<void>> = []
+    const surveyRollbackSteps: Array<() => Promise<void>> = []
+    let historyTableTouched = false
+    let finalizePhase: 'traverse' | 'survey' | 'history' = 'traverse'
+
+    setFinalizingProject(true)
+    setStatus(m.finalizeProjectApplying)
+    setFinalizeConfirmOpen(false)
+
+    try {
+      const traverseLayer = await getTraverseConnectionsLayer()
+      const surveyLayer = await getSurveyMonumentsLayer()
+      const historyLayer = await getMonumentHistoryLayer()
+
+      const deleteTraverseEdits = finalizePlan.edits.filter((edit) => edit.kind === 'delete-traverse-connection' && edit.objectId !== undefined)
+      const createTraverseEdits = finalizePlan.edits.filter((edit) => edit.kind === 'create-traverse-connection' && edit.geometry)
+      const updateSurveyEdits = finalizePlan.edits.filter((edit) => edit.kind === 'update-survey-monument' && edit.objectId !== undefined && edit.geometry)
+      const createSurveyEdits = finalizePlan.edits.filter((edit) => edit.kind === 'create-survey-monument' && edit.geometry)
+      const updateHistoryEdits = finalizePlan.edits.filter((edit) => edit.kind === 'update-history' && edit.objectId !== undefined)
+      const createHistoryEdits = finalizePlan.edits.filter((edit) => edit.kind === 'create-history')
+      const backfillHistoryEdits = finalizePlan.edits.filter((edit) => edit.kind === 'backfill-history-relationship')
+
+      if (deleteTraverseEdits.length > 0 || createTraverseEdits.length > 0) {
+        setStatus(m.finalizeProjectReplacingTraverse)
+      }
+
+      if (deleteTraverseEdits.length > 0) {
+        const deleteObjectIds = deleteTraverseEdits.map((edit) => edit.objectId as string | number)
+        const originalTraverseFeatures = await queryLayerFeaturesByObjectIds(traverseLayer, deleteObjectIds)
+        const deleteResults = await traverseLayer.applyEdits({
+          deleteFeatures: deleteObjectIds.map((objectId) => ({ attributes: { OBJECTID: objectId } }))
+        }, {
+          rollbackOnFailureEnabled: true
+        })
+        const deleteError = getFailedEditResult(deleteResults, 'deleteFeatureResults', m.finalizeProjectFailed)
+        if (deleteError) throw deleteError
+        traverseRollbackSteps.push(async () => {
+          if (originalTraverseFeatures.length === 0) return
+          await traverseLayer.applyEdits({
+            addFeatures: originalTraverseFeatures.map((feature: any) => ({
+              geometry: feature.geometry,
+              attributes: stripSystemEditAttributes(feature.attributes || {}, traverseLayer)
+            }))
+          }, {
+            rollbackOnFailureEnabled: true
+          })
+        })
+      }
+
+      if (createTraverseEdits.length > 0) {
+        const createResults = await traverseLayer.applyEdits({
+          addFeatures: createTraverseEdits.map((edit) => ({
+            geometry: edit.geometry,
+            attributes: edit.attributes || {}
+          }))
+        }, {
+          rollbackOnFailureEnabled: true
+        })
+        const createError = getFailedEditResult(createResults, 'addFeatureResults', m.finalizeProjectFailed)
+        if (createError) throw createError
+        const createdObjectIds = getEditResultObjectIds(createResults, 'addFeatureResults')
+        traverseRollbackSteps.push(async () => {
+          if (createdObjectIds.length === 0) return
+          await traverseLayer.applyEdits({
+            deleteFeatures: createdObjectIds.map((objectId: number | string) => ({ attributes: { OBJECTID: objectId } }))
+          }, {
+            rollbackOnFailureEnabled: true
+          })
+        })
+      }
+
+      finalizePhase = 'survey'
+
+      if (updateSurveyEdits.length > 0 || createSurveyEdits.length > 0) {
+        setStatus(m.finalizeProjectUpdatingSurvey)
+      }
+
+      if (updateSurveyEdits.length > 0) {
+        const updateObjectIds = updateSurveyEdits.map((edit) => edit.objectId as string | number)
+        const originalSurveyFeatures = await queryLayerFeaturesByObjectIds(surveyLayer, updateObjectIds)
+        const updateResults = await surveyLayer.applyEdits({
+          updateFeatures: updateSurveyEdits.map((edit) => ({
+            geometry: edit.geometry,
+            attributes: { OBJECTID: edit.objectId }
+          }))
+        }, {
+          rollbackOnFailureEnabled: true
+        })
+        const updateError = getFailedEditResult(updateResults, 'updateFeatureResults', m.finalizeProjectFailed)
+        if (updateError) throw updateError
+        surveyRollbackSteps.push(async () => {
+          if (originalSurveyFeatures.length === 0) return
+          await surveyLayer.applyEdits({
+            updateFeatures: originalSurveyFeatures.map((feature: any) => ({
+              geometry: feature.geometry,
+              attributes: {
+                ...(feature.attributes || {}),
+                OBJECTID: getAttributeValue(feature.attributes || {}, 'OBJECTID')
+              }
+            }))
+          }, {
+            rollbackOnFailureEnabled: true
+          })
+        })
+      }
+
+      const createdSurveyGlobalIdsByPointId = new Map<string, string>()
+      if (createSurveyEdits.length > 0) {
+        const createResults = await surveyLayer.applyEdits({
+          addFeatures: createSurveyEdits.map((edit) => ({
+            geometry: edit.geometry,
+            attributes: edit.attributes || {}
+          }))
+        }, {
+          rollbackOnFailureEnabled: true
+        })
+        const createError = getFailedEditResult(createResults, 'addFeatureResults', m.finalizeProjectFailed)
+        if (createError) throw createError
+        const createdObjectIds = getEditResultObjectIds(createResults, 'addFeatureResults')
+        surveyRollbackSteps.push(async () => {
+          if (createdObjectIds.length === 0) return
+          await surveyLayer.applyEdits({
+            deleteFeatures: createdObjectIds.map((objectId: number | string) => ({ attributes: { OBJECTID: objectId } }))
+          }, {
+            rollbackOnFailureEnabled: true
+          })
+        })
+
+        const createdSurveyFeatures = await queryLayerFeaturesByObjectIds(surveyLayer, createdObjectIds, false)
+        createdSurveyFeatures.forEach((feature: any) => {
+          const attributes = feature.attributes || {}
+          const pointNumber = getStringAttribute(attributes, monumentPointNumberField)
+          const globalId = getStringAttribute(attributes, monumentGlobalIdField)
+          if (pointNumber && globalId) createdSurveyGlobalIdsByPointId.set(pointNumber.trim().toLowerCase(), globalId)
+        })
+      }
+
+      finalizePhase = 'history'
+
+      if (updateHistoryEdits.length > 0 || createHistoryEdits.length > 0 || backfillHistoryEdits.length > 0) {
+        setStatus(m.finalizeProjectUpdatingHistory)
+      }
+
+      const createdHistoryObjectIdsByPointId = new Map<string, number | string>()
+      if (updateHistoryEdits.length > 0) {
+        historyTableTouched = true
+        const updateResults = await historyLayer.applyEdits({
+          updateFeatures: updateHistoryEdits.map((edit) => ({
+            attributes: {
+              ...(edit.attributes || {}),
+              OBJECTID: edit.objectId
+            }
+          }))
+        }, {
+          rollbackOnFailureEnabled: true
+        })
+        const updateError = getFailedEditResult(updateResults, 'updateFeatureResults', m.finalizeProjectFailed)
+        if (updateError) throw updateError
+      }
+
+      if (createHistoryEdits.length > 0) {
+        historyTableTouched = true
+        const createResults = await historyLayer.applyEdits({
+          addFeatures: createHistoryEdits.map((edit) => ({
+            attributes: edit.attributes || {}
+          }))
+        }, {
+          rollbackOnFailureEnabled: true
+        })
+        const createError = getFailedEditResult(createResults, 'addFeatureResults', m.finalizeProjectFailed)
+        if (createError) throw createError
+        ;(createResults.addFeatureResults || []).forEach((result: any, index: number) => {
+          const pointId = createHistoryEdits[index]?.pointId
+          if (pointId && result?.objectId !== undefined && result?.objectId !== null) {
+            createdHistoryObjectIdsByPointId.set(pointId.trim().toLowerCase(), result.objectId)
+          }
+        })
+      }
+
+      const backfillUpdates = backfillHistoryEdits.map((edit) => {
+        const pointKey = (edit.pointId || '').trim().toLowerCase()
+        const historyObjectId = edit.objectId ?? createdHistoryObjectIdsByPointId.get(pointKey)
+        const surveyGlobalId = createdSurveyGlobalIdsByPointId.get(pointKey)
+        if (historyObjectId === undefined || historyObjectId === null || !surveyGlobalId) return null
+        return {
+          attributes: {
+            OBJECTID: historyObjectId,
+            [historyMonumentGlobalIdField]: formatGuidForEdit(surveyGlobalId)
+          }
+        }
+      }).filter(Boolean)
+
+      if (backfillUpdates.length > 0) {
+        historyTableTouched = true
+        const backfillResults = await historyLayer.applyEdits({
+          updateFeatures: backfillUpdates
+        }, {
+          rollbackOnFailureEnabled: true
+        })
+        const backfillError = getFailedEditResult(backfillResults, 'updateFeatureResults', m.finalizeProjectFailed)
+        if (backfillError) throw backfillError
+      }
+
+      setStatus(`${m.finalizeProjectComplete}: ${finalizePlan.edits.length} ${m.plannedEditsLabel}`)
+      traversePreviewGraphicsLayerRef.current?.removeAll?.()
+      setValidationModalOpen(false)
+      setFinalizeConfirmOpen(false)
+      if (selectedProject) loadProjectHistory(selectedProject).catch(() => undefined)
+      if (selectedProject.globalId) {
+        const refreshedConnections = await queryExistingTraverseConnections(selectedProject.globalId)
+        await revealExistingTraverseConnections(refreshedConnections, selectedProject.globalId)
+      }
+      if (parsedTraverseData) {
+        const refreshedPlan = await buildFinalizePlan(parsedTraverseData)
+        setFinalizePlan(refreshedPlan)
+      }
+    } catch (err) {
+      try {
+        const rollbackSteps = finalizePhase === 'traverse'
+          ? traverseRollbackSteps
+          : finalizePhase === 'survey'
+            ? surveyRollbackSteps
+            : []
+        for (const rollbackStep of [...rollbackSteps].reverse()) {
+          await rollbackStep()
+        }
+      } catch (rollbackErr) {
+        const message = rollbackErr instanceof Error ? rollbackErr.message : m.finalizeProjectRollbackFailed
+        setStatus(`${m.finalizeProjectRollbackFailed} ${message || ''}`.trim())
+        return
+      }
+
+      const message = err instanceof Error ? err.message : m.finalizeProjectFailed
+      const tableWarning = historyTableTouched ? ` ${m.finalizeProjectTableRollbackLimited}` : ''
+      setStatus(`${m.finalizeProjectFailed} ${message || ''}${tableWarning}`.trim())
+    } finally {
+      setFinalizingProject(false)
+    }
+  }, [
+    finalizePlan,
+    getMonumentHistoryLayer,
+    getSurveyMonumentsLayer,
+    getTraverseConnectionsLayer,
+    historyMonumentGlobalIdField,
+    loadProjectHistory,
+    m.finalizePlanEmpty,
+    m.finalizeProjectApplying,
+    m.finalizeProjectComplete,
+    m.finalizeProjectFailed,
+    m.finalizeProjectRollbackFailed,
+    m.finalizeProjectTableRollbackLimited,
+    m.finalizeProjectReplacingTraverse,
+    m.finalizeProjectUpdatingHistory,
+    m.finalizeProjectUpdatingSurvey,
+    m.plannedEditsLabel,
+    monumentGlobalIdField,
+    monumentPointNumberField,
+    queryExistingTraverseConnections,
+    revealExistingTraverseConnections,
+    selectedProject,
+    parsedTraverseData,
+    buildFinalizePlan
   ])
 
   const buildPointNumberPlan = React.useCallback(async (): Promise<PointNumberPlan | null> => {
@@ -4230,19 +5396,31 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
     setLoadingTraverseFiles(true)
     try {
       const parsedFiles = await Promise.all(incomingFiles.map(parseTraverseFile))
+      const previewData = buildParsedTraverseDataFromFiles(parsedFiles, staticFiles.length === 0)
+      const generatedPreviewCount = await renderGeneratedTraverseConnectionGraphics(previewData.connections, true)
       setTraverseFiles(parsedFiles)
-      setParsedTraverseData(null)
+      setParsedTraverseData(previewData)
       setParsedStaticData(null)
       setFinalizePlan(null)
       setValidationModalOpen(false)
-      setStatus(getProjectFileNameValidationStatus(parsedFiles) || `${m.traverseParsed}: ${parsedFiles.length}`)
+      const fileStatus = getProjectFileNameValidationStatus(parsedFiles) || `${m.traverseParsed}: ${parsedFiles.length}`
+      const previewStatus = generatedPreviewCount > 0 ? ` ${m.generatedTraversePreviewDrawn}: ${generatedPreviewCount}.` : ''
+      setStatus(`${fileStatus}. ${m.traversePreviewReady}: ${previewData.connections.length}.${previewStatus}`)
     } catch (err) {
       const message = err instanceof Error ? err.message : m.traverseParseFailed
       setStatus(`${m.traverseParseFailed} ${message || ''}`.trim())
     } finally {
       setLoadingTraverseFiles(false)
     }
-  }, [getProjectFileNameValidationStatus, m.traverseParsed, m.traverseParseFailed])
+  }, [
+    getProjectFileNameValidationStatus,
+    m.generatedTraversePreviewDrawn,
+    m.traverseParsed,
+    m.traverseParseFailed,
+    m.traversePreviewReady,
+    renderGeneratedTraverseConnectionGraphics,
+    staticFiles.length
+  ])
 
   const importStaticFile = React.useCallback(async (file?: File) => {
     if (!file) return
@@ -4250,11 +5428,13 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
     setLoadingTraverseFiles(true)
     try {
       const parsedFile = await parseTraverseFile(file)
+      const parsedStaticFile = parseStaticText(parsedFile.text, parsedFile.id, parsedFile.name)
       setStaticFiles([parsedFile])
-      setBasisOfBearing(parsedFile.basisOfBearing || '')
+      setBasisOfBearing(parsedStaticFile.basisOfBearing || parsedFile.basisOfBearing || '')
       setParsedTraverseData(null)
-      setParsedStaticData(null)
+      setParsedStaticData(parsedStaticFile)
       setFinalizePlan(null)
+      traversePreviewGraphicsLayerRef.current?.removeAll?.()
       setValidationModalOpen(false)
       setStatus(getProjectFileNameValidationStatus([parsedFile]) || `${m.traverseParsed}: 1`)
     } catch (err) {
@@ -4270,41 +5450,17 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
     setParsedTraverseData(null)
     setParsedStaticData(null)
     setFinalizePlan(null)
+    traversePreviewGraphicsLayerRef.current?.removeAll?.()
     setValidationModalOpen(false)
     setStatus(m.traverseFilesReset)
   }
 
   const stageProcessTraverseFiles = async () => {
     setLoadingTraverseFiles(true)
-    const fileResults = traverseFiles.map((file) => parseTraverseText(file.text, file.id, file.name, staticFiles.length === 0))
-    const monumentsByPointId = new Map<string, ParsedTraverseMonument>()
-    const fixedStations = new Set<string>()
-
-    fileResults.forEach((result) => {
-      result.fixedStations.forEach((pointId) => fixedStations.add(pointId))
-      result.monuments.forEach((monument) => {
-        if (!monumentsByPointId.has(monument.pointId)) monumentsByPointId.set(monument.pointId, monument)
-      })
-    })
-    fixedStations.forEach((pointId) => {
-      const monument = monumentsByPointId.get(pointId)
-      if (monument) monument.fixedStation = true
-    })
-    const enrichedFileResults = fileResults.map((result) => ({
-      ...result,
-      connections: enrichTraverseConnections(result.connections, monumentsByPointId)
-    }))
-    const connections = enrichedFileResults.flatMap((result) => result.connections)
-    const calculatedConnectionCount = connections.filter((connection) =>
+    const parsedData = buildParsedTraverseDataFromFiles(traverseFiles, staticFiles.length === 0)
+    const calculatedConnectionCount = parsedData.connections.filter((connection) =>
       connection.distance !== undefined && connection.direction !== undefined
     ).length
-
-    const parsedData = {
-      monuments: Array.from(monumentsByPointId.values()),
-      connections,
-      fixedStations: Array.from(fixedStations),
-      files: enrichedFileResults
-    }
     try {
       const plan = await buildFinalizePlan(parsedData)
       await createFinalizeStepRunner([{
@@ -4314,7 +5470,15 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
       }])
       setParsedTraverseData(parsedData)
       setFinalizePlan(plan)
-      setStatus(`${m.traverseProcessed}: ${parsedData.monuments.length} ${m.traverseMonumentsLabel}, ${parsedData.connections.length} ${m.traverseConnectionsLabel}, ${calculatedConnectionCount} ${m.traverseCalculatedLabel}, ${parsedData.fixedStations.length} ${m.fixedStationsLabel}. ${m.finalizePlanReady}: ${plan.edits.length}`)
+      let existingConnectionStatus = ''
+      if (selectedProject?.globalId && plan.existingTraverseConnections.length > 0) {
+        const revealResult = await revealExistingTraverseConnections(plan.existingTraverseConnections, selectedProject.globalId)
+        existingConnectionStatus = ` ${m.existingTraverseConnectionsFound}: ${plan.existingTraverseConnections.length}.`
+        if (!revealResult.layerFound) existingConnectionStatus += ` ${m.existingTraverseConnectionsLayerNotFound}`
+      }
+      const generatedPreviewCount = await renderGeneratedTraverseConnectionGraphics(parsedData.connections, true)
+      const generatedPreviewStatus = generatedPreviewCount > 0 ? ` ${m.generatedTraversePreviewDrawn}: ${generatedPreviewCount}.` : ''
+      setStatus(`${m.traverseProcessed}: ${parsedData.monuments.length} ${m.traverseMonumentsLabel}, ${parsedData.connections.length} ${m.traverseConnectionsLabel}, ${calculatedConnectionCount} ${m.traverseCalculatedLabel}, ${parsedData.fixedStations.length} ${m.fixedStationsLabel}.${existingConnectionStatus}${generatedPreviewStatus} ${m.finalizePlanReady}: ${plan.edits.length}`)
     } catch (err) {
       const message = err instanceof Error ? err.message : m.finalizePlanFailed
       setFinalizePlan(null)
@@ -4330,6 +5494,7 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
     setParsedTraverseData(null)
     setParsedStaticData(null)
     setFinalizePlan(null)
+    traversePreviewGraphicsLayerRef.current?.removeAll?.()
     setValidationModalOpen(false)
     setStatus(m.staticFileReset)
   }
@@ -5089,7 +6254,7 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
             type: 'primary',
             size: 'sm',
             style: modeActionButtonStyle,
-            disabled: !canMergeSurveyMonuments,
+            disabled: buildingTargetMergePlan || applyingTargetMerge || buildingMeanMergePlan || applyingMeanMerge || !canMergeSurveyMonuments,
             onClick: () => {
               stageMergeAction('target').catch((err) => {
                 const message = err instanceof Error ? err.message : m.mergeRollbackFailed
@@ -5101,7 +6266,7 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
             type: 'primary',
             size: 'sm',
             style: modeActionButtonStyle,
-            disabled: !canMergeSurveyMonuments,
+            disabled: buildingTargetMergePlan || applyingTargetMerge || buildingMeanMergePlan || applyingMeanMerge || !canMergeSurveyMonuments,
             onClick: () => {
               stageMergeAction('mean').catch((err) => {
                 const message = err instanceof Error ? err.message : m.mergeRollbackFailed
@@ -5603,6 +6768,244 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
       }, applyingPointNumbers ? m.updatePointNumber : m.applyPointNumbers)
     ))
 
+  const targetMergeModal = () =>
+    h(Modal, {
+      isOpen: targetMergeModalOpen,
+      toggle: () => {
+        if (!applyingTargetMerge) setTargetMergeModalOpen(false)
+      },
+      centered: true,
+      backdrop: 'static',
+      style: { width: 860, maxWidth: 'calc(100vw - 2rem)' }
+    },
+    h(ModalHeader, {
+      toggle: applyingTargetMerge
+        ? undefined
+        : () => {
+            setTargetMergeModalOpen(false)
+          }
+    }, m.targetMergeReviewTitle),
+    h(ModalBody, null,
+      h('div', { className: 'd-flex flex-column', style: { gap: '0.75rem', maxHeight: '68vh', minHeight: 360 } },
+        buildingTargetMergePlan
+          ? h('div', { style: { fontSize: 12, opacity: 0.75 } }, m.targetMergePlanBuilding)
+          : !targetMergePlan
+            ? h('div', { style: { fontSize: 12, opacity: 0.75 } }, m.targetMergePlanEmpty)
+            : h(React.Fragment, null,
+              h('div', { className: 'd-flex flex-wrap', style: { gap: '0.5rem' } },
+                validationCountTile(m.targetMergeTotalSurveyMonuments, targetMergePlan.sourceDeleteCount + 1),
+                validationCountTile(m.targetMergeSourcesTitle, targetMergePlan.sourceDeleteCount),
+                validationCountTile(m.targetMergeHistoryTitle, targetMergePlan.historyUpdateCount),
+                validationCountTile(m.errorsLabel, targetMergePlan.validations.filter((validation) => validation.severity === 'error').length),
+                validationCountTile(m.warningsLabel, targetMergePlan.validations.filter((validation) => validation.severity === 'warning').length)
+              ),
+              h('div', null,
+                h('div', { className: 'font-weight-bold mb-1', style: { fontSize: 12 } }, m.targetMergeTargetTitle),
+                validationHeaderRow([m.objectIdLabel, m.pointNumberLabel, 'GlobalID', m.statusLabel]),
+                validationDataRow([
+                  targetMergePlan.target.objectId,
+                  targetMergePlan.target.pointNumber,
+                  targetMergePlan.target.globalId || '-',
+                  m.readyLabel
+                ], 'target-merge-target')
+              ),
+              h('div', null,
+                h('div', { className: 'font-weight-bold mb-1', style: { fontSize: 12 } }, m.targetMergeSourcesTitle),
+                validationHeaderRow([m.objectIdLabel, m.pointNumberLabel, 'GlobalID', m.targetMergeHistoryRecordsLabel, m.actionLabel]),
+                ...targetMergePlan.sources.map((row) =>
+                  validationDataRow([
+                    row.monument.objectId,
+                    row.monument.pointNumber,
+                    row.monument.globalId || '-',
+                    row.historyRows.length,
+                    m.removeSurveyMonument
+                  ], `target-merge-source-${row.monument.objectId}`)
+                )
+              ),
+              h('div', null,
+                h('div', { className: 'font-weight-bold mb-1', style: { fontSize: 12 } }, m.targetMergeHistoryTitle),
+                targetMergePlan.historyUpdateCount === 0
+                  ? h('div', { style: { fontSize: 12, opacity: 0.75 } }, m.assignHistoryEmpty)
+                  : h(React.Fragment, null,
+                    validationHeaderRow([m.objectIdLabel, m.historyPointNumberLabel, m.sourceListLabel, m.actionLabel]),
+                    ...targetMergePlan.sources.flatMap((sourceRow) =>
+                      sourceRow.historyRows.map((historyRow) =>
+                        validationDataRow([
+                          historyRow.objectId,
+                          historyRow.pointNumber,
+                          `${historyRow.sourcePointNumber} (${m.objectIdLabel} ${historyRow.sourceObjectId})`,
+                          `${historyMonumentGlobalIdField} -> ${targetMergePlan.target.pointNumber}`
+                        ], `target-merge-history-${historyRow.objectId}`)
+                      )
+                    )
+                  )
+              ),
+              h('div', null,
+                h('div', { className: 'font-weight-bold mb-1', style: { fontSize: 12 } }, m.validationLabel),
+                targetMergePlan.validations.length === 0
+                  ? h('div', { style: { fontSize: 12, opacity: 0.75 } }, m.noValidationIssues)
+                  : targetMergePlan.validations.map((validation, index) =>
+                    h('div', {
+                      key: `${validation.severity}-${validation.pointId || index}`,
+                      className: 'py-1',
+                      style: {
+                        fontSize: 12,
+                        borderBottom: '1px solid rgba(0, 0, 0, 0.06)',
+                        color: validation.severity === 'error' ? 'var(--danger-600, #c92a2a)' : validation.severity === 'warning' ? 'var(--warning-700, #8a5a00)' : undefined
+                      }
+                    },
+                    h('div', { style: { fontWeight: 700 } }, validation.severity.toUpperCase()),
+                    h('div', null, `${validation.pointId ? `${validation.pointId} - ` : ''}${validation.message}`)
+                    )
+                  )
+              )
+            )
+      )
+    ),
+    h(ModalFooter, null,
+      h(Button, {
+        type: 'default',
+        disabled: applyingTargetMerge,
+        onClick: () => {
+          setTargetMergeModalOpen(false)
+        }
+      }, m.cancel),
+      h(Button, {
+        type: 'primary',
+        disabled: buildingTargetMergePlan || applyingTargetMerge || !targetMergePlan || !targetMergePlan.canCommit,
+        onClick: () => {
+          applyTargetMergePlan().catch(() => undefined)
+        }
+      }, applyingTargetMerge ? m.targetMerge : m.applyTargetMerge)
+    ))
+
+  const meanMergeModal = () =>
+    h(Modal, {
+      isOpen: meanMergeModalOpen,
+      toggle: () => {
+        if (!applyingMeanMerge) setMeanMergeModalOpen(false)
+      },
+      centered: true,
+      backdrop: 'static',
+      style: { width: 900, maxWidth: 'calc(100vw - 2rem)' }
+    },
+    h(ModalHeader, {
+      toggle: applyingMeanMerge
+        ? undefined
+        : () => {
+            setMeanMergeModalOpen(false)
+          }
+    }, m.meanMergeReviewTitle),
+    h(ModalBody, null,
+      h('div', { className: 'd-flex flex-column', style: { gap: '0.75rem', maxHeight: '68vh', minHeight: 380 } },
+        buildingMeanMergePlan
+          ? h('div', { style: { fontSize: 12, opacity: 0.75 } }, m.meanMergePlanBuilding)
+          : !meanMergePlan
+            ? h('div', { style: { fontSize: 12, opacity: 0.75 } }, m.meanMergePlanEmpty)
+            : h(React.Fragment, null,
+              h('div', { className: 'd-flex flex-wrap', style: { gap: '0.5rem' } },
+                validationCountTile(m.targetMergeTotalSurveyMonuments, meanMergePlan.sourceDeleteCount + 1),
+                validationCountTile(m.targetMergeSourcesTitle, meanMergePlan.sourceDeleteCount),
+                validationCountTile(m.targetMergeHistoryTitle, meanMergePlan.historyUpdateCount),
+                validationCountTile(m.errorsLabel, meanMergePlan.validations.filter((validation) => validation.severity === 'error').length),
+                validationCountTile(m.warningsLabel, meanMergePlan.validations.filter((validation) => validation.severity === 'warning').length)
+              ),
+              h('div', null,
+                h('div', { className: 'font-weight-bold mb-1', style: { fontSize: 12 } }, m.meanMergeCoordinatesTitle),
+                validationHeaderRow([m.workflowStepLabel, m.xCoordinateLabel, m.yCoordinateLabel, m.actionLabel]),
+                validationDataRow([
+                  m.meanMergeTargetCurrentTitle,
+                  formatTraverseNumber(meanMergePlan.targetOriginalX, 4),
+                  formatTraverseNumber(meanMergePlan.targetOriginalY, 4),
+                  m.selectedSurveyMonument
+                ], 'mean-merge-current-coordinate'),
+                validationDataRow([
+                  m.meanMergeCoordinatesTitle,
+                  formatTraverseNumber(meanMergePlan.meanX, 4),
+                  formatTraverseNumber(meanMergePlan.meanY, 4),
+                  m.meanMergeMoveTarget
+                ], 'mean-merge-new-coordinate')
+              ),
+              h('div', null,
+                h('div', { className: 'font-weight-bold mb-1', style: { fontSize: 12 } }, m.targetMergeTargetTitle),
+                validationHeaderRow([m.objectIdLabel, m.pointNumberLabel, 'GlobalID', m.statusLabel]),
+                validationDataRow([
+                  meanMergePlan.target.objectId,
+                  meanMergePlan.target.pointNumber,
+                  meanMergePlan.target.globalId || '-',
+                  m.readyLabel
+                ], 'mean-merge-target')
+              ),
+              h('div', null,
+                h('div', { className: 'font-weight-bold mb-1', style: { fontSize: 12 } }, m.targetMergeSourcesTitle),
+                validationHeaderRow([m.objectIdLabel, m.pointNumberLabel, 'GlobalID', m.targetMergeHistoryRecordsLabel, m.actionLabel]),
+                ...meanMergePlan.sources.map((row) =>
+                  validationDataRow([
+                    row.monument.objectId,
+                    row.monument.pointNumber,
+                    row.monument.globalId || '-',
+                    row.historyRows.length,
+                    m.removeSurveyMonument
+                  ], `mean-merge-source-${row.monument.objectId}`)
+                )
+              ),
+              h('div', null,
+                h('div', { className: 'font-weight-bold mb-1', style: { fontSize: 12 } }, m.targetMergeHistoryTitle),
+                meanMergePlan.historyUpdateCount === 0
+                  ? h('div', { style: { fontSize: 12, opacity: 0.75 } }, m.assignHistoryEmpty)
+                  : h(React.Fragment, null,
+                    validationHeaderRow([m.objectIdLabel, m.historyPointNumberLabel, m.sourceListLabel, m.actionLabel]),
+                    ...meanMergePlan.sources.flatMap((sourceRow) =>
+                      sourceRow.historyRows.map((historyRow) =>
+                        validationDataRow([
+                          historyRow.objectId,
+                          historyRow.pointNumber,
+                          `${historyRow.sourcePointNumber} (${m.objectIdLabel} ${historyRow.sourceObjectId})`,
+                          `${historyMonumentGlobalIdField} -> ${meanMergePlan.target.pointNumber}`
+                        ], `mean-merge-history-${historyRow.objectId}`)
+                      )
+                    )
+                  )
+              ),
+              h('div', null,
+                h('div', { className: 'font-weight-bold mb-1', style: { fontSize: 12 } }, m.validationLabel),
+                meanMergePlan.validations.length === 0
+                  ? h('div', { style: { fontSize: 12, opacity: 0.75 } }, m.noValidationIssues)
+                  : meanMergePlan.validations.map((validation, index) =>
+                    h('div', {
+                      key: `${validation.severity}-${validation.pointId || index}`,
+                      className: 'py-1',
+                      style: {
+                        fontSize: 12,
+                        borderBottom: '1px solid rgba(0, 0, 0, 0.06)',
+                        color: validation.severity === 'error' ? 'var(--danger-600, #c92a2a)' : validation.severity === 'warning' ? 'var(--warning-700, #8a5a00)' : undefined
+                      }
+                    },
+                    h('div', { style: { fontWeight: 700 } }, validation.severity.toUpperCase()),
+                    h('div', null, `${validation.pointId ? `${validation.pointId} - ` : ''}${validation.message}`)
+                    )
+                  )
+              )
+            )
+      )
+    ),
+    h(ModalFooter, null,
+      h(Button, {
+        type: 'default',
+        disabled: applyingMeanMerge,
+        onClick: () => {
+          setMeanMergeModalOpen(false)
+        }
+      }, m.cancel),
+      h(Button, {
+        type: 'primary',
+        disabled: buildingMeanMergePlan || applyingMeanMerge || !meanMergePlan || !meanMergePlan.canCommit,
+        onClick: () => {
+          applyMeanMergePlan().catch(() => undefined)
+        }
+      }, applyingMeanMerge ? m.meanMerge : m.applyMeanMerge)
+    ))
+
   const createProjectValidationModal = () =>
     h(Modal, {
       isOpen: createProjectModalOpen,
@@ -5748,6 +7151,7 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
         [m.finalizeUpdateSurveyMonument, finalizePlan.counts['update-survey-monument']],
         [m.finalizeCreateSurveyMonument, finalizePlan.counts['create-survey-monument']],
         [m.finalizeBackfillHistory, finalizePlan.counts['backfill-history-relationship']],
+        [m.finalizeDeleteTraverseConnection, finalizePlan.counts['delete-traverse-connection']],
         [m.finalizeCreateTraverseConnection, finalizePlan.counts['create-traverse-connection']]
       ]
       return h('div', { className: 'd-flex flex-column', style: { gap: '0.75rem' } },
@@ -5833,6 +7237,64 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
     )
   }
 
+  const finalizeConfirmationRows = () => {
+    if (!finalizePlan) return []
+    return [
+      [m.finalizeDeleteTraverseConnection, finalizePlan.counts['delete-traverse-connection']],
+      [m.finalizeCreateTraverseConnection, finalizePlan.counts['create-traverse-connection']],
+      [m.finalizeUpdateSurveyMonument, finalizePlan.counts['update-survey-monument']],
+      [m.finalizeCreateSurveyMonument, finalizePlan.counts['create-survey-monument']],
+      [m.finalizeUpdateHistory, finalizePlan.counts['update-history']],
+      [m.finalizeCreateHistory, finalizePlan.counts['create-history']],
+      [m.finalizeBackfillHistory, finalizePlan.counts['backfill-history-relationship']]
+    ].filter(([, count]) => Number(count) > 0)
+  }
+
+  const finalizeConfirmModal = () =>
+    h(Modal, {
+      isOpen: finalizeConfirmOpen,
+      toggle: () => {
+        if (!finalizingProject) setFinalizeConfirmOpen(false)
+      },
+      centered: true,
+      backdrop: 'static',
+      style: { width: 520, maxWidth: 'calc(100vw - 2rem)' }
+    },
+    h(ModalHeader, {
+      toggle: finalizingProject
+        ? undefined
+        : () => {
+            setFinalizeConfirmOpen(false)
+          }
+    }, m.finalizeProjectConfirmTitle),
+    h(ModalBody, null,
+      h('div', { className: 'd-flex flex-column', style: { gap: '0.75rem' } },
+        h('div', { style: { fontSize: 12, lineHeight: '17px' } }, m.finalizeProjectConfirmMessage),
+        h('div', null,
+          validationHeaderRow([m.workflowStepLabel, m.countLabel, m.statusLabel]),
+          ...finalizeConfirmationRows().map(([label, count]) =>
+            validationDataRow([label, count, m.readyLabel], `finalize-confirm-${label}`)
+          )
+        )
+      )
+    ),
+    h(ModalFooter, null,
+      h(Button, {
+        type: 'default',
+        disabled: finalizingProject,
+        onClick: () => {
+          setFinalizeConfirmOpen(false)
+        }
+      }, m.cancel),
+      h(Button, {
+        type: 'primary',
+        disabled: finalizingProject || !finalizePlan || !finalizePlan.canCommit,
+        onClick: () => {
+          applyFinalizeProjectEdits().catch(() => undefined)
+        }
+      }, m.finalizeProjectConfirmAction)
+    ))
+
   const validationModal = () =>
     h(Modal, {
       isOpen: validationModalOpen,
@@ -5887,8 +7349,10 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
       }, m.close),
       validationReviewMode === 'traverse' && h(Button, {
         type: 'primary',
-        disabled: loadingTraverseFiles || !finalizePlan || !finalizePlan.canCommit,
-        onClick: stageFinalizeProjectEdits
+        disabled: loadingTraverseFiles || finalizingProject || !finalizePlan || !finalizePlan.canCommit,
+        onClick: () => {
+          setFinalizeConfirmOpen(true)
+        }
       }, m.traverseMode)
     ))
 
@@ -6074,7 +7538,10 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
     attachmentModal(),
     autoAssignModal(),
     pointNumberModal(),
+    targetMergeModal(),
+    meanMergeModal(),
     createProjectValidationModal(),
+    finalizeConfirmModal(),
     validationModal()
   )
 }
