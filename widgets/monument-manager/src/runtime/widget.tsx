@@ -19,7 +19,7 @@ import {
 import type { IMConfig } from '../config'
 import defaultMessages from './translations/default'
 
-type MonumentMode = 'finder' | 'history' | 'create' | 'create-project' | 'merge-points' | 'traverse' | 'update-xy'
+type MonumentMode = 'finder' | 'history' | 'create' | 'create-project' | 'merge-points' | 'remove-monuments' | 'traverse' | 'update-xy'
 
 interface ModeDefinition {
   id: MonumentMode
@@ -44,6 +44,7 @@ interface MonumentHistorySummary {
   monumentGlobalId?: string
   projectGlobalId?: string
   projectName?: string
+  createdDate?: number
   pointNumber: string
   status: string
   monumentType: string
@@ -58,6 +59,8 @@ interface SurveyMonumentSummary {
   pointNumber: string
   monumentType: string
   status: string
+  joeId?: number | string
+  denId?: number | string
 }
 
 interface QueryResponse {
@@ -338,6 +341,20 @@ interface TargetMergePlan {
   canCommit: boolean
   historyUpdateCount: number
   sourceDeleteCount: number
+  zeroHistoryCount: number
+}
+
+interface RemoveMonumentsPlanRow {
+  monument: SurveyMonumentSummary
+  historyRows: MergeHistoryReassignment[]
+}
+
+interface RemoveMonumentsPlan {
+  rows: RemoveMonumentsPlanRow[]
+  validations: FinalizeValidationMessage[]
+  canCommit: boolean
+  surveyDeleteCount: number
+  historyDeleteCount: number
   zeroHistoryCount: number
 }
 
@@ -1033,6 +1050,15 @@ const getStringAttribute = (attributes: { [key: string]: any }, key: string) => 
   return String(value)
 }
 
+const hasUsableAttributeValue = (value: any) =>
+  value !== null && value !== undefined && String(value).trim() !== '' && String(value).trim() !== '-'
+
+const getIntegerAttributeValue = (value: any) => {
+  if (!hasUsableAttributeValue(value)) return null
+  const numericValue = Number(value)
+  return Number.isInteger(numericValue) ? numericValue : null
+}
+
 const formatGuidForEdit = (value?: string) => {
   const trimmed = (value || '').trim()
   const match = trimmed.match(/^\{?([0-9a-f]{8})-([0-9a-f]{4})-([0-9a-f]{4})-([0-9a-f]{4})-([0-9a-f]{12})\}?$/i)
@@ -1060,6 +1086,20 @@ const stripSystemEditAttributes = (attributes: { [key: string]: any } = {}, laye
     const normalizedKey = key.toLowerCase()
     if (normalizedKey === objectIdField || normalizedKey === globalIdField) return result
     result[key] = attributes[key]
+    return result
+  }, {})
+}
+
+const getCopyableAddAttributes = (attributes: { [key: string]: any } = {}, layer: any) => {
+  const strippedAttributes = stripSystemEditAttributes(attributes, layer)
+  const fields = Array.isArray(layer?.fields) ? layer.fields : []
+  if (fields.length === 0) return strippedAttributes
+
+  return Object.keys(strippedAttributes).reduce<{ [key: string]: any }>((result, key) => {
+    const field = fields.find((candidate: any) => String(candidate?.name || '').toLowerCase() === key.toLowerCase())
+    if (!field) return result
+    if (field.editable === false || field.type === 'oid' || field.type === 'global-id') return result
+    result[field.name || key] = strippedAttributes[key]
     return result
   }, {})
 }
@@ -1148,6 +1188,11 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
   const [applyingTargetMerge, setApplyingTargetMerge] = React.useState(false)
   const [targetMergePlan, setTargetMergePlan] = React.useState<TargetMergePlan | null>(null)
   const [targetMergeModalOpen, setTargetMergeModalOpen] = React.useState(false)
+  const [autoSettingTarget, setAutoSettingTarget] = React.useState(false)
+  const [buildingRemoveMonumentsPlan, setBuildingRemoveMonumentsPlan] = React.useState(false)
+  const [applyingRemoveMonuments, setApplyingRemoveMonuments] = React.useState(false)
+  const [removeMonumentsPlan, setRemoveMonumentsPlan] = React.useState<RemoveMonumentsPlan | null>(null)
+  const [removeMonumentsModalOpen, setRemoveMonumentsModalOpen] = React.useState(false)
   const [buildingMeanMergePlan, setBuildingMeanMergePlan] = React.useState(false)
   const [applyingMeanMerge, setApplyingMeanMerge] = React.useState(false)
   const [meanMergePlan, setMeanMergePlan] = React.useState<MeanMergePlan | null>(null)
@@ -1188,6 +1233,7 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
   const [status, setStatus] = React.useState(m.statusReady)
   const searchInitializedRef = React.useRef(false)
   const projectLayerFiltersRef = React.useRef(new Map<string, { layer: any, definitionExpression: string | null | undefined }>())
+  const traverseConnectionVisibilityRef = React.useRef(new Map<any, boolean | undefined>())
   const monumentGraphicsLayerRef = React.useRef<any>(null)
   const monumentGraphicsMapRef = React.useRef<any>(null)
   const traversePreviewGraphicsLayerRef = React.useRef<any>(null)
@@ -1195,6 +1241,7 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
   const csvProjectGraphicsSignatureRef = React.useRef('')
   const traverseConnectionsPreviewSignatureRef = React.useRef('')
   const suppressAssignSurveySelectionSyncRef = React.useRef(false)
+  const suppressAssignHistoryLoadedStatusRef = React.useRef(false)
   const monumentProjectsLayerRef = React.useRef<{ url: string, layer: any } | null>(null)
   const surveyMonumentsLayerRef = React.useRef<{ url: string, layer: any } | null>(null)
   const monumentHistoryLayerRef = React.useRef<{ url: string, layer: any } | null>(null)
@@ -1209,16 +1256,17 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
     { id: 'create', label: m.createMode, title: m.assignProjectTitle },
     { id: 'create-project', label: m.createTitle, title: m.createProjectWorkflowTitle },
     { id: 'merge-points', label: m.mergePointsMode, title: m.mergePointsTitle },
+    { id: 'remove-monuments', label: m.removeMonumentsMode, title: m.removeMonumentsTitle },
     { id: 'traverse', label: m.traverseMode, title: m.traverseTitle },
     { id: 'update-xy', label: m.updateXyMode, title: m.updateXyTitle }
   ]
   const workflowModeRows: MonumentMode[][] = [
-    ['history', 'create'],
-    ['create-project', 'traverse', 'merge-points']
+    ['history', 'create', 'merge-points'],
+    ['create-project', 'traverse', 'remove-monuments']
   ]
 
   const activeMode = workflowModes.find((item) => item.id === mode) || workflowModes[0]
-  const isSurveyHistoryMode = mode === 'create' || mode === 'merge-points'
+  const isSurveyHistoryMode = mode === 'create' || mode === 'merge-points' || mode === 'remove-monuments'
   const configuredSources = [
     { label: m.surveyMonumentsLayer, value: cfg.surveyMonumentsLayerUrl || DEFAULT_SURVEY_MONUMENTS_LAYER_URL },
     { label: m.monumentProjectsLayer, value: cfg.monumentProjectsLayerUrl || DEFAULT_MONUMENT_PROJECTS_LAYER_URL },
@@ -1330,6 +1378,9 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
   const formatDateTime = (value?: number) =>
     value ? new Date(value).toLocaleString() : '-'
 
+  const formatDate = (value?: number) =>
+    value ? new Date(value).toLocaleDateString() : '-'
+
   const getFinalizeEditsByPointId = React.useCallback((pointId: string) =>
     (finalizePlan?.edits || []).filter((edit) => edit.pointId === pointId),
   [finalizePlan?.edits])
@@ -1360,6 +1411,7 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
     globalId: getStringAttribute(attributes, 'GlobalID'),
     monumentGlobalId: getStringAttribute(attributes, historyMonumentGlobalIdField),
     projectGlobalId: getStringAttribute(attributes, historyProjectGlobalIdField),
+    createdDate: Number(getAttributeValue(attributes, 'created_date')) || undefined,
     pointNumber: displayOptionalValue(attributes.PointNumber),
     status: displayOptionalValue(attributes.Status),
     monumentType: displayOptionalValue(attributes.Type),
@@ -1386,7 +1438,9 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
     globalId: getStringAttribute(attributes, monumentGlobalIdField),
     pointNumber: displayOptionalValue(getAttributeValue(attributes, monumentPointNumberField)),
     monumentType: displayOptionalValue(getAttributeValue(attributes, 'Type')),
-    status: displayOptionalValue(getAttributeValue(attributes, 'Status'))
+    status: displayOptionalValue(getAttributeValue(attributes, 'Status')),
+    joeId: getAttributeValue(attributes, 'Joe_ID'),
+    denId: getAttributeValue(attributes, 'Den_ID')
   }), [monumentGlobalIdField, monumentPointNumberField])
 
   const getSurveyMonumentKey = (item: SurveyMonumentSummary) => String(item.objectId)
@@ -1482,6 +1536,7 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
           'GlobalID',
           historyProjectGlobalIdField,
           historyMonumentGlobalIdField,
+          'created_date',
           'PointNumber',
           'Status',
           'Type',
@@ -1535,7 +1590,7 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
     ]
     if (/^\d{4}$/.test(term)) textSearch.push(`SurveyYear = ${term}`)
 
-    return `${activeWhere} AND (${textSearch.join(' OR ')})`
+    return `(${textSearch.join(' OR ')})`
   }, [projectDisplayField])
 
   const getLayerKey = (layer: any, fallback: string) => String(layer?.uid || layer?.id || fallback)
@@ -2112,12 +2167,16 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
         return true
       })
 
-    const missingGlobalIdObjectIds = rawIncomingSurveyMonuments
-      .filter((item) => !item.globalId && item.objectId !== undefined && item.objectId !== null)
+    const missingAutoTargetFieldObjectIds = rawIncomingSurveyMonuments
+      .filter((item) =>
+        (!item.globalId || item.joeId === undefined || item.denId === undefined) &&
+        item.objectId !== undefined &&
+        item.objectId !== null
+      )
       .map((item) => item.objectId)
-    const enrichedMonuments = await loadSurveyMonumentsByObjectIds(missingGlobalIdObjectIds)
+    const enrichedMonuments = await loadSurveyMonumentsByObjectIds(missingAutoTargetFieldObjectIds)
     const incomingSurveyMonuments = rawIncomingSurveyMonuments.map((item) =>
-      item.globalId ? item : enrichedMonuments.get(String(item.objectId)) || item
+      enrichedMonuments.get(String(item.objectId)) || item
     )
 
     setAssignSurveyMonuments((current) => {
@@ -2185,8 +2244,13 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
         const nextKeys = new Set(historyItemsWithProjects.map(getHistoryKey))
         return nextKeys.has(current) ? current : ''
       })
-      setStatus(`${m.assignHistoryLoaded} ${historyItemsWithProjects.length}`)
+      if (suppressAssignHistoryLoadedStatusRef.current) {
+        suppressAssignHistoryLoadedStatusRef.current = false
+      } else {
+        setStatus(`${m.assignHistoryLoaded} ${historyItemsWithProjects.length}`)
+      }
     } catch (err) {
+      suppressAssignHistoryLoadedStatusRef.current = false
       const message = err instanceof Error ? err.message : m.historyLoadFailed
       setStatus(message || m.historyLoadFailed)
     } finally {
@@ -2463,6 +2527,87 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
       setAddingAssignHistory(false)
     }
   }, [activeAssignSurveyKey, assignSurveyMonuments, getMonumentHistoryLayer, historyMonumentGlobalIdField, historyProjectGlobalIdField, loadAssignHistoryForSurveyMonument, m.addHistoryFailed, m.addHistorySuccess, m.assignSurveyMissingGlobalId, m.historyMissingProjectId, m.selectSurveyMonumentFirst, selectMonumentHistoryRecord, selectedProject])
+
+  const createCopiedHistoryFromSelectedRecord = React.useCallback(async () => {
+    const historyItem = assignHistoryItems.find((item) => getHistoryKey(item) === activeAssignHistoryKey)
+    if (!historyItem) {
+      setStatus(m.selectHistoryFirst)
+      return
+    }
+
+    const objectId = getNumericObjectId(historyItem.objectId)
+    if (objectId === null) {
+      setStatus(m.createCopyHistoryFailed)
+      return
+    }
+    if (!selectedProject?.globalId) {
+      setStatus(m.historyMissingProjectId)
+      return
+    }
+
+    setAddingAssignHistory(true)
+    try {
+      const layer = await getMonumentHistoryLayer()
+      const projectGlobalId = formatGuidForEdit(selectedProject.globalId)
+      const objectIdField = layer.objectIdField || 'OBJECTID'
+      const query = layer.createQuery ? layer.createQuery() : {}
+      query.where = `${objectIdField} = ${objectId}`
+      query.outFields = ['*']
+      query.returnGeometry = false
+      query.num = 1
+
+      const queryResult = await layer.queryFeatures(query)
+      const sourceAttributes = queryResult?.features?.[0]?.attributes || null
+      if (!sourceAttributes) throw new Error(m.createCopyHistoryFailed)
+
+      const attributes = {
+        ...getCopyableAddAttributes(sourceAttributes, layer),
+        [historyProjectGlobalIdField]: projectGlobalId
+      }
+      const results = await layer.applyEdits({
+        addFeatures: [{ attributes }]
+      })
+      const addResult = results.addFeatureResults?.[0]
+      if (!addResult || addResult.error) throw new Error(addResult?.error?.message || m.createCopyHistoryFailed)
+
+      const activeMonument = assignSurveyMonuments.find((item) => getSurveyMonumentKey(item) === activeAssignSurveyKey)
+      if (activeMonument) await loadAssignHistoryForSurveyMonument(activeMonument)
+
+      const newObjectId = addResult.objectId
+      if (newObjectId !== undefined && newObjectId !== null) {
+        const newHistoryKey = String(newObjectId)
+        setActiveAssignHistoryKey(newHistoryKey)
+        suppressAssignSurveySelectionSyncRef.current = true
+        selectMonumentHistoryRecord(newObjectId)
+          .catch(() => undefined)
+          .finally(() => {
+            window.setTimeout(() => {
+              suppressAssignSurveySelectionSyncRef.current = false
+            }, 750)
+          })
+      }
+      setStatus(`${m.createCopyHistorySuccess}: ${historyItem.pointNumber}`)
+    } catch (err) {
+      const message = err instanceof Error ? err.message : m.createCopyHistoryFailed
+      setStatus(message || m.createCopyHistoryFailed)
+    } finally {
+      setAddingAssignHistory(false)
+    }
+  }, [
+    activeAssignHistoryKey,
+    activeAssignSurveyKey,
+    assignHistoryItems,
+    assignSurveyMonuments,
+    getMonumentHistoryLayer,
+    historyProjectGlobalIdField,
+    loadAssignHistoryForSurveyMonument,
+    m.createCopyHistoryFailed,
+    m.createCopyHistorySuccess,
+    m.historyMissingProjectId,
+    m.selectHistoryFirst,
+    selectMonumentHistoryRecord,
+    selectedProject?.globalId
+  ])
 
   const refreshAssignHistory = React.useCallback(async () => {
     const monument = assignSurveyMonuments.find((item) => getSurveyMonumentKey(item) === activeAssignSurveyKey)
@@ -3251,6 +3396,21 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
     return data.extent || null
   }, [getTraverseConnectionWhere, traverseConnectionsUrl])
 
+  const showTraverseConnectionLayer = React.useCallback((layer: any) => {
+    if (!layer) return
+    if (!traverseConnectionVisibilityRef.current.has(layer)) {
+      traverseConnectionVisibilityRef.current.set(layer, layer.visible)
+    }
+    layer.visible = true
+  }, [])
+
+  const restoreTraverseConnectionLayerVisibility = React.useCallback(() => {
+    traverseConnectionVisibilityRef.current.forEach((visible, layer) => {
+      layer.visible = visible
+    })
+    traverseConnectionVisibilityRef.current.clear()
+  }, [])
+
   const revealExistingTraverseConnections = React.useCallback(async (connections: ExistingTraverseConnectionSummary[], projectGlobalId: string) => {
     if (connections.length === 0) return { layerFound: false, zoomed: false }
 
@@ -3259,8 +3419,8 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
 
     const layers = await getTraverseConnectionMapLayers()
     layers.forEach((layer) => {
-      layer.visible = true
-      if (layer.parent) layer.parent.visible = true
+      showTraverseConnectionLayer(layer)
+      showTraverseConnectionLayer(layer.parent)
     })
 
     try {
@@ -3296,6 +3456,7 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
     getTraverseConnectionMapLayers,
     jimuMapView,
     queryTraverseConnectionExtent,
+    showTraverseConnectionLayer,
     traverseConnectionDataSourceIds,
     traverseConnectionsUrl
   ])
@@ -3606,8 +3767,9 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
 
   React.useEffect(() => {
     if (mode === 'traverse') return
+    restoreTraverseConnectionLayerVisibility()
     traversePreviewGraphicsLayerRef.current?.removeAll?.()
-  }, [mode])
+  }, [mode, restoreTraverseConnectionLayerVisibility])
 
   React.useEffect(() => {
     if (!isSurveyHistoryMode) return
@@ -3660,11 +3822,12 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
   }, [activeAssignSurveyKey, assignSurveyMonuments, isSurveyHistoryMode, m.monumentGraphicsFailed, renderAssignSurveyMonumentGraphics])
 
   React.useEffect(() => () => {
+    restoreTraverseConnectionLayerVisibility()
     monumentGraphicsLayerRef.current?.removeAll?.()
     monumentGraphicsMapRef.current?.remove?.(monumentGraphicsLayerRef.current)
     traversePreviewGraphicsLayerRef.current?.removeAll?.()
     traversePreviewGraphicsMapRef.current?.remove?.(traversePreviewGraphicsLayerRef.current)
-  }, [])
+  }, [restoreTraverseConnectionLayerVisibility])
 
   const projectRow = (project: MonumentProjectSummary) => {
     const selected = String(selectedProject?.objectId) === String(project.objectId)
@@ -3722,12 +3885,12 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
   }
 
   const startWorkflowMode = (nextMode: MonumentMode) => {
-    const requiresProject = nextMode !== 'merge-points'
+    const requiresProject = nextMode !== 'merge-points' && nextMode !== 'remove-monuments'
     if (requiresProject && !selectedProject) {
       setStatus(m.selectProjectFirst)
       return
     }
-    if (nextMode === 'merge-points') {
+    if (nextMode === 'merge-points' || nextMode === 'remove-monuments') {
       setAssignSurveyMonuments([])
       setActiveAssignSurveyKey('')
       setAssignHistoryItems([])
@@ -3762,9 +3925,13 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
 
   const setActiveSurveyMonumentAsTarget = () => {
     if (!activeAssignSurveyKey || assignSurveyMonuments.length < 2) return
+    suppressAssignHistoryLoadedStatusRef.current = true
     setAssignSurveyMonuments((current) => {
       const targetIndex = current.findIndex((item) => getSurveyMonumentKey(item) === activeAssignSurveyKey)
-      if (targetIndex <= 0) return current
+      if (targetIndex <= 0) {
+        suppressAssignHistoryLoadedStatusRef.current = false
+        return current
+      }
       const nextItems = [...current]
       const [targetItem] = nextItems.splice(targetIndex, 1)
       nextItems.unshift(targetItem)
@@ -3838,6 +4005,83 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
 
     return historyRowsBySourceGlobalId
   }, [historyMonumentGlobalIdField, monumentHistoryUrl])
+
+  const autoSetMergeTarget = React.useCallback(() => {
+    if (!canMergeSurveyMonuments) {
+      setStatus(m.mergeRequiresMultipleMonuments)
+      return
+    }
+
+    setAutoSettingTarget(true)
+    try {
+      const denCandidates = assignSurveyMonuments
+        .map((monument, index) => ({
+          monument,
+          index,
+          denId: getIntegerAttributeValue(monument.denId)
+        }))
+        .filter((candidate) => candidate.denId !== null)
+
+      const joeCandidates = assignSurveyMonuments
+        .map((monument, index) => ({
+          monument,
+          index
+        }))
+        .filter((candidate) => hasUsableAttributeValue(candidate.monument.joeId))
+
+      let targetCandidate: { monument: SurveyMonumentSummary, index: number } | null = null
+      let validationLabel = ''
+
+      if (denCandidates.length > 0) {
+        const denTarget = [...denCandidates].sort((left, right) =>
+          (right.denId ?? Number.NEGATIVE_INFINITY) - (left.denId ?? Number.NEGATIVE_INFINITY) ||
+          left.index - right.index
+        )[0]
+        targetCandidate = denTarget
+        validationLabel = `${m.autoTargetSetByDenId}: ${denTarget.monument.pointNumber} (${denTarget.denId})`
+      } else if (joeCandidates.length === 1) {
+        targetCandidate = joeCandidates[0]
+        validationLabel = `${m.autoTargetSetByJoeId}: ${targetCandidate.monument.pointNumber} (${targetCandidate.monument.joeId})`
+      } else if (joeCandidates.length > 1) {
+        validationLabel = m.autoTargetMultipleJoeIds
+      } else {
+        validationLabel = m.autoTargetNoIds
+      }
+
+      if (!targetCandidate) {
+        setStatus(validationLabel)
+        return
+      }
+
+      const targetKey = getSurveyMonumentKey(targetCandidate.monument)
+      suppressAssignHistoryLoadedStatusRef.current = true
+      setAssignSurveyMonuments((current) => {
+        const target = current.find((item) => getSurveyMonumentKey(item) === targetKey)
+        if (!target) return current
+        return [
+          target,
+          ...current.filter((item) => getSurveyMonumentKey(item) !== targetKey)
+        ]
+      })
+      setActiveAssignSurveyKey(targetKey)
+      setStatus(validationLabel)
+    } catch (err) {
+      const message = err instanceof Error ? err.message : m.autoTargetFailed
+      const validationLabel = `${m.autoTargetFailed} ${message || ''}`.trim()
+      setStatus(validationLabel)
+    } finally {
+      setAutoSettingTarget(false)
+    }
+  }, [
+    assignSurveyMonuments,
+    canMergeSurveyMonuments,
+    m.autoTargetFailed,
+    m.autoTargetMultipleJoeIds,
+    m.autoTargetNoIds,
+    m.autoTargetSetByDenId,
+    m.autoTargetSetByJoeId,
+    m.mergeRequiresMultipleMonuments
+  ])
 
   const buildTargetMergePlan = React.useCallback(async (): Promise<TargetMergePlan | null> => {
     if (!canMergeSurveyMonuments) {
@@ -3971,6 +4215,130 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
     m.targetMergeFailed,
     renderAssignSurveyMonumentGraphics,
     targetMergePlan
+  ])
+
+  const buildRemoveMonumentsPlan = React.useCallback(async (): Promise<RemoveMonumentsPlan | null> => {
+    if (assignSurveyMonuments.length === 0) {
+      setStatus(m.deleteMonumentsPlanEmpty)
+      return null
+    }
+
+    const validations: FinalizeValidationMessage[] = []
+    assignSurveyMonuments.forEach((monument) => {
+      if (!monument.globalId) {
+        validations.push({ severity: 'error', pointId: monument.pointNumber, message: m.deleteMonumentsMissingGlobalId })
+      }
+      if (monument.objectId === undefined || monument.objectId === null || monument.objectId === '') {
+        validations.push({ severity: 'error', pointId: monument.pointNumber, message: m.deleteMonumentsMissingObjectId })
+      }
+    })
+
+    const historiesByGlobalId = await queryMergeHistoryBySourceGlobalIds(assignSurveyMonuments)
+    const rows = assignSurveyMonuments.map((monument) => {
+      const historyRows = historiesByGlobalId.get(normalizeGuidKey(monument.globalId)) || []
+      if (historyRows.length === 0) {
+        validations.push({ severity: 'warning', pointId: monument.pointNumber, message: m.deleteMonumentsNoHistory })
+      }
+      return {
+        monument,
+        historyRows
+      }
+    })
+    const historyDeleteCount = rows.reduce((total, row) => total + row.historyRows.length, 0)
+
+    return {
+      rows,
+      validations,
+      canCommit: validations.every((validation) => validation.severity !== 'error'),
+      surveyDeleteCount: rows.length,
+      historyDeleteCount,
+      zeroHistoryCount: rows.filter((row) => row.historyRows.length === 0).length
+    }
+  }, [
+    assignSurveyMonuments,
+    m.deleteMonumentsMissingGlobalId,
+    m.deleteMonumentsMissingObjectId,
+    m.deleteMonumentsNoHistory,
+    m.deleteMonumentsPlanEmpty,
+    queryMergeHistoryBySourceGlobalIds
+  ])
+
+  const openRemoveMonumentsReview = React.useCallback(async () => {
+    setBuildingRemoveMonumentsPlan(true)
+    setRemoveMonumentsModalOpen(true)
+    try {
+      const plan = await buildRemoveMonumentsPlan()
+      setRemoveMonumentsPlan(plan)
+      if (plan) setStatus(`${m.deleteMonumentsPlanReady}: ${plan.surveyDeleteCount} ${m.surveyMonumentsLayer}, ${plan.historyDeleteCount} ${m.historyCountLabel}`)
+    } catch (err) {
+      const message = err instanceof Error ? err.message : m.deleteMonumentsFailed
+      setRemoveMonumentsPlan(null)
+      setStatus(`${m.deleteMonumentsFailed} ${message || ''}`.trim())
+    } finally {
+      setBuildingRemoveMonumentsPlan(false)
+    }
+  }, [
+    buildRemoveMonumentsPlan,
+    m.deleteMonumentsFailed,
+    m.deleteMonumentsPlanReady,
+    m.historyCountLabel,
+    m.surveyMonumentsLayer
+  ])
+
+  const applyRemoveMonumentsPlan = React.useCallback(async () => {
+    if (!removeMonumentsPlan || !removeMonumentsPlan.canCommit) return
+
+    setApplyingRemoveMonuments(true)
+    try {
+      const historyLayer = await getMonumentHistoryLayer()
+      const surveyLayer = await getSurveyMonumentsLayer()
+      const historyRows = removeMonumentsPlan.rows.flatMap((row) => row.historyRows)
+      const surveyObjectIds = removeMonumentsPlan.rows.map((row) => row.monument.objectId)
+
+      if (historyRows.length > 0) {
+        setStatus(m.deleteMonumentsDeletingHistory)
+        const historyDeleteResults = await historyLayer.applyEdits({
+          deleteFeatures: historyRows.map((row) => ({ attributes: { OBJECTID: row.objectId } }))
+        }, {
+          rollbackOnFailureEnabled: true
+        })
+        const historyDeleteError = getFailedEditResult(historyDeleteResults, 'deleteFeatureResults', m.deleteMonumentsFailed)
+        if (historyDeleteError) throw historyDeleteError
+      }
+
+      setStatus(m.deleteMonumentsDeletingSurvey)
+      const surveyDeleteResults = await surveyLayer.applyEdits({
+        deleteFeatures: surveyObjectIds.map((objectId) => ({ attributes: { OBJECTID: objectId } }))
+      }, {
+        rollbackOnFailureEnabled: true
+      })
+      const surveyDeleteError = getFailedEditResult(surveyDeleteResults, 'deleteFeatureResults', m.deleteMonumentsFailed)
+      if (surveyDeleteError) throw surveyDeleteError
+
+      setStatus(`${m.deleteMonumentsComplete}: ${removeMonumentsPlan.surveyDeleteCount} ${m.surveyMonumentsLayer}, ${removeMonumentsPlan.historyDeleteCount} ${m.historyCountLabel}`)
+      setRemoveMonumentsModalOpen(false)
+      setRemoveMonumentsPlan(null)
+      setAssignSurveyMonuments([])
+      setActiveAssignSurveyKey('')
+      setAssignHistoryItems([])
+      setActiveAssignHistoryKey('')
+      monumentGraphicsLayerRef.current?.removeAll?.()
+    } catch (err) {
+      const message = err instanceof Error ? err.message : m.deleteMonumentsFailed
+      setStatus(`${m.deleteMonumentsFailed} ${message || ''}`.trim())
+    } finally {
+      setApplyingRemoveMonuments(false)
+    }
+  }, [
+    getMonumentHistoryLayer,
+    getSurveyMonumentsLayer,
+    m.deleteMonumentsComplete,
+    m.deleteMonumentsDeletingHistory,
+    m.deleteMonumentsDeletingSurvey,
+    m.deleteMonumentsFailed,
+    m.historyCountLabel,
+    m.surveyMonumentsLayer,
+    removeMonumentsPlan
   ])
 
   const queryMergeSurveyGeometriesByObjectIds = React.useCallback(async (monuments: SurveyMonumentSummary[]) => {
@@ -5570,7 +5938,8 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
     const secondaryParts = [
       { label: m.embeddedInLabel, value: item.embeddedIn },
       { label: m.markerTypeLabel, value: item.markerType },
-      { label: m.markerMaterialLabel, value: item.markerMaterial }
+      { label: m.markerMaterialLabel, value: item.markerMaterial },
+      { label: m.createdDateLabel, value: formatDate(item.createdDate) }
     ]
     const secondaryText = secondaryParts.map((part) => `${part.label}: ${part.value}`).join(' | ')
 
@@ -6173,7 +6542,10 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
         }, m.cancel)
       ),
       mode === 'create' && selectedProject && h('div', { style: { fontSize: 14, fontWeight: 700, lineHeight: '18px', overflowWrap: 'anywhere' } }, selectedProject.name),
-      h('div', { className: 'border rounded p-2 d-flex flex-column', style: { minHeight: 120, flex: '0 0 38%' } },
+      h('div', {
+        className: 'border rounded p-2 d-flex flex-column',
+        style: { minHeight: 120, flex: mode === 'remove-monuments' ? '0 0 50%' : '0 0 38%' }
+      },
         h('div', { className: 'd-flex align-items-center justify-content-between mb-2', style: { gap: '0.5rem' } },
           h('div', { className: 'font-weight-bold', style: { fontSize: 12 } }, m.surveyMonumentsTitle),
           h('div', { className: 'd-flex align-items-center', style: { gap: '0.35rem', flex: '0 0 auto' } },
@@ -6197,9 +6569,18 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
             type: 'primary',
             size: 'sm',
             style: modeActionButtonStyle,
-            disabled: assignSurveyMonuments.length < 2 || !activeAssignSurveyKey,
+            disabled: assignSurveyMonuments.length < 2 || !activeAssignSurveyKey || autoSettingTarget,
             onClick: setActiveSurveyMonumentAsTarget
           }, m.setTarget),
+          mode === 'merge-points' && h(Button, {
+            type: 'default',
+            size: 'sm',
+            style: modeActionButtonStyle,
+            disabled: assignSurveyMonuments.length < 2 || autoSettingTarget,
+            onClick: () => {
+              autoSetMergeTarget()
+            }
+          }, m.autoSetTarget),
           mode === 'create' && h(Button, {
             type: 'primary',
             size: 'sm',
@@ -6247,7 +6628,16 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
             onClick: () => {
               createAssociatedHistoryForSelectedSurveyMonument().catch(() => undefined)
             }
-          }, m.addHistory)
+          }, m.addHistory),
+          h(Button, {
+            type: 'default',
+            size: 'sm',
+            style: modeActionButtonStyle,
+            disabled: !activeAssignHistoryKey || addingAssignHistory || loadingAssignHistory || !selectedProject,
+            onClick: () => {
+              createCopiedHistoryFromSelectedRecord().catch(() => undefined)
+            }
+          }, m.createCopyHistory)
         ),
         mode === 'merge-points' && h('div', { className: 'd-flex mt-2', style: { gap: '0.35rem' } },
           h(Button, {
@@ -6275,6 +6665,17 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
             }
           }, m.meanMerge)
         )
+      ),
+      mode === 'remove-monuments' && h('div', { className: 'd-flex', style: { gap: '0.35rem' } },
+        h(Button, {
+          type: 'primary',
+          size: 'sm',
+          style: modeActionButtonStyle,
+          disabled: assignSurveyMonuments.length === 0 || buildingRemoveMonumentsPlan || applyingRemoveMonuments,
+          onClick: () => {
+            openRemoveMonumentsReview().catch(() => undefined)
+          }
+        }, m.deleteMonuments)
       )
     )
 
@@ -6766,6 +7167,107 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
           applyPointNumberPlan().catch(() => undefined)
         }
       }, applyingPointNumbers ? m.updatePointNumber : m.applyPointNumbers)
+    ))
+
+  const removeMonumentsModal = () =>
+    h(Modal, {
+      isOpen: removeMonumentsModalOpen,
+      toggle: () => {
+        if (!applyingRemoveMonuments) setRemoveMonumentsModalOpen(false)
+      },
+      centered: true,
+      backdrop: 'static',
+      style: { width: 860, maxWidth: 'calc(100vw - 2rem)' }
+    },
+    h(ModalHeader, {
+      toggle: applyingRemoveMonuments
+        ? undefined
+        : () => {
+            setRemoveMonumentsModalOpen(false)
+          }
+    }, m.deleteMonumentsReviewTitle),
+    h(ModalBody, null,
+      h('div', { className: 'd-flex flex-column', style: { gap: '0.75rem', maxHeight: '68vh', minHeight: 360 } },
+        h('div', { style: { fontSize: 12, lineHeight: '17px' } }, m.deleteMonumentsConfirmMessage),
+        buildingRemoveMonumentsPlan
+          ? h('div', { style: { fontSize: 12, opacity: 0.75 } }, m.deleteMonumentsPlanBuilding)
+          : !removeMonumentsPlan
+            ? h('div', { style: { fontSize: 12, opacity: 0.75 } }, m.deleteMonumentsPlanEmpty)
+            : h(React.Fragment, null,
+              h('div', { className: 'd-flex flex-wrap', style: { gap: '0.5rem' } },
+                validationCountTile(m.selectedSurveyMonuments, removeMonumentsPlan.surveyDeleteCount),
+                validationCountTile(m.monumentHistoryTitle, removeMonumentsPlan.historyDeleteCount),
+                validationCountTile(m.errorsLabel, removeMonumentsPlan.validations.filter((validation) => validation.severity === 'error').length),
+                validationCountTile(m.warningsLabel, removeMonumentsPlan.validations.filter((validation) => validation.severity === 'warning').length)
+              ),
+              h('div', null,
+                h('div', { className: 'font-weight-bold mb-1', style: { fontSize: 12 } }, m.surveyMonumentsTitle),
+                validationHeaderRow([m.objectIdLabel, m.pointNumberLabel, 'GlobalID', m.targetMergeHistoryRecordsLabel, m.actionLabel]),
+                ...removeMonumentsPlan.rows.map((row) =>
+                  validationDataRow([
+                    row.monument.objectId,
+                    row.monument.pointNumber,
+                    row.monument.globalId || '-',
+                    row.historyRows.length,
+                    m.deleteMonuments
+                  ], `remove-monument-${row.monument.objectId}`)
+                )
+              ),
+              h('div', null,
+                h('div', { className: 'font-weight-bold mb-1', style: { fontSize: 12 } }, m.monumentHistoryTitle),
+                removeMonumentsPlan.historyDeleteCount === 0
+                  ? h('div', { style: { fontSize: 12, opacity: 0.75 } }, m.assignHistoryEmpty)
+                  : h(React.Fragment, null,
+                    validationHeaderRow([m.objectIdLabel, m.historyPointNumberLabel, m.sourceListLabel, m.actionLabel]),
+                    ...removeMonumentsPlan.rows.flatMap((planRow) =>
+                      planRow.historyRows.map((historyRow) =>
+                        validationDataRow([
+                          historyRow.objectId,
+                          historyRow.pointNumber,
+                          `${historyRow.sourcePointNumber} (${m.objectIdLabel} ${historyRow.sourceObjectId})`,
+                          m.deleteMonuments
+                        ], `remove-history-${historyRow.objectId}`)
+                      )
+                    )
+                  )
+              ),
+              h('div', null,
+                h('div', { className: 'font-weight-bold mb-1', style: { fontSize: 12 } }, m.validationLabel),
+                removeMonumentsPlan.validations.length === 0
+                  ? h('div', { style: { fontSize: 12, opacity: 0.75 } }, m.noValidationIssues)
+                  : removeMonumentsPlan.validations.map((validation, index) =>
+                    h('div', {
+                      key: `${validation.severity}-${validation.pointId || index}`,
+                      className: 'py-1',
+                      style: {
+                        fontSize: 12,
+                        borderBottom: '1px solid rgba(0, 0, 0, 0.06)',
+                        color: validation.severity === 'error' ? 'var(--danger-600, #c92a2a)' : validation.severity === 'warning' ? 'var(--warning-700, #8a5a00)' : undefined
+                      }
+                    },
+                    h('div', { style: { fontWeight: 700 } }, validation.severity.toUpperCase()),
+                    h('div', null, `${validation.pointId ? `${validation.pointId} - ` : ''}${validation.message}`)
+                    )
+                  )
+              )
+            )
+      )
+    ),
+    h(ModalFooter, null,
+      h(Button, {
+        type: 'default',
+        disabled: applyingRemoveMonuments,
+        onClick: () => {
+          setRemoveMonumentsModalOpen(false)
+        }
+      }, m.cancel),
+      h(Button, {
+        type: 'primary',
+        disabled: buildingRemoveMonumentsPlan || applyingRemoveMonuments || !removeMonumentsPlan || !removeMonumentsPlan.canCommit,
+        onClick: () => {
+          applyRemoveMonumentsPlan().catch(() => undefined)
+        }
+      }, m.deleteMonuments)
     ))
 
   const targetMergeModal = () =>
@@ -7538,6 +8040,7 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
     attachmentModal(),
     autoAssignModal(),
     pointNumberModal(),
+    removeMonumentsModal(),
     targetMergeModal(),
     meanMergeModal(),
     createProjectValidationModal(),
