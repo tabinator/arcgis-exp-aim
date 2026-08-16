@@ -406,6 +406,12 @@ const getUnknownErrorMessage = (err: unknown, fallbackMessage: string) =>
     ? err.message
     : getEditErrorMessage(err, fallbackMessage)
 
+const getOperationErrorStatus = (fallbackMessage: string, err: unknown) => {
+  const message = getUnknownErrorMessage(err, fallbackMessage)
+  if (!message || message === fallbackMessage) return fallbackMessage
+  return `${fallbackMessage} ${message}`.trim()
+}
+
 const mapWithConcurrency = async <T, R>(
   items: T[],
   limit: number,
@@ -1104,6 +1110,47 @@ const getCopyableAddAttributes = (attributes: { [key: string]: any } = {}, layer
   }, {})
 }
 
+const getRollbackAddAttributes = (attributes: { [key: string]: any } = {}, layer: any) => {
+  const copyableAttributes = getCopyableAddAttributes(attributes, layer)
+  const globalIdField = layer?.globalIdField || 'GlobalID'
+  const globalId = getAttributeValue(attributes, globalIdField)
+  return globalId
+    ? {
+        ...copyableAttributes,
+        [globalIdField]: globalId
+      }
+    : copyableAttributes
+}
+
+const layerSupportsRollbackOnFailureOption = (layer: any) =>
+  layer?.capabilities?.editing?.supportsRollbackOnFailure === true ||
+  layer?.supportsRollbackOnFailureParameter === true
+
+const getApplyEditsOptions = (layer: any, options: { [key: string]: any } = {}) =>
+  layerSupportsRollbackOnFailureOption(layer)
+    ? { ...options, rollbackOnFailureEnabled: true }
+    : options
+
+const getDeleteGraphics = (Graphic: any, layer: any, objectIds: Array<string | number>) => {
+  const objectIdField = layer?.objectIdField || 'OBJECTID'
+  return objectIds.map((objectId) => new Graphic({
+    attributes: { [objectIdField]: objectId }
+  }))
+}
+
+const queryLayerFeaturesByObjectIds = async (layer: any, objectIds: Array<string | number>, returnGeometry = true) => {
+  const numericObjectIds = Array.from(new Set(objectIds
+    .map((objectId) => typeof objectId === 'number' ? objectId : Number(objectId))
+    .filter((objectId) => Number.isFinite(objectId))))
+  if (numericObjectIds.length === 0) return []
+  const query = layer.createQuery ? layer.createQuery() : {}
+  query.objectIds = numericObjectIds
+  query.outFields = ['*']
+  query.returnGeometry = returnGeometry
+  const result = await layer.queryFeatures(query)
+  return result?.features || []
+}
+
 const collectMatchingDataSourceIds = (
   appConfig: any,
   targetUrl: string,
@@ -1651,6 +1698,42 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
   const getSurveyMonumentRuntimeDataSources = React.useCallback(async () =>
     getRuntimeDataSources(surveyMonumentsUrl, surveyMonumentDataSourceIds),
   [getRuntimeDataSources, surveyMonumentDataSourceIds, surveyMonumentsUrl])
+
+  const refreshDeleteMonumentViews = React.useCallback(async () => {
+    const dataSources = [
+      ...(await getSurveyMonumentRuntimeDataSources()),
+      ...(await getMonumentHistoryRuntimeDataSources())
+    ]
+    dataSources.forEach((dataSource: any) => {
+      try {
+        MessageManager.getInstance().publishMessage(
+          new DataRecordsSelectionChangeMessage(props.id, [], [dataSource.id])
+        )
+        dataSource.clearSelection?.()
+        dataSource.refresh?.()
+      } catch {
+        // Refresh is best-effort; delete verification already queried the service.
+      }
+    })
+
+    await jimuMapView?.whenAllJimuLayerViewLoaded?.()
+    const layerViews = jimuMapView?.getAllLoadedJimuLayerViews?.() || []
+    for (const layerView of layerViews) {
+      const layer = layerView.layer || {}
+      const candidates = [
+        layer.url,
+        layer.parsedUrl?.path,
+        layer.layerId !== undefined && layer.url ? `${String(layer.url).replace(/\/+$/, '')}/${layer.layerId}` : ''
+      ].filter(Boolean).map(String)
+      if (!urlCandidatesMatch(surveyMonumentsUrl, candidates) && !urlCandidatesMatch(monumentHistoryUrl, candidates)) continue
+      try {
+        layerView.selectFeaturesByIds?.([])
+        layer.refresh?.()
+      } catch {
+        // Keep UI cleanup moving if one map layer view is stale.
+      }
+    }
+  }, [getMonumentHistoryRuntimeDataSources, getSurveyMonumentRuntimeDataSources, jimuMapView, monumentHistoryUrl, props.id, surveyMonumentsUrl])
 
   const getMonumentProjectsLayer = React.useCallback(async () => {
     if (monumentProjectsLayerRef.current?.url === monumentProjectsUrl) {
@@ -2446,7 +2529,7 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
             [historyProjectGlobalIdField]: projectGlobalId
           }
         }))
-      })
+      }, getApplyEditsOptions(layer))
       const failedResult = (results.updateFeatureResults || []).find((result: any) => result?.error)
       if (failedResult) throw new Error(failedResult.error?.message || m.autoAssignFailed)
 
@@ -2646,7 +2729,7 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
               [historyProjectGlobalIdField]: projectGlobalId
             }
           })]
-        })
+        }, getApplyEditsOptions(layer))
         const failedResult = (results.updateFeatureResults || []).find((result: any) => result?.error)
         if (failedResult) updateError = failedResult
       } catch (err) {
@@ -2661,9 +2744,7 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
                 [historyProjectGlobalIdField]: projectGlobalId
               }
             })]
-          }, {
-            globalIdUsed: true
-          })
+          }, getApplyEditsOptions(layer, { globalIdUsed: true }))
           updateError = (globalIdResults.updateFeatureResults || []).find((result: any) => result?.error) || null
         } catch (err) {
           updateError = err
@@ -4165,6 +4246,7 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
     try {
       const historyLayer = await getMonumentHistoryLayer()
       const surveyLayer = await getSurveyMonumentsLayer()
+      const [Graphic] = await loadArcGISJSAPIModules(['esri/Graphic'])
 
       if (historyRows.length > 0) {
         setStatus(m.targetMergeApplyingHistory)
@@ -4175,19 +4257,15 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
               [historyMonumentGlobalIdField]: targetGlobalId
             }
           }))
-        }, {
-          rollbackOnFailureEnabled: true
-        })
+        }, getApplyEditsOptions(historyLayer))
         const updateError = getFailedEditResult(updateResults, 'updateFeatureResults', m.targetMergeFailed)
         if (updateError) throw updateError
       }
 
       setStatus(m.targetMergeDeletingSources)
       const deleteResults = await surveyLayer.applyEdits({
-        deleteFeatures: sourceObjectIds.map((objectId) => ({ attributes: { OBJECTID: objectId } }))
-      }, {
-        rollbackOnFailureEnabled: true
-      })
+        deleteFeatures: getDeleteGraphics(Graphic, surveyLayer, sourceObjectIds)
+      }, getApplyEditsOptions(surveyLayer))
       const deleteError = getFailedEditResult(deleteResults, 'deleteFeatureResults', m.targetMergeFailed)
       if (deleteError) throw deleteError
 
@@ -4271,9 +4349,8 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
       setRemoveMonumentsPlan(plan)
       if (plan) setStatus(`${m.deleteMonumentsPlanReady}: ${plan.surveyDeleteCount} ${m.surveyMonumentsLayer}, ${plan.historyDeleteCount} ${m.historyCountLabel}`)
     } catch (err) {
-      const message = err instanceof Error ? err.message : m.deleteMonumentsFailed
       setRemoveMonumentsPlan(null)
-      setStatus(`${m.deleteMonumentsFailed} ${message || ''}`.trim())
+      setStatus(getOperationErrorStatus(m.deleteMonumentsFailed, err))
     } finally {
       setBuildingRemoveMonumentsPlan(false)
     }
@@ -4289,32 +4366,73 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
     if (!removeMonumentsPlan || !removeMonumentsPlan.canCommit) return
 
     setApplyingRemoveMonuments(true)
+    const rollbackSteps: Array<() => Promise<void>> = []
     try {
       const historyLayer = await getMonumentHistoryLayer()
       const surveyLayer = await getSurveyMonumentsLayer()
+      const [Graphic] = await loadArcGISJSAPIModules(['esri/Graphic'])
       const historyRows = removeMonumentsPlan.rows.flatMap((row) => row.historyRows)
       const surveyObjectIds = removeMonumentsPlan.rows.map((row) => row.monument.objectId)
+      const originalHistoryFeatures = historyRows.length > 0
+        ? await queryLayerFeaturesByObjectIds(historyLayer, historyRows.map((row) => row.objectId), false)
+        : []
+      const originalSurveyFeatures = await queryLayerFeaturesByObjectIds(surveyLayer, surveyObjectIds)
+      const getFeatureObjectId = (layer: any, feature: any) =>
+        getAttributeValue(feature?.attributes || {}, layer?.objectIdField || 'OBJECTID')
+      const getRemainingObjectIds = async (layer: any, objectIds: Array<string | number>) =>
+        (await queryLayerFeaturesByObjectIds(layer, objectIds, false))
+          .map((feature: any) => getFeatureObjectId(layer, feature))
+          .filter((objectId: any) => objectId !== undefined && objectId !== null)
+      const getDeletedFeatures = (layer: any, features: any[], remainingObjectIds: Array<string | number>) => {
+        const remainingKeys = new Set(remainingObjectIds.map((objectId) => String(objectId)))
+        return features.filter((feature: any) => !remainingKeys.has(String(getFeatureObjectId(layer, feature))))
+      }
 
       if (historyRows.length > 0) {
         setStatus(m.deleteMonumentsDeletingHistory)
+        const historyObjectIds = historyRows.map((row) => row.objectId)
         const historyDeleteResults = await historyLayer.applyEdits({
-          deleteFeatures: historyRows.map((row) => ({ attributes: { OBJECTID: row.objectId } }))
-        }, {
-          rollbackOnFailureEnabled: true
-        })
+          deleteFeatures: getDeleteGraphics(Graphic, historyLayer, historyObjectIds)
+        }, getApplyEditsOptions(historyLayer))
         const historyDeleteError = getFailedEditResult(historyDeleteResults, 'deleteFeatureResults', m.deleteMonumentsFailed)
         if (historyDeleteError) throw historyDeleteError
+        const remainingHistoryObjectIds = await getRemainingObjectIds(historyLayer, historyObjectIds)
+        const deletedHistoryFeatures = getDeletedFeatures(historyLayer, originalHistoryFeatures, remainingHistoryObjectIds)
+        rollbackSteps.push(async () => {
+          if (deletedHistoryFeatures.length === 0) return
+          await historyLayer.applyEdits({
+            addFeatures: deletedHistoryFeatures.map((feature: any) => ({
+              attributes: getRollbackAddAttributes(feature.attributes || {}, historyLayer)
+            }))
+          }, getApplyEditsOptions(historyLayer, { globalIdUsed: true }))
+        })
+        if (remainingHistoryObjectIds.length > 0) {
+          throw new Error(`${m.deleteMonumentsVerifyFailed} ${remainingHistoryObjectIds.join(', ')}`)
+        }
       }
 
       setStatus(m.deleteMonumentsDeletingSurvey)
       const surveyDeleteResults = await surveyLayer.applyEdits({
-        deleteFeatures: surveyObjectIds.map((objectId) => ({ attributes: { OBJECTID: objectId } }))
-      }, {
-        rollbackOnFailureEnabled: true
-      })
+        deleteFeatures: getDeleteGraphics(Graphic, surveyLayer, surveyObjectIds)
+      }, getApplyEditsOptions(surveyLayer))
       const surveyDeleteError = getFailedEditResult(surveyDeleteResults, 'deleteFeatureResults', m.deleteMonumentsFailed)
       if (surveyDeleteError) throw surveyDeleteError
+      const remainingSurveyObjectIds = await getRemainingObjectIds(surveyLayer, surveyObjectIds)
+      const deletedSurveyFeatures = getDeletedFeatures(surveyLayer, originalSurveyFeatures, remainingSurveyObjectIds)
+      rollbackSteps.push(async () => {
+        if (deletedSurveyFeatures.length === 0) return
+        await surveyLayer.applyEdits({
+          addFeatures: deletedSurveyFeatures.map((feature: any) => ({
+            geometry: feature.geometry,
+            attributes: getRollbackAddAttributes(feature.attributes || {}, surveyLayer)
+          }))
+        }, getApplyEditsOptions(surveyLayer, { globalIdUsed: true }))
+      })
+      if (remainingSurveyObjectIds.length > 0) {
+        throw new Error(`${m.deleteMonumentsVerifyFailed} ${remainingSurveyObjectIds.join(', ')}`)
+      }
 
+      await refreshDeleteMonumentViews()
       setStatus(`${m.deleteMonumentsComplete}: ${removeMonumentsPlan.surveyDeleteCount} ${m.surveyMonumentsLayer}, ${removeMonumentsPlan.historyDeleteCount} ${m.historyCountLabel}`)
       setRemoveMonumentsModalOpen(false)
       setRemoveMonumentsPlan(null)
@@ -4324,8 +4442,16 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
       setActiveAssignHistoryKey('')
       monumentGraphicsLayerRef.current?.removeAll?.()
     } catch (err) {
-      const message = err instanceof Error ? err.message : m.deleteMonumentsFailed
-      setStatus(`${m.deleteMonumentsFailed} ${message || ''}`.trim())
+      try {
+        for (const rollbackStep of [...rollbackSteps].reverse()) {
+          await rollbackStep()
+        }
+      } catch (rollbackErr) {
+        setStatus(getOperationErrorStatus(m.deleteMonumentsRollbackFailed, rollbackErr))
+        return
+      }
+      const rollbackStatus = rollbackSteps.length > 0 ? ` ${m.deleteMonumentsRollbackComplete}` : ''
+      setStatus(`${getOperationErrorStatus(m.deleteMonumentsFailed, err)}${rollbackStatus}`.trim())
     } finally {
       setApplyingRemoveMonuments(false)
     }
@@ -4336,8 +4462,12 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
     m.deleteMonumentsDeletingHistory,
     m.deleteMonumentsDeletingSurvey,
     m.deleteMonumentsFailed,
+    m.deleteMonumentsRollbackComplete,
+    m.deleteMonumentsRollbackFailed,
+    m.deleteMonumentsVerifyFailed,
     m.historyCountLabel,
     m.surveyMonumentsLayer,
+    refreshDeleteMonumentViews,
     removeMonumentsPlan
   ])
 
@@ -4463,6 +4593,7 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
     try {
       const historyLayer = await getMonumentHistoryLayer()
       const surveyLayer = await getSurveyMonumentsLayer()
+      const [Graphic] = await loadArcGISJSAPIModules(['esri/Graphic'])
 
       setStatus(m.meanMergeApplyingTarget)
       const targetUpdateResults = await surveyLayer.applyEdits({
@@ -4470,9 +4601,7 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
           attributes: { OBJECTID: meanMergePlan.target.objectId },
           geometry: meanMergePlan.meanGeometry
         }]
-      }, {
-        rollbackOnFailureEnabled: true
-      })
+      }, getApplyEditsOptions(surveyLayer))
       const targetUpdateError = getFailedEditResult(targetUpdateResults, 'updateFeatureResults', m.meanMergeFailed)
       if (targetUpdateError) throw targetUpdateError
       targetMoved = true
@@ -4486,9 +4615,7 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
               [historyMonumentGlobalIdField]: targetGlobalId
             }
           }))
-        }, {
-          rollbackOnFailureEnabled: true
-        })
+        }, getApplyEditsOptions(historyLayer))
         const updateError = getFailedEditResult(updateResults, 'updateFeatureResults', m.meanMergeFailed)
         if (updateError) throw updateError
         historyUpdated = true
@@ -4496,10 +4623,8 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
 
       setStatus(m.targetMergeDeletingSources)
       const deleteResults = await surveyLayer.applyEdits({
-        deleteFeatures: sourceObjectIds.map((objectId) => ({ attributes: { OBJECTID: objectId } }))
-      }, {
-        rollbackOnFailureEnabled: true
-      })
+        deleteFeatures: getDeleteGraphics(Graphic, surveyLayer, sourceObjectIds)
+      }, getApplyEditsOptions(surveyLayer))
       const deleteError = getFailedEditResult(deleteResults, 'deleteFeatureResults', m.meanMergeFailed)
       if (deleteError) throw deleteError
 
@@ -4519,9 +4644,7 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
               attributes: { OBJECTID: meanMergePlan.target.objectId },
               geometry: meanMergePlan.targetOriginalGeometry
             }]
-          }, {
-            rollbackOnFailureEnabled: true
-          })
+          }, getApplyEditsOptions(surveyLayer))
           const rollbackError = getFailedEditResult(rollbackResults, 'updateFeatureResults', m.meanMergeTargetRollbackFailed)
           if (rollbackError) throw rollbackError
         } catch (rollbackErr) {
@@ -4778,19 +4901,6 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
       .map((result: any) => result?.objectId)
       .filter((objectId: any) => objectId !== undefined && objectId !== null)
 
-  const queryLayerFeaturesByObjectIds = async (layer: any, objectIds: Array<string | number>, returnGeometry = true) => {
-    const numericObjectIds = Array.from(new Set(objectIds
-      .map((objectId) => typeof objectId === 'number' ? objectId : Number(objectId))
-      .filter((objectId) => Number.isFinite(objectId))))
-    if (numericObjectIds.length === 0) return []
-    const query = layer.createQuery ? layer.createQuery() : {}
-    query.objectIds = numericObjectIds
-    query.outFields = ['*']
-    query.returnGeometry = returnGeometry
-    const result = await layer.queryFeatures(query)
-    return result?.features || []
-  }
-
   const getLayerEditCapabilityIssues = React.useCallback((layer: any, label: string, requirements: { add?: boolean, update?: boolean, delete?: boolean }) => {
     const operations = layer?.capabilities?.operations || {}
     const issues: FinalizeValidationMessage[] = []
@@ -4823,6 +4933,7 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
 
     try {
       const surveyLayer = await getSurveyMonumentsLayer()
+      const [Graphic] = await loadArcGISJSAPIModules(['esri/Graphic'])
       if (!plan.useSelectedProject) {
         const projectLayer = await getMonumentProjectsLayer()
         const projectGeometry = await getCsvProjectBoundaryPolygon(getCreateProjectCsvRows())
@@ -4842,8 +4953,8 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
         if (projectObjectId === undefined || projectObjectId === null) throw new Error(m.createProjectFailed)
         rollbackSteps.push(async () => {
           await projectLayer.applyEdits({
-            deleteFeatures: [{ attributes: { OBJECTID: projectObjectId } }]
-          })
+            deleteFeatures: getDeleteGraphics(Graphic, projectLayer, [projectObjectId])
+          }, getApplyEditsOptions(projectLayer))
         })
       }
 
@@ -4868,8 +4979,8 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
         rollbackSteps.push(async () => {
           if (createdSurveyObjectIds.length === 0) return
           await surveyLayer.applyEdits({
-            deleteFeatures: createdSurveyObjectIds.map((objectId: number | string) => ({ attributes: { OBJECTID: objectId } }))
-          })
+            deleteFeatures: getDeleteGraphics(Graphic, surveyLayer, createdSurveyObjectIds)
+          }, getApplyEditsOptions(surveyLayer))
         })
         const surveyCreateError = getFailedEditResult(surveyCreateResults, 'addFeatureResults', m.createProjectFailed)
         if (surveyCreateError) throw surveyCreateError
@@ -4884,9 +4995,7 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
               [monumentPointNumberField]: row.pointNumber === '-' ? null : row.pointNumber
             }
           }))
-        }, {
-          rollbackOnFailureEnabled: true
-        })
+        }, getApplyEditsOptions(surveyLayer))
         rollbackSteps.push(async () => {
           if (updateRows.length === 0) return
           await surveyLayer.applyEdits({
@@ -4896,9 +5005,7 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
                 [monumentPointNumberField]: row.currentPointNumber || null
               }
             }))
-          }, {
-            rollbackOnFailureEnabled: true
-          })
+          }, getApplyEditsOptions(surveyLayer))
         })
         const surveyUpdateError = getFailedEditResult(surveyUpdateResults, 'updateFeatureResults', m.createProjectFailed)
         if (surveyUpdateError) throw surveyUpdateError
@@ -5281,6 +5388,7 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
       const traverseLayer = await getTraverseConnectionsLayer()
       const surveyLayer = await getSurveyMonumentsLayer()
       const historyLayer = await getMonumentHistoryLayer()
+      const [Graphic] = await loadArcGISJSAPIModules(['esri/Graphic'])
 
       const deleteTraverseEdits = finalizePlan.edits.filter((edit) => edit.kind === 'delete-traverse-connection' && edit.objectId !== undefined)
       const createTraverseEdits = finalizePlan.edits.filter((edit) => edit.kind === 'create-traverse-connection' && edit.geometry)
@@ -5298,10 +5406,8 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
         const deleteObjectIds = deleteTraverseEdits.map((edit) => edit.objectId as string | number)
         const originalTraverseFeatures = await queryLayerFeaturesByObjectIds(traverseLayer, deleteObjectIds)
         const deleteResults = await traverseLayer.applyEdits({
-          deleteFeatures: deleteObjectIds.map((objectId) => ({ attributes: { OBJECTID: objectId } }))
-        }, {
-          rollbackOnFailureEnabled: true
-        })
+          deleteFeatures: getDeleteGraphics(Graphic, traverseLayer, deleteObjectIds)
+        }, getApplyEditsOptions(traverseLayer))
         const deleteError = getFailedEditResult(deleteResults, 'deleteFeatureResults', m.finalizeProjectFailed)
         if (deleteError) throw deleteError
         traverseRollbackSteps.push(async () => {
@@ -5311,9 +5417,7 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
               geometry: feature.geometry,
               attributes: stripSystemEditAttributes(feature.attributes || {}, traverseLayer)
             }))
-          }, {
-            rollbackOnFailureEnabled: true
-          })
+          }, getApplyEditsOptions(traverseLayer))
         })
       }
 
@@ -5323,19 +5427,15 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
             geometry: edit.geometry,
             attributes: edit.attributes || {}
           }))
-        }, {
-          rollbackOnFailureEnabled: true
-        })
+        }, getApplyEditsOptions(traverseLayer))
         const createError = getFailedEditResult(createResults, 'addFeatureResults', m.finalizeProjectFailed)
         if (createError) throw createError
         const createdObjectIds = getEditResultObjectIds(createResults, 'addFeatureResults')
         traverseRollbackSteps.push(async () => {
           if (createdObjectIds.length === 0) return
           await traverseLayer.applyEdits({
-            deleteFeatures: createdObjectIds.map((objectId: number | string) => ({ attributes: { OBJECTID: objectId } }))
-          }, {
-            rollbackOnFailureEnabled: true
-          })
+            deleteFeatures: getDeleteGraphics(Graphic, traverseLayer, createdObjectIds)
+          }, getApplyEditsOptions(traverseLayer))
         })
       }
 
@@ -5353,9 +5453,7 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
             geometry: edit.geometry,
             attributes: { OBJECTID: edit.objectId }
           }))
-        }, {
-          rollbackOnFailureEnabled: true
-        })
+        }, getApplyEditsOptions(surveyLayer))
         const updateError = getFailedEditResult(updateResults, 'updateFeatureResults', m.finalizeProjectFailed)
         if (updateError) throw updateError
         surveyRollbackSteps.push(async () => {
@@ -5368,9 +5466,7 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
                 OBJECTID: getAttributeValue(feature.attributes || {}, 'OBJECTID')
               }
             }))
-          }, {
-            rollbackOnFailureEnabled: true
-          })
+          }, getApplyEditsOptions(surveyLayer))
         })
       }
 
@@ -5381,19 +5477,15 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
             geometry: edit.geometry,
             attributes: edit.attributes || {}
           }))
-        }, {
-          rollbackOnFailureEnabled: true
-        })
+        }, getApplyEditsOptions(surveyLayer))
         const createError = getFailedEditResult(createResults, 'addFeatureResults', m.finalizeProjectFailed)
         if (createError) throw createError
         const createdObjectIds = getEditResultObjectIds(createResults, 'addFeatureResults')
         surveyRollbackSteps.push(async () => {
           if (createdObjectIds.length === 0) return
           await surveyLayer.applyEdits({
-            deleteFeatures: createdObjectIds.map((objectId: number | string) => ({ attributes: { OBJECTID: objectId } }))
-          }, {
-            rollbackOnFailureEnabled: true
-          })
+            deleteFeatures: getDeleteGraphics(Graphic, surveyLayer, createdObjectIds)
+          }, getApplyEditsOptions(surveyLayer))
         })
 
         const createdSurveyFeatures = await queryLayerFeaturesByObjectIds(surveyLayer, createdObjectIds, false)
@@ -5421,9 +5513,7 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
               OBJECTID: edit.objectId
             }
           }))
-        }, {
-          rollbackOnFailureEnabled: true
-        })
+        }, getApplyEditsOptions(historyLayer))
         const updateError = getFailedEditResult(updateResults, 'updateFeatureResults', m.finalizeProjectFailed)
         if (updateError) throw updateError
       }
@@ -5434,9 +5524,7 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
           addFeatures: createHistoryEdits.map((edit) => ({
             attributes: edit.attributes || {}
           }))
-        }, {
-          rollbackOnFailureEnabled: true
-        })
+        }, getApplyEditsOptions(historyLayer))
         const createError = getFailedEditResult(createResults, 'addFeatureResults', m.finalizeProjectFailed)
         if (createError) throw createError
         ;(createResults.addFeatureResults || []).forEach((result: any, index: number) => {
@@ -5464,9 +5552,7 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
         historyTableTouched = true
         const backfillResults = await historyLayer.applyEdits({
           updateFeatures: backfillUpdates
-        }, {
-          rollbackOnFailureEnabled: true
-        })
+        }, getApplyEditsOptions(historyLayer))
         const backfillError = getFailedEditResult(backfillResults, 'updateFeatureResults', m.finalizeProjectFailed)
         if (backfillError) throw backfillError
       }
@@ -5689,9 +5775,7 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
             [monumentPointNumberField]: row.newPointNumber
           }
         }))
-      }, {
-        rollbackOnFailureEnabled: true
-      })
+      }, getApplyEditsOptions(layer))
       const failedResult = (results.updateFeatureResults || []).find((result: any) => result?.error)
       if (failedResult) throw new Error(failedResult.error?.message || m.pointNumberApplyFailed)
 
@@ -5708,9 +5792,7 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
                 [monumentPointNumberField]: row.currentPointNumber || null
               }
             }))
-          }, {
-            rollbackOnFailureEnabled: true
-          })
+          }, getApplyEditsOptions(layer))
         } catch (rollbackErr) {
           const rollbackMessage = rollbackErr instanceof Error ? rollbackErr.message : m.pointNumberRollbackFailed
           setStatus(`${m.pointNumberRollbackFailed} ${rollbackMessage || ''}`.trim())
@@ -5891,9 +5973,7 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
             [PROJECT_BASIS_OF_BEARING_FIELD]: value
           }
         }]
-      }, {
-        rollbackOnFailureEnabled: true
-      })
+      }, getApplyEditsOptions(layer))
       const failedResult = (results.updateFeatureResults || []).find((result: any) => result?.error)
       if (failedResult) throw new Error(failedResult.error?.message || m.basisOfBearingUpdateFailed)
       setStatus(`${m.basisOfBearingAccepted} ${value}`)

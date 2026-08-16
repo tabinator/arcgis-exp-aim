@@ -36,6 +36,7 @@ import type {
   CartLayerQueryResult,
   PackageCartItem,
   PackageSummary,
+  QueryFeature,
   QueryResponse,
   SelectedPackage,
   SelectionSource,
@@ -66,6 +67,21 @@ interface WorkOrderFeatureSnapshot {
 interface PackageFieldSnapshot {
   item: PackageCartItem
   packageValue: any
+}
+
+interface ItemRowOptions {
+  onRemove?: (item: PackageCartItem) => void
+  onAction?: (item: PackageCartItem) => void
+  onSelect?: (item: PackageCartItem) => void
+  showPropertyMetadata?: boolean
+  showStatusInPrimaryText?: boolean
+  showPropertyNameLine?: boolean
+  selectedPhaseKeys?: string[]
+  onPhaseSelectionToggle?: (item: PackageCartItem) => void
+}
+
+interface GroupedItemsPanelOptions extends ItemRowOptions {
+  emptyMessage: string
 }
 
 const PACKAGE_ID_SEARCH_FIELD = 'PCKGID'
@@ -537,6 +553,7 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
     currentSelectionItems,
     committedPackagePhaseIdentities,
     getPhaseIdentity,
+    hasEmptyWorkOrderValue,
     isModifyMode,
     loadingPackagePhases,
     m.modifyPackagePropertyNameConflict,
@@ -725,12 +742,12 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
     fallbackErrorMessage = m.featureUpdateFailed
   ) => {
     const { objectIdField, fields } = await getLayerEditInfo(layerUrl)
-    const resolvedAttributes = Object.entries(attributes).reduce((resolved, [fieldName, value]) => {
+    const resolvedAttributes = Object.entries(attributes).reduce<{ [key: string]: any }>((resolved, [fieldName, value]) => {
       const field = fields.find((candidate) => candidate.name.toLowerCase() === fieldName.toLowerCase())
       if (!field) throw new Error(`${m.featureFieldMissing} ${fieldName}`)
       resolved[field.name] = value
       return resolved
-    }, {} as { [key: string]: any })
+    }, {})
     const q = new URL(`${layerUrl.replace(/\/+$/, '')}/applyEdits`)
     const body = new URLSearchParams({
       f: 'json',
@@ -767,12 +784,12 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
     }
 
     const { objectIdField, fields } = await getLayerEditInfo(layerUrl)
-    const resolvedAttributes = Object.entries(attributes).reduce((resolved, [fieldName, value]) => {
+    const resolvedAttributes = Object.entries(attributes).reduce<{ [key: string]: any }>((resolved, [fieldName, value]) => {
       const field = fields.find((candidate) => candidate.name.toLowerCase() === fieldName.toLowerCase())
       if (!field) throw new Error(`${m.featureFieldMissing} ${fieldName}`)
       resolved[field.name] = value
       return resolved
-    }, {} as { [key: string]: any })
+    }, {})
     const q = new URL(`${layerUrl.replace(/\/+$/, '')}/applyEdits`)
     const body = new URLSearchParams({
       f: 'json',
@@ -821,7 +838,7 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
     if (response.type === 'opaque') return null
 
     const text = await response.text()
-    let data: any = text
+    let data: any
     try {
       data = text ? JSON.parse(text) : null
     } catch {
@@ -1015,7 +1032,7 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
     return snapshots
   }
 
-  const compactActionButtonStyle = {
+  const compactActionButtonStyle: React.CSSProperties = {
     flex: '1 1 0',
     minWidth: 0,
     height: 30,
@@ -1026,7 +1043,7 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
     textAlign: 'center'
   }
 
-  const modeActionButtonStyle = {
+  const modeActionButtonStyle: React.CSSProperties = {
     height: 30,
     padding: '0 10px',
     fontSize: 11,
@@ -1034,7 +1051,7 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
     whiteSpace: 'nowrap',
     textAlign: 'center'
   }
-  const validationAlertStyle = {
+  const validationAlertStyle: React.CSSProperties = {
     fontSize: 11,
     lineHeight: '14px'
   }
@@ -1202,8 +1219,8 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
     return Array.isArray(d.fields) ? d.fields : []
   }
 
-  const findLayerField = (fields: LayerFieldInfo[], fieldName: string) =>
-    fields.find((field) => normalizeFieldName(field.name) === normalizeFieldName(fieldName))
+  const findLayerField = React.useCallback((fields: LayerFieldInfo[], fieldName: string) =>
+    fields.find((field) => normalizeFieldName(field.name) === normalizeFieldName(fieldName)), [])
 
   const getStatusOptionsFromFields = (fields: LayerFieldInfo[]) => {
     const statusField = findLayerField(fields, 'Status')
@@ -1306,7 +1323,7 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
       .filter(([, summary]) => summary.isEligible && summary.matchesSearch)
       .map(([id, summary]) => ({ id, featureCount: summary.featureCount }))
       .sort((a, b) => a.id.localeCompare(b.id))
-  }, [packageField])
+  }, [findLayerField, packageField])
 
   const queryPackageFeatures = async (layerUrl: string, pkg: string): Promise<QueryResponse> => {
     const allFeatures: QueryFeature[] = []
@@ -1649,14 +1666,6 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
     }
   }
 
-  const openDeleteConfirmation = () => {
-    if (!selectedPackage) {
-      setStatus(m.deleteNeedsSelection)
-      return
-    }
-    setIsDeleteConfirmationOpen(true)
-  }
-
   const closeDeleteConfirmation = () => {
     setIsDeleteConfirmationOpen(false)
   }
@@ -1899,7 +1908,7 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
     setStatus(m.modifySelectionPropertyNameMismatch)
   }, [cartRestAttributes, isModifyMode, m.modifyPackagePropertyNameConflict, m.modifySelectionPropertyNameMismatch, modifyPropertyNamesMustMatch, modifySelectionItems, packagePropertyNameConflict, packagePropertyNameKey])
 
-  const ensureHighlightLayer = async () => {
+  const ensureHighlightLayer = React.useCallback(async () => {
     if (!jimuMapView?.view?.map) throw new Error(m.mapNotConfigured)
     if (highlightLayerRef.current && highlightMapRef.current !== jimuMapView.view.map) {
       highlightMapRef.current?.remove?.(highlightLayerRef.current)
@@ -1921,7 +1930,7 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
       jimuMapView.view.map.reorder?.(highlightLayerRef.current, layerIndex - 1)
     }
     return highlightLayerRef.current
-  }
+  }, [jimuMapView, m.mapNotConfigured, props.id])
 
   const ensureCartGraphicsLayer = React.useCallback(async () => {
     if (!jimuMapView?.view?.map) return null
@@ -1967,7 +1976,7 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
     return phaseSelectionLayerRef.current
   }
 
-  const getGeometryJson = (geometry: any, geometryType?: string, spatialReference?: any) => {
+  const getGeometryJson = React.useCallback((geometry: any, geometryType?: string, spatialReference?: any) => {
     const geometryJson = { ...geometry }
     if (geometryType && !geometryJson.type) {
       geometryJson.type = geometryType.replace('esriGeometry', '').toLowerCase()
@@ -1976,9 +1985,9 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
       geometryJson.spatialReference = spatialReference
     }
     return geometryJson
-  }
+  }, [])
 
-  const getHighlightSymbol = (geometry: any) => {
+  const getHighlightSymbol = React.useCallback((geometry: any) => {
     const type = geometry?.type
     if (type === 'point' || type === 'multipoint') {
       return {
@@ -2001,7 +2010,7 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
       color: [255, 244, 120, 0.14],
       outline: { color: [255, 255, 255, 0.95], width: 3 }
     }
-  }
+  }, [])
 
   const getCartGraphicSymbol = (geometry: any) => {
     const type = geometry?.type
@@ -2078,7 +2087,7 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
     removeItemGraphicsFromLayer(phaseSelectionLayerRef.current, item)
   }
 
-  const addItemsToPackageHighlight = async (items: PackageCartItem[]) => {
+  const addItemsToPackageHighlight = React.useCallback(async (items: PackageCartItem[]) => {
     if (items.length === 0) return
     const layer = await ensureHighlightLayer()
     const [Graphic, geometryJsonUtils] = await loadArcGISJSAPIModules([
@@ -2125,13 +2134,13 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
       removeItemGraphicsFromLayer(layer, item)
     })
     if (graphics.length > 0) layer.addMany(graphics)
-  }
+  }, [ensureHighlightLayer, getGeometryJson, getHighlightSymbol, queryCartFeatures])
 
-  const redrawPackageHighlightFromItems = async (items: PackageCartItem[]) => {
+  const redrawPackageHighlightFromItems = React.useCallback(async (items: PackageCartItem[]) => {
     const layer = await ensureHighlightLayer()
     layer.removeAll()
     await addItemsToPackageHighlight(items)
-  }
+  }, [addItemsToPackageHighlight, ensureHighlightLayer])
 
   React.useEffect(() => {
     if (!isModifyMode || !selectedPackage || packagePhaseItems.length === 0) return
@@ -2146,7 +2155,7 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
     return () => {
       cancelled = true
     }
-  }, [isModifyMode, packagePhaseItems, selectedPackage])
+  }, [isModifyMode, packagePhaseItems, redrawPackageHighlightFromItems, selectedPackage])
 
   const renderPackageHighlight = async (
     layerUrl: string,
@@ -2341,7 +2350,7 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
     return () => {
       cancelled = true
     }
-  }, [cartItems, cartQueryResults, ensureCartGraphicsLayer, isCreateMode, m.cartGraphicsError])
+  }, [cartItems, cartQueryResults, ensureCartGraphicsLayer, getGeometryJson, isCreateMode, m.cartGraphicsError])
 
   React.useEffect(() => () => {
     highlightLayerRef.current?.removeAll?.()
@@ -2408,7 +2417,7 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
     }
   }, [isCreateMode, isModifyMode, isReviewWorkOrderMode, refresh])
 
-  const runPackageSearch = async (rawSearchText: string) => {
+  const runPackageSearch = React.useCallback(async (rawSearchText: string) => {
     const searchText = rawSearchText.trim()
     if (searchText.length > 0 && searchText.length < PACKAGE_SEARCH_MINIMUM_LENGTH) {
       setStatus(m.packageSearchMinimum)
@@ -2446,7 +2455,7 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
     } finally {
       setSearchingPackages(false)
     }
-  }
+  }, [loadLayerPackages, m.layerPrefix, m.noTargetLayers, m.packageListReady, m.packageSearchFailed, m.packageSearchMinimum, m.packageSearchReady, targetLayers])
 
   const readBoxApiResponse = async (response: Response) => {
     const text = await response.text()
@@ -2571,7 +2580,7 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
     return () => {
       window.clearTimeout(timer)
     }
-  }, [packageSearchTerm])
+  }, [packageSearchTerm, runPackageSearch])
 
   const row = (layerUrl: string, pkg: PackageSummary) => {
     const key = getPackageKey(layerUrl, pkg.id)
@@ -2612,15 +2621,18 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
 
   const itemRow = (
     item: PackageCartItem,
-    onRemove?: (item: PackageCartItem) => void,
-    onAction?: (item: PackageCartItem) => void,
-    onSelect?: (item: PackageCartItem) => void,
-    showPropertyMetadata?: boolean,
-    showStatusInPrimaryText?: boolean,
-    showPropertyNameLine = true,
-    selectedPhaseKeys?: string[],
-    onPhaseSelectionToggle?: (item: PackageCartItem) => void
+    options: ItemRowOptions = {}
   ) => {
+    const {
+      onRemove,
+      onAction,
+      onSelect,
+      showPropertyMetadata,
+      showStatusInPrimaryText,
+      showPropertyNameLine = true,
+      selectedPhaseKeys,
+      onPhaseSelectionToggle
+    } = options
     const restAttributes = cartRestAttributes[item.key] || {}
     const workCodeValue = getAttributeValue(restAttributes, WORK_CODE_FIELD) ?? getAttributeValue(item.attributes || {}, WORK_CODE_FIELD)
     const workCode = workCodeValue === null || workCodeValue === undefined || String(workCodeValue).trim() === ''
@@ -2793,32 +2805,15 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
 
   const groupedItemsPanel = (
     items: PackageCartItem[],
-    emptyMessage: string,
-    onRemove?: (item: PackageCartItem) => void,
-    onAction?: (item: PackageCartItem) => void,
-    onSelect?: (item: PackageCartItem) => void,
-    showPropertyMetadata?: boolean,
-    showStatusInPrimaryText?: boolean,
-    showPropertyNameLine?: boolean,
-    selectedPhaseKeys?: string[],
-    onPhaseSelectionToggle?: (item: PackageCartItem) => void
+    options: GroupedItemsPanelOptions
   ) => {
+    const { emptyMessage, ...itemOptions } = options
     const itemGroups = groupItemsByLayer(items)
     if (itemGroups.length === 0) return h('div', { style: { fontSize: 12, opacity: 0.75 } }, emptyMessage)
     return h(React.Fragment, null,
       ...itemGroups.map((group) =>
         h('div', { key: group.layerName },
-          ...group.items.map((item) => itemRow(
-            item,
-            onRemove,
-            onAction,
-            onSelect,
-            showPropertyMetadata,
-            showStatusInPrimaryText,
-            showPropertyNameLine,
-            selectedPhaseKeys,
-            onPhaseSelectionToggle
-          ))
+          ...group.items.map((item) => itemRow(item, itemOptions))
         )
       )
     )
@@ -2933,7 +2928,11 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
         ),
         cartLayerName && h('div', { className: 'mb-2', style: { fontSize: 11, opacity: 0.82 } }, `${m.packageLayer} ${cartLayerName}`),
         h('div', { className: 'flex-grow-1', style: { minHeight: 0, overflowY: 'auto', overflowX: 'hidden' } },
-          groupedItemsPanel(cartItems, m.cartEmpty, removeCartItem, undefined, undefined, true)
+          groupedItemsPanel(cartItems, {
+            emptyMessage: m.cartEmpty,
+            onRemove: removeCartItem,
+            showPropertyMetadata: true
+          })
         )
       ),
       validationWarnings.length > 0
@@ -3012,7 +3011,11 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
           h('div', { style: { fontSize: 11, opacity: 0.75 } }, `${modifySelectionItems.length} ${m.stagedFeaturesCountSuffix}`)
         ),
         h('div', { className: 'flex-grow-1', style: { minHeight: 0, overflowY: 'auto', overflowX: 'hidden' } },
-          groupedItemsPanel(modifySelectionItems, m.selectFeaturesEmpty, removeModifySelectionItem, undefined, undefined, true)
+          groupedItemsPanel(modifySelectionItems, {
+            emptyMessage: m.selectFeaturesEmpty,
+            onRemove: removeModifySelectionItem,
+            showPropertyMetadata: true
+          })
         ),
         h('div', { className: 'd-flex mt-2', style: { gap: '0.35rem' } },
           h(Button, {
@@ -3044,9 +3047,14 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
         h('div', { className: 'flex-grow-1', style: { minHeight: 0, overflowY: 'auto', overflowX: 'hidden' } },
           loadingPackagePhases
             ? h('div', { style: { fontSize: 12, opacity: 0.75 } }, m.loadingPackagePhases)
-            : groupedItemsPanel(packagePhaseItems, m.packagePhasesEmpty, undefined, requestRemovePackagePhase, (item) => {
-              selectPackagePhase(item).catch(() => undefined)
-            }, true)
+            : groupedItemsPanel(packagePhaseItems, {
+              emptyMessage: m.packagePhasesEmpty,
+              onAction: requestRemovePackagePhase,
+              onSelect: (item) => {
+                selectPackagePhase(item).catch(() => undefined)
+              },
+              showPropertyMetadata: true
+            })
         )
       ),
       status && h(Alert, {
@@ -3191,9 +3199,17 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
         h('div', { className: 'flex-grow-1', style: { minHeight: 0, overflowY: 'auto', overflowX: 'hidden' } },
           loadingPackagePhases
             ? h('div', { style: { fontSize: 12, opacity: 0.75 } }, m.loadingPackagePhases)
-            : groupedItemsPanel(packagePhaseItems, m.packagePhasesEmpty, undefined, undefined, (item) => {
-              selectPackagePhase(item).catch(() => undefined)
-            }, true, true, false, selectedWorkOrderPhaseKeys, toggleWorkOrderPhaseSelection)
+            : groupedItemsPanel(packagePhaseItems, {
+              emptyMessage: m.packagePhasesEmpty,
+              onSelect: (item) => {
+                selectPackagePhase(item).catch(() => undefined)
+              },
+              showPropertyMetadata: true,
+              showStatusInPrimaryText: true,
+              showPropertyNameLine: false,
+              selectedPhaseKeys: selectedWorkOrderPhaseKeys,
+              onPhaseSelectionToggle: toggleWorkOrderPhaseSelection
+            })
         )
       ),
       status && h(Alert, { form: 'basic', type: 'info', text: status, style: validationAlertStyle }),

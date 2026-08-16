@@ -44,6 +44,7 @@ git push -u origin feature/aim-work-orders-initial
 
 - `widgets/aim-manager`
 - `widgets/aim-create-work-order`
+- `widgets/monument-manager`
 
 ## Workflow Documentation
 
