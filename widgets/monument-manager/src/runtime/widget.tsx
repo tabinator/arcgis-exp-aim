@@ -267,7 +267,7 @@ type PointNumberPlanAction = 'update' | 'skip'
 
 interface PointNumberPlanRow {
   id: string
-  historyObjectId: number | string
+  historyObjectId?: number | string
   historyPointNumber: string
   pointGlobalId: string
   surveyObjectId?: number | string
@@ -279,6 +279,7 @@ interface PointNumberPlanRow {
 }
 
 interface PointNumberPlan {
+  source: 'history' | 'survey'
   rows: PointNumberPlanRow[]
   assignableRows: PointNumberPlanRow[]
   selectedCount: number
@@ -286,6 +287,7 @@ interface PointNumberPlan {
   missingPointGlobalIdCount: number
   missingPointNumberCount: number
   notFoundCount: number
+  noHistoryCount: number
   conflictCount: number
   alreadyMatchedCount: number
   overwriteCount: number
@@ -1207,6 +1209,7 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
   const [projects, setProjects] = React.useState<MonumentProjectSummary[]>([])
   const [selectedProject, setSelectedProject] = React.useState<MonumentProjectSummary | null>(null)
   const [historyItems, setHistoryItems] = React.useState<MonumentHistorySummary[]>([])
+  const [historySearchTerm, setHistorySearchTerm] = React.useState('')
   const [selectedHistoryKeys, setSelectedHistoryKeys] = React.useState<string[]>([])
   const [activeHistoryKey, setActiveHistoryKey] = React.useState('')
   const [assignSurveyMonuments, setAssignSurveyMonuments] = React.useState<SurveyMonumentSummary[]>([])
@@ -1468,6 +1471,15 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
   }), [historyMonumentGlobalIdField, historyProjectGlobalIdField])
 
   const getHistoryKey = (item: MonumentHistorySummary) => String(item.globalId || item.objectId)
+
+  const filteredHistoryItems = React.useMemo(() => {
+    const searchTerm = historySearchTerm.trim().toLowerCase()
+    if (!searchTerm) return historyItems
+    return historyItems.filter((item) =>
+      item.pointNumber.toLowerCase().includes(searchTerm) ||
+      String(item.objectId).toLowerCase().includes(searchTerm)
+    )
+  }, [historyItems, historySearchTerm])
 
   const getRecordAttributes = (record: any) =>
     record?.getDataBeforeMapping?.() || record?.feature?.attributes || record?.getData?.() || {}
@@ -5713,6 +5725,7 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
     const assignableRows = rows.filter((row) => row.action === 'update' && row.surveyObjectId !== undefined)
 
     return {
+      source: 'history',
       rows,
       assignableRows,
       selectedCount: selectedHistoryItems.length,
@@ -5720,6 +5733,7 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
       missingPointGlobalIdCount: rows.filter((row) => row.status === m.pointNumberMissingRelationship).length,
       missingPointNumberCount: rows.filter((row) => row.status === m.pointNumberMissingHistoryValue).length,
       notFoundCount: rows.filter((row) => row.status === m.monumentZoomNotFound).length,
+      noHistoryCount: 0,
       conflictCount: rows.filter((row) => row.status === m.pointNumberConflict).length,
       alreadyMatchedCount: rows.filter((row) => row.status === m.pointNumberAlreadyMatches).length,
       overwriteCount: rows.filter((row) => row.status === m.pointNumberWillOverwrite).length,
@@ -5739,6 +5753,139 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
     selectedHistoryKeys
   ])
 
+  const buildSurveyPointNumberPlan = React.useCallback(async (): Promise<PointNumberPlan | null> => {
+    if (!selectedProject?.globalId) {
+      setStatus(m.historyMissingProjectId)
+      return null
+    }
+    if (assignSurveyMonuments.length === 0) {
+      setStatus(m.assignSelectSurveyMonuments)
+      return null
+    }
+
+    const selectedProjectKey = normalizeGuidKey(selectedProject.globalId)
+    const candidatesByMonumentGlobalId = await loadAutoAssignHistoryCandidates(
+      assignSurveyMonuments.map((monument) => monument.globalId || '')
+    )
+    const rows: PointNumberPlanRow[] = assignSurveyMonuments.map((monument) => {
+      const monumentKey = getSurveyMonumentKey(monument)
+      const pointGlobalId = (monument.globalId || '').trim()
+      const currentPointNumber = monument.pointNumber === '-' ? '' : monument.pointNumber.trim()
+      const baseRow = {
+        id: `survey-point-number-${monumentKey}`,
+        pointGlobalId,
+        surveyObjectId: monument.objectId,
+        currentPointNumber
+      }
+
+      if (!pointGlobalId) {
+        return {
+          ...baseRow,
+          historyPointNumber: '-',
+          action: 'skip' as PointNumberPlanAction,
+          status: m.pointNumberMissingRelationship,
+          severity: 'error' as const
+        }
+      }
+
+      const candidates = candidatesByMonumentGlobalId.get(pointGlobalId.toLowerCase()) || []
+      const candidate = candidates[0]
+      if (!candidate) {
+        return {
+          ...baseRow,
+          historyPointNumber: '-',
+          action: 'skip' as PointNumberPlanAction,
+          status: m.pointNumberNoHistory,
+          severity: 'warning' as const
+        }
+      }
+
+      const candidatesWithPointNumber = candidates.filter((historyCandidate) => historyCandidate.pointNumber.trim())
+      const selectedProjectCandidates = candidatesWithPointNumber.filter((historyCandidate) =>
+        normalizeGuidKey(historyCandidate.projectGlobalId) === selectedProjectKey
+      )
+      const selectedProjectPointNumbers = new Set(selectedProjectCandidates.map((historyCandidate) =>
+        historyCandidate.pointNumber.trim().toLowerCase()
+      ))
+
+      if (selectedProjectPointNumbers.size > 1) {
+        return {
+          ...baseRow,
+          historyObjectId: selectedProjectCandidates[0]?.objectId,
+          historyPointNumber: selectedProjectCandidates[0]?.pointNumber || '-',
+          action: 'skip' as PointNumberPlanAction,
+          status: m.pointNumberProjectConflict,
+          severity: 'error' as const
+        }
+      }
+
+      const selectedCandidate = selectedProjectCandidates[0] || candidatesWithPointNumber[0]
+      if (!selectedCandidate) {
+        return {
+          ...baseRow,
+          historyObjectId: candidate.objectId,
+          historyPointNumber: candidate.pointNumber || '-',
+          action: 'skip' as PointNumberPlanAction,
+          status: m.pointNumberMissingHistoryValue,
+          severity: 'error' as const
+        }
+      }
+
+      const historyPointNumber = selectedCandidate.pointNumber.trim()
+      if (currentPointNumber === historyPointNumber) {
+        return {
+          ...baseRow,
+          historyObjectId: selectedCandidate.objectId,
+          historyPointNumber: selectedCandidate.pointNumber,
+          newPointNumber: historyPointNumber,
+          action: 'skip' as PointNumberPlanAction,
+          status: m.pointNumberAlreadyMatches,
+          severity: 'info' as const
+        }
+      }
+
+      return {
+        ...baseRow,
+        historyObjectId: selectedCandidate.objectId,
+        historyPointNumber: selectedCandidate.pointNumber,
+        newPointNumber: historyPointNumber,
+        action: 'update' as PointNumberPlanAction,
+        status: currentPointNumber ? m.pointNumberWillOverwrite : m.readyLabel,
+        severity: currentPointNumber ? 'warning' as const : 'ready' as const
+      }
+    })
+    const assignableRows = rows.filter((row) => row.action === 'update' && row.surveyObjectId !== undefined)
+
+    return {
+      source: 'survey',
+      rows,
+      assignableRows,
+      selectedCount: assignSurveyMonuments.length,
+      readyCount: assignableRows.length,
+      missingPointGlobalIdCount: rows.filter((row) => row.status === m.pointNumberMissingRelationship).length,
+      missingPointNumberCount: rows.filter((row) => row.status === m.pointNumberMissingHistoryValue).length,
+      notFoundCount: 0,
+      noHistoryCount: rows.filter((row) => row.status === m.pointNumberNoHistory).length,
+      conflictCount: rows.filter((row) => row.status === m.pointNumberProjectConflict).length,
+      alreadyMatchedCount: rows.filter((row) => row.status === m.pointNumberAlreadyMatches).length,
+      overwriteCount: rows.filter((row) => row.status === m.pointNumberWillOverwrite).length,
+      errorCount: rows.filter((row) => row.severity === 'error').length
+    }
+  }, [
+    assignSurveyMonuments,
+    loadAutoAssignHistoryCandidates,
+    m.assignSelectSurveyMonuments,
+    m.historyMissingProjectId,
+    m.pointNumberAlreadyMatches,
+    m.pointNumberMissingHistoryValue,
+    m.pointNumberMissingRelationship,
+    m.pointNumberNoHistory,
+    m.pointNumberProjectConflict,
+    m.pointNumberWillOverwrite,
+    m.readyLabel,
+    selectedProject?.globalId
+  ])
+
   const openPointNumberReview = React.useCallback(async () => {
     setBuildingPointNumberPlan(true)
     setPointNumberModalOpen(true)
@@ -5754,6 +5901,22 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
       setBuildingPointNumberPlan(false)
     }
   }, [buildPointNumberPlan, m.pointNumberPlanFailed, m.pointNumberPlanReady, m.pointNumberSkipped])
+
+  const openSurveyPointNumberReview = React.useCallback(async () => {
+    setBuildingPointNumberPlan(true)
+    setPointNumberModalOpen(true)
+    try {
+      const plan = await buildSurveyPointNumberPlan()
+      setPointNumberPlan(plan)
+      if (plan) setStatus(`${m.pointNumberPlanReady}: ${plan.readyCount}. ${m.pointNumberSkipped}: ${plan.rows.length - plan.readyCount}`)
+    } catch (err) {
+      const message = err instanceof Error ? err.message : m.pointNumberPlanFailed
+      setPointNumberPlan(null)
+      setStatus(`${m.pointNumberPlanFailed} ${message || ''}`.trim())
+    } finally {
+      setBuildingPointNumberPlan(false)
+    }
+  }, [buildSurveyPointNumberPlan, m.pointNumberPlanFailed, m.pointNumberPlanReady, m.pointNumberSkipped])
 
   const applyPointNumberPlan = React.useCallback(async () => {
     if (!pointNumberPlan) return
@@ -5781,7 +5944,15 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
 
       setStatus(`${m.pointNumberApplyComplete}: ${updateRows.length}`)
       setPointNumberModalOpen(false)
-      if (selectedProject) await loadProjectHistory(selectedProject)
+      if (pointNumberPlan.source === 'survey') {
+        const nextPointNumbersByObjectId = new Map(updateRows.map((row) => [String(row.surveyObjectId), row.newPointNumber || '']))
+        setAssignSurveyMonuments((current) => current.map((monument) => {
+          const nextPointNumber = nextPointNumbersByObjectId.get(String(monument.objectId))
+          return nextPointNumber === undefined ? monument : { ...monument, pointNumber: nextPointNumber }
+        }))
+      } else if (selectedProject) {
+        await loadProjectHistory(selectedProject)
+      }
     } catch (err) {
       if (layer && rollbackRows.length > 0) {
         try {
@@ -6563,14 +6734,18 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
         h('div', { className: 'd-flex align-items-center justify-content-between mb-2', style: { gap: '0.5rem' } },
           h('div', { className: 'font-weight-bold', style: { fontSize: 12 } }, m.monumentHistoryTitle),
           h('div', { className: 'd-flex align-items-center', style: { gap: '0.35rem', flex: '0 0 auto' } },
-            h('div', { style: { fontSize: 11, opacity: 0.75 } }, `${historyItems.length} ${m.featureCountLabel}`),
+            h('div', { style: { fontSize: 11, opacity: 0.75 } },
+              historySearchTerm.trim()
+                ? `${filteredHistoryItems.length}/${historyItems.length} ${m.featureCountLabel}`
+                : `${historyItems.length} ${m.featureCountLabel}`
+            ),
             h(Button, {
               size: 'sm',
               type: 'tertiary',
-              disabled: loadingHistory || historyItems.length === 0,
+              disabled: loadingHistory || filteredHistoryItems.length === 0,
               style: { height: 24, padding: '0 6px', fontSize: 11 },
               onClick: () => {
-                const allKeys = historyItems.map(getHistoryKey)
+                const allKeys = filteredHistoryItems.map(getHistoryKey)
                 setSelectedHistoryKeys(allKeys)
                 setStatus(`${m.selectedHistoryCount}: ${allKeys.length}`)
               }
@@ -6587,13 +6762,26 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
             }, m.clear)
           )
         ),
+        h('div', { className: 'mb-2' },
+          h(TextInput, {
+            value: historySearchTerm,
+            placeholder: m.historySearchPlaceholder,
+            disabled: loadingHistory || historyItems.length === 0,
+            onChange: (evt) => {
+              setHistorySearchTerm(evt.target.value)
+              setSelectedHistoryKeys([])
+            }
+          })
+        ),
         historyError && h(Alert, { form: 'basic', type: 'warning', text: historyError }),
         h('div', { className: 'flex-grow-1', style: { minHeight: 0, overflowY: 'auto', overflowX: 'hidden' } },
           loadingHistory
             ? h('div', { style: { fontSize: 12, opacity: 0.75 } }, m.loadingHistory)
             : historyItems.length === 0
               ? h('div', { style: { fontSize: 12, opacity: 0.75 } }, m.historyEmpty)
-              : historyItems.map(historyRow)
+              : filteredHistoryItems.length === 0
+                ? h('div', { style: { fontSize: 12, opacity: 0.75 } }, m.historySearchEmpty)
+                : filteredHistoryItems.map(historyRow)
         ),
         h('div', { className: 'd-flex mt-2', style: { gap: '0.35rem' } },
           h(Button, {
@@ -6669,7 +6857,16 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
             onClick: () => {
               openAutoAssignReview().catch(() => undefined)
             }
-          }, m.assignAll)
+          }, m.assignAll),
+          mode === 'create' && h(Button, {
+            type: 'default',
+            size: 'sm',
+            style: modeActionButtonStyle,
+            disabled: buildingPointNumberPlan || applyingPointNumbers || assignSurveyMonuments.length === 0 || !selectedProject,
+            onClick: () => {
+              openSurveyPointNumberReview().catch(() => undefined)
+            }
+          }, m.updatePointNumber)
         )
       ),
       h('div', { className: 'border rounded p-2 d-flex flex-column flex-grow-1', style: { minHeight: 0 } },
@@ -7242,7 +7439,7 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
       }, m.close),
       h(Button, {
         type: 'primary',
-        disabled: buildingPointNumberPlan || applyingPointNumbers || !pointNumberPlan || pointNumberPlan.readyCount === 0 || pointNumberPlan.errorCount > 0,
+        disabled: buildingPointNumberPlan || applyingPointNumbers || !pointNumberPlan || pointNumberPlan.readyCount === 0,
         onClick: () => {
           applyPointNumberPlan().catch(() => undefined)
         }
