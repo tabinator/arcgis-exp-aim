@@ -3,7 +3,8 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 SOURCE_WIDGETS_DIR="$REPO_ROOT/widgets"
-TARGET_WIDGETS_DIR="/Users/gisdev/arcgis-experience-builder/client/your-extensions/widgets"
+EXB_HOME="${EXB_HOME:-/Users/gisdev/arcgis-experience-builder-1.21}"
+TARGET_WIDGETS_DIR="$EXB_HOME/client/your-extensions/widgets"
 
 if [[ ! -d "$SOURCE_WIDGETS_DIR" ]]; then
   echo "Source widgets directory missing: $SOURCE_WIDGETS_DIR"

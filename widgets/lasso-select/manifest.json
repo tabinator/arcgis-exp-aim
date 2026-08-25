@@ -1,0 +1,27 @@
+{
+  "name": "lasso-select",
+  "label": "Lasso Select",
+  "type": "widget",
+  "version": "1.20.0",
+  "exbVersion": "1.20.0",
+  "author": "Sean",
+  "description": "Draw a freehand lasso on the map and select features from configured target layers.",
+  "copyright": "",
+  "license": "http://www.apache.org/licenses/LICENSE-2.0",
+  "properties": {
+    "defaultInControllerUx": "offPanel"
+  },
+  "dependency": [
+    "jimu-arcgis"
+  ],
+  "settingDependency": [
+    "jimu-arcgis"
+  ],
+  "translatedLocales": [
+    "en"
+  ],
+  "defaultSize": {
+    "width": 320,
+    "height": 220
+  }
+}
