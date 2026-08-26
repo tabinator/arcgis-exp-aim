@@ -81,7 +81,7 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
   const targetLayerIds = props.config?.targetLayerIds || []
   const targetCount = targetDataSourceIds.length || targetLayerIds.length
   const hasRequiredSettings = !!useMapWidgetId && targetCount > 0
-  const isOffPanel = !!props.controllerWidgetId && props.inControllerUx === 'offPanel'
+  const isOffPanel = props.inControllerUx === 'offPanel'
   const isOffPanelActive = isOffPanel && props.state !== WidgetState.Closed && props.state !== WidgetState.Hidden && props.state !== undefined
 
   const clearHighlights = React.useCallback(() => {
