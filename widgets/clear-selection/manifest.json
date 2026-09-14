@@ -1,0 +1,27 @@
+{
+  "name": "clear-selection",
+  "label": "Clear Selection",
+  "type": "widget",
+  "version": "1.20.0",
+  "exbVersion": "1.20.0",
+  "author": "Sean",
+  "description": "Clear selected features from the configured map widget.",
+  "copyright": "",
+  "license": "http://www.apache.org/licenses/LICENSE-2.0",
+  "properties": {
+    "defaultInControllerUx": "offPanel"
+  },
+  "dependency": [
+    "jimu-arcgis"
+  ],
+  "settingDependency": [
+    "jimu-arcgis"
+  ],
+  "translatedLocales": [
+    "en"
+  ],
+  "defaultSize": {
+    "width": 280,
+    "height": 140
+  }
+}

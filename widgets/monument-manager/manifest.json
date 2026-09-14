@@ -1,0 +1,21 @@
+{
+  "name": "monument-manager",
+  "label": "Monument Manager",
+  "type": "widget",
+  "version": "1.0.0",
+  "exbVersion": "1.21.0",
+  "author": "Sean",
+  "description": "ArcGIS Experience Builder widget for managing monument workflows.",
+  "copyright": "",
+  "license": "http://www.apache.org/licenses/LICENSE-2.0",
+  "properties": {},
+  "translatedLocales": [
+    "en"
+  ],
+  "dependency": "jimu-arcgis",
+  "supportDataSource": true,
+  "defaultSize": {
+    "width": 420,
+    "height": 520
+  }
+}
