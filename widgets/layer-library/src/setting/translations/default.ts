@@ -19,7 +19,7 @@ export default {
   search: 'Search',
   visibility: 'Visibility',
   zoom: 'Zoom to layer',
-  filters: 'Filtering foundation',
+  filters: 'Layer filters',
   legend: 'Legend placeholder',
   deleteCategory: 'Delete',
   moveUp: 'Up',
