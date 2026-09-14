@@ -1,7 +1,6 @@
 import { React } from 'jimu-core'
 import { getAppConfigAction, type AllWidgetSettingProps } from 'jimu-for-builder'
-import { SettingSection, SettingRow } from 'jimu-ui/advanced/setting-components'
-import { MapWidgetSelector } from 'jimu-ui/advanced/setting-components'
+import { MapWidgetSelector, SettingRow, SettingSection } from 'jimu-ui/advanced/setting-components'
 import type { IMConfig } from '../config'
 import defaultMessages from './translations/default'
 

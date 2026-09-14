@@ -7,22 +7,23 @@ import {
   type UseDataSource
 } from 'jimu-core'
 import { Button } from 'jimu-ui'
-import { JimuMapViewComponent, type JimuMapView } from 'jimu-arcgis'
-import Graphic from 'esri/Graphic'
+import { JimuMapViewComponent, type JimuLayerView, type JimuMapView } from 'jimu-arcgis'
+import type Graphic from 'esri/Graphic'
 import GraphicsLayer from 'esri/layers/GraphicsLayer'
 import SketchViewModel from 'esri/widgets/Sketch/SketchViewModel'
 import type Polygon from 'esri/geometry/Polygon'
 import type { IMConfig } from '../config'
+import { versionManager } from '../version-manager'
 import defaultMessages from './translations/default'
 
 type CreateEvent = __esri.SketchViewModelCreateEvent
-type SelectableJimuLayerView = {
+interface SelectableJimuLayerView {
   layer?: __esri.FeatureLayer
   layerDataSourceId?: string
   selectFeaturesByQuery?: (
     query: ArcGISQueryParams,
     selectionMode: DataSourceSelectionMode
-  ) => Promise<Array<__esri.Graphic | unknown>>
+  ) => Promise<__esri.Graphic[]>
 }
 
 const getTargetDataSourceIds = (configIds: string[], useDataSources: UseDataSource[]): string[] => {
@@ -38,11 +39,12 @@ const getTargetLayers = (
   const targetDataSourceIdSet = new Set(targetDataSourceIds)
   const layerViews: SelectableJimuLayerView[] = []
 
-  Object.values(jimuMapView.jimuLayerViews || {}).forEach((jimuLayerView) => {
-    const isTarget = targetDataSourceIdSet.has(jimuLayerView.layerDataSourceId)
+  Object.values(jimuMapView.jimuLayerViews || {}).forEach((jimuLayerView: JimuLayerView) => {
+    const candidate = jimuLayerView as SelectableJimuLayerView
+    const isTarget = targetDataSourceIdSet.has(candidate.layerDataSourceId)
 
-    if (isTarget && jimuLayerView.layer?.type === 'feature' && jimuLayerView.selectFeaturesByQuery) {
-      layerViews.push(jimuLayerView as SelectableJimuLayerView)
+    if (isTarget && candidate.layer?.type === 'feature' && candidate.selectFeaturesByQuery) {
+      layerViews.push(candidate)
     }
   })
 
@@ -50,13 +52,14 @@ const getTargetLayers = (
 
   const normalizedLayerTargets = (targetLayerIds || []).map((value) => value.toLowerCase())
 
-  Object.values(jimuMapView.jimuLayerViews || {}).forEach((jimuLayerView) => {
-    const layerId = jimuLayerView.layer?.id?.toLowerCase()
-    const layerTitle = jimuLayerView.layer?.title?.toLowerCase()
+  Object.values(jimuMapView.jimuLayerViews || {}).forEach((jimuLayerView: JimuLayerView) => {
+    const candidate = jimuLayerView as SelectableJimuLayerView
+    const layerId = candidate.layer?.id?.toLowerCase()
+    const layerTitle = candidate.layer?.title?.toLowerCase()
     const isTarget = normalizedLayerTargets.includes(layerId) || normalizedLayerTargets.includes(layerTitle)
 
-    if (isTarget && jimuLayerView.layer?.type === 'feature' && jimuLayerView.selectFeaturesByQuery) {
-      layerViews.push(jimuLayerView as SelectableJimuLayerView)
+    if (isTarget && candidate.layer?.type === 'feature' && candidate.selectFeaturesByQuery) {
+      layerViews.push(candidate)
     }
   })
 
@@ -73,15 +76,17 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
   const createHandleRef = React.useRef<__esri.Handle>(null)
 
   const useMapWidgetId = props.useMapWidgetIds?.[0]
-  const configuredTargetDataSourceIds = props.config?.targetDataSourceIds as string[]
-  const useDataSources = props.useDataSources as UseDataSource[]
+  const configuredTargetDataSourceIds = props.config?.targetDataSourceIds as unknown as string[]
+  const useDataSources = props.useDataSources as unknown as UseDataSource[]
   const targetDataSourceIds = React.useMemo(() => {
     return getTargetDataSourceIds(configuredTargetDataSourceIds, useDataSources)
   }, [configuredTargetDataSourceIds, useDataSources])
-  const targetLayerIds = props.config?.targetLayerIds || []
+  const targetLayerIds = React.useMemo(() => {
+    return (props.config?.targetLayerIds || []) as unknown as string[]
+  }, [props.config?.targetLayerIds])
   const targetCount = targetDataSourceIds.length || targetLayerIds.length
   const hasRequiredSettings = !!useMapWidgetId && targetCount > 0
-  const isOffPanel = props.inControllerUx === 'offPanel'
+  const isOffPanel = props.controllerWidgetId || props.inControllerUx === 'offPanel'
   const isOffPanelActive = isOffPanel && props.state !== WidgetState.Closed && props.state !== WidgetState.Hidden && props.state !== undefined
 
   const clearHighlights = React.useCallback(() => {
@@ -110,7 +115,7 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
     await Promise.all(targetLayerViews.map(async (jimuLayerView) => {
       const query: ArcGISQueryParams = {
         geometry,
-        spatialRelationship: 'intersects',
+        spatialRel: 'esriSpatialRelIntersects',
         returnGeometry: true,
         outFields: ['*']
       }
@@ -147,7 +152,7 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
           color: [0, 122, 194, 1],
           width: 2
         }
-      } as __esri.SimpleFillSymbolProperties
+      } as __esri.SimpleFillSymbolProperties & { type: 'simple-fill' }
     })
 
     sketchViewModelRef.current = sketchViewModel
@@ -173,14 +178,14 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
     }
   }, [isOffPanelActive, jimuMapView, props.config?.keepActiveAfterSelect, props.id, selectFeatures])
 
-  const startSelecting = () => {
+  const startSelecting = React.useCallback(() => {
     if (!sketchViewModelRef.current || !hasRequiredSettings) return
 
     setIsSelecting(true)
     setStatus(defaultMessages.selecting)
     sketchLayerRef.current?.removeAll()
     sketchViewModelRef.current.create('polygon', { mode: 'freehand' })
-  }
+  }, [hasRequiredSettings])
 
   const toggleSelecting = () => {
     if (isSelecting) {
@@ -200,7 +205,7 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
       stopSelecting()
       setStatus(defaultMessages.ready)
     }
-  }, [isOffPanel, isOffPanelActive, jimuMapView, hasRequiredSettings])
+  }, [isOffPanel, isOffPanelActive, startSelecting, stopSelecting])
 
   const message = !useMapWidgetId
     ? defaultMessages.configureWidget
@@ -246,5 +251,7 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
     h('p', { className: 'mb-0 small text-muted' }, message)
   )
 }
+
+Widget.versionManager = versionManager
 
 export default Widget
