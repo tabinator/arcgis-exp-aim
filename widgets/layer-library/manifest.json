@@ -1,0 +1,26 @@
+{
+  "name": "layer-library",
+  "label": "Layer Library",
+  "type": "widget",
+  "version": "1.21.0",
+  "exbVersion": "1.21.0",
+  "author": "Sean",
+  "description": "Organize layers from a selected Map widget into author-defined categories for simpler runtime discovery and interaction.",
+  "copyright": "",
+  "license": "http://www.apache.org/licenses/LICENSE-2.0",
+  "properties": {},
+  "dependency": [
+    "jimu-arcgis"
+  ],
+  "settingDependency": [
+    "jimu-arcgis"
+  ],
+  "supportDataSource": true,
+  "translatedLocales": [
+    "en"
+  ],
+  "defaultSize": {
+    "width": 360,
+    "height": 420
+  }
+}
