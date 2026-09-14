@@ -29,6 +29,7 @@ export interface Config {
   selectionMode: CategorySelectionMode
   showSearch: boolean
   showLayerFilters: boolean
+  showExportCsv: boolean
   showZoomToLayer: boolean
   showVisibilityToggle: boolean
   showLegend: boolean

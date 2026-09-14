@@ -182,14 +182,23 @@ const Setting = (props: AllWidgetSettingProps<IMConfig>) => {
           key: category.id,
           className: `border-top py-2 ${category.id === activeCategoryId ? 'font-weight-bold' : ''}`
         },
-          h('div', { className: 'd-flex align-items-center justify-content-between' },
-            h(Button, {
+          h('div', { className: 'd-flex align-items-center justify-content-between', style: { gap: 8 } },
+            h(TextInput, {
+              className: 'flex-fill',
               size: 'sm',
-              type: 'tertiary',
-              className: 'text-left px-0',
-              onClick: () => { setSelectedCategoryId(category.id) }
-            }, category.name),
-            h('span', { className: 'text-muted small' }, `${category.layers.length} layers`)
+              value: category.name,
+              placeholder: defaultMessages.categoryName,
+              onFocus: () => { setSelectedCategoryId(category.id) },
+              onChange: (event) => {
+                const nextName = event.target.value
+                setSelectedCategoryId(category.id)
+                updateCategory(category.id, (currentCategory) => ({ ...currentCategory, name: nextName }))
+              }
+            }),
+            h('span', {
+              className: 'text-muted small',
+              style: { flex: '0 0 auto' }
+            }, `${category.layers.length} layers`)
           ),
           h('div', { className: 'd-flex align-items-center mt-1', style: { gap: 6 } },
             h(Button, {
@@ -326,6 +335,7 @@ const Setting = (props: AllWidgetSettingProps<IMConfig>) => {
       h(SettingRow, null, renderToggle(defaultMessages.visibility, props.config?.showVisibilityToggle, (_, checked) => { setBoolean('showVisibilityToggle', checked) })),
       h(SettingRow, null, renderToggle(defaultMessages.zoom, props.config?.showZoomToLayer, (_, checked) => { setBoolean('showZoomToLayer', checked) })),
       h(SettingRow, null, renderToggle(defaultMessages.filters, props.config?.showLayerFilters, (_, checked) => { setBoolean('showLayerFilters', checked) })),
+      h(SettingRow, null, renderToggle(defaultMessages.exportCsv, props.config?.showExportCsv ?? true, (_, checked) => { setBoolean('showExportCsv', checked) })),
       h(SettingRow, null, renderToggle(defaultMessages.legend, !!props.config?.showLegend, (_, checked) => { setBoolean('showLegend', checked) }))
     )
   )

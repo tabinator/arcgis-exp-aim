@@ -6,6 +6,7 @@ import defaultMessages from './translations/default'
 
 type FilterOperator = 'equals' | 'notEquals' | 'contains' | 'startsWith' | 'anyOf' | 'greaterThan' | 'lessThan'
 type FilterJoin = 'AND' | 'OR'
+type ExportMode = 'filtered' | 'selected' | 'extent'
 
 interface LayerFilterExpression {
   id: string
@@ -31,6 +32,19 @@ interface LayerField {
   name: string
   alias?: string
   type?: string
+}
+
+interface QueryableFeatureLayer {
+  definitionExpression?: string
+  fields?: LayerField[]
+  objectIdField?: string
+  title?: string
+  createQuery?: () => __esri.Query
+  queryFeatures?: (query: __esri.Query | __esri.QueryProperties) => Promise<__esri.FeatureSet>
+}
+
+interface SelectableLayerView {
+  getSelectedFeatures?: () => Promise<__esri.Graphic[]>
 }
 
 type ResolvedLayer = LibraryLayer & {
@@ -74,10 +88,12 @@ const categoryContainsLayer = (category: LayerCategory, targetLayer: LibraryLaye
 
 const getFilterableLayer = (layer?: __esri.Layer) => {
   if (!layer || layer.type !== 'feature') return null
-  return layer as unknown as {
-    definitionExpression?: string
-    fields?: LayerField[]
-  }
+  return layer as unknown as QueryableFeatureLayer
+}
+
+const getQueryableFeatureLayer = (layer?: __esri.Layer) => {
+  const featureLayer = getFilterableLayer(layer)
+  return typeof featureLayer?.queryFeatures === 'function' ? featureLayer : null
 }
 
 const getLayerFields = (resolved: ResolvedLayer): LayerField[] => {
@@ -138,6 +154,63 @@ const combineDefinitionExpressions = (baseExpression: string, filterExpression: 
   return `(${baseExpression}) AND (${filterExpression})`
 }
 
+const sanitizeFileName = (value: string) => {
+  return (value || 'Layer export')
+    .replace(/[\\/:*?"<>|]+/g, '-')
+    .replace(/\s+/g, ' ')
+    .trim()
+}
+
+const formatCsvValue = (value: unknown) => {
+  if (value === null || value === undefined) return ''
+  let text: string
+  if (value instanceof Date) {
+    text = value.toISOString()
+  } else if (typeof value === 'string') {
+    text = value
+  } else if (typeof value === 'number' || typeof value === 'boolean' || typeof value === 'bigint') {
+    text = value.toString()
+  } else {
+    text = JSON.stringify(value)
+  }
+  return /[",\r\n]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text
+}
+
+const getCsvFields = (features: __esri.Graphic[], layerFields: LayerField[]) => {
+  const configuredFields = layerFields.map((field) => field.name).filter(Boolean)
+  if (configuredFields.length > 0) return configuredFields
+
+  const fieldNames = new Set<string>()
+  features.forEach((feature) => {
+    Object.keys(feature.attributes || {}).forEach((fieldName) => { fieldNames.add(fieldName) })
+  })
+  return Array.from(fieldNames)
+}
+
+const toCsv = (features: __esri.Graphic[], layerFields: LayerField[]) => {
+  const fields = getCsvFields(features, layerFields)
+  const aliases = new Map(layerFields.map((field) => [field.name, field.alias || field.name]))
+  const rows = [
+    fields.map((field) => formatCsvValue(aliases.get(field) || field)).join(','),
+    ...features.map((feature) => (
+      fields.map((field) => formatCsvValue((feature.attributes || {})[field])).join(',')
+    ))
+  ]
+  return rows.join('\r\n')
+}
+
+const downloadCsv = (fileName: string, csv: string) => {
+  const blob = new Blob([csv], { type: 'text/csv;charset=utf-8' })
+  const url = URL.createObjectURL(blob)
+  const link = document.createElement('a')
+  link.href = url
+  link.download = `${sanitizeFileName(fileName)}.csv`
+  document.body.appendChild(link)
+  link.click()
+  document.body.removeChild(link)
+  URL.revokeObjectURL(url)
+}
+
 const createFilterExpression = (field = ''): LayerFilterExpression => ({
   id: `expression-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
   field,
@@ -169,6 +242,15 @@ const utilityButtonStyle = {
   whiteSpace: 'nowrap' as const
 }
 
+const iconButtonStyle = {
+  width: 28,
+  height: 24,
+  padding: 0,
+  display: 'inline-flex',
+  alignItems: 'center',
+  justifyContent: 'center'
+}
+
 const badgeStyle = {
   border: '1px solid color-mix(in srgb, var(--sys-color-primary-main, #007ac2) 55%, transparent)',
   borderRadius: 999,
@@ -188,6 +270,8 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
   const [activeCategoryIds, setActiveCategoryIds] = React.useState<string[]>([])
   const [searchText, setSearchText] = React.useState('')
   const [openFilterLayerKey, setOpenFilterLayerKey] = React.useState('')
+  const [openExportLayerKey, setOpenExportLayerKey] = React.useState('')
+  const [exportStatus, setExportStatus] = React.useState('')
   const [draftFilters, setDraftFilters] = React.useState<LayerFilterByKey>({})
   const [appliedFilters, setAppliedFilters] = React.useState<LayerFilterByKey>({})
   const originalDefinitionExpressions = React.useRef<DefinitionExpressionByKey>({})
@@ -353,6 +437,55 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
     category.layers.forEach(clearLayerFilter)
   }
 
+  const queryLayerFeatures = async (featureLayer: QueryableFeatureLayer, mode: ExportMode) => {
+    const query = typeof featureLayer.createQuery === 'function'
+      ? featureLayer.createQuery()
+      : {} as __esri.QueryProperties
+
+    query.where = featureLayer.definitionExpression || '1=1'
+    query.outFields = ['*']
+    query.returnGeometry = false
+
+    if (mode === 'extent' && jimuMapView?.view?.extent) {
+      query.geometry = jimuMapView.view.extent
+      query.spatialRelationship = 'intersects'
+    }
+
+    const result = await featureLayer.queryFeatures(query)
+    return result.features || []
+  }
+
+  const exportLayer = async (libraryLayer: LibraryLayer, mode: ExportMode) => {
+    if (!jimuMapView) return
+
+    const resolved = resolveLayer(jimuMapView, libraryLayer)
+    const featureLayer = getQueryableFeatureLayer(resolved.layer)
+    if (!featureLayer) return
+
+    try {
+      const features = mode === 'selected'
+        ? await ((resolved.jimuLayerView as unknown as SelectableLayerView)?.getSelectedFeatures?.() || Promise.resolve([]))
+        : await queryLayerFeatures(featureLayer, mode)
+
+      if (features.length === 0) {
+        setExportStatus(defaultMessages.exportNoRecords)
+        return
+      }
+
+      const csv = toCsv(features, getLayerFields(resolved))
+      const modeLabel = mode === 'selected'
+        ? defaultMessages.exportSelectedRecords
+        : mode === 'extent'
+          ? defaultMessages.exportVisibleExtent
+          : defaultMessages.exportFilteredRecords
+      downloadCsv(`${resolved.title || libraryLayer.id} - ${modeLabel}`, csv)
+      setOpenExportLayerKey('')
+      setExportStatus(defaultMessages.exportDownloaded)
+    } catch {
+      setExportStatus(defaultMessages.exportFailed)
+    }
+  }
+
   const zoomToLayer = async (libraryLayer: LibraryLayer) => {
     if (!jimuMapView) return
 
@@ -382,6 +515,75 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
     ...category,
     layers: category.layers.filter((layer) => matchesSearch(category, layer))
   })).filter((category) => matchesSearch(category) || category.layers.length > 0)
+
+  const renderSvgIcon = (title: string, paths: string[]) => (
+    h('svg', {
+      viewBox: '0 0 24 24',
+      width: 15,
+      height: 15,
+      role: 'img',
+      'aria-label': title,
+      style: { display: 'block' }
+    },
+      h('title', null, title),
+      paths.map((path) => h('path', {
+        key: path,
+        d: path,
+        fill: 'none',
+        stroke: 'currentColor',
+        strokeWidth: 2,
+        strokeLinecap: 'round',
+        strokeLinejoin: 'round'
+      }))
+    )
+  )
+
+  const filterIcon = renderSvgIcon(defaultMessages.openFilter, [
+    'M4 5h16l-6 7v5l-4 2v-7L4 5z'
+  ])
+
+  const zoomIcon = renderSvgIcon(defaultMessages.zoomToLayer, [
+    'M10.5 17a6.5 6.5 0 1 1 0-13 6.5 6.5 0 0 1 0 13z',
+    'M15.5 15.5 20 20',
+    'M10.5 8v5',
+    'M8 10.5h5'
+  ])
+
+  const exportIcon = renderSvgIcon(defaultMessages.exportCsv, [
+    'M12 4v10',
+    'M8 10l4 4 4-4',
+    'M5 18h14'
+  ])
+
+  const renderExportMenu = (libraryLayer: LibraryLayer) => {
+    const resolved = jimuMapView ? resolveLayer(jimuMapView, libraryLayer) : libraryLayer as ResolvedLayer
+    const canExportSelected = !!(resolved.jimuLayerView as unknown as SelectableLayerView)?.getSelectedFeatures
+    const exportButton = (label: string, mode: ExportMode, disabled = false) => (
+      h(Button, {
+        size: 'sm',
+        type: 'tertiary',
+        className: 'w-100 text-left',
+        disabled,
+        onClick: () => { exportLayer(libraryLayer, mode).catch(() => { setExportStatus(defaultMessages.exportFailed) }) },
+        style: { height: 26, padding: '0 8px', fontSize: 11, justifyContent: 'flex-start' }
+      }, label)
+    )
+
+    return h('div', {
+      className: 'ml-4 mb-2 p-2 border',
+      style: {
+        ...surfaceStyle,
+        borderRadius: 6
+      }
+    },
+      h('div', { className: 'small font-weight-bold mb-1' }, defaultMessages.exportCsv),
+      h('div', { className: 'd-flex flex-column', style: { gap: 4 } },
+        exportButton(defaultMessages.exportFilteredRecords, 'filtered'),
+        exportButton(defaultMessages.exportSelectedRecords, 'selected', !canExportSelected),
+        exportButton(defaultMessages.exportVisibleExtent, 'extent', !jimuMapView?.view?.extent)
+      )
+    )
+  }
 
   const renderFilterPanel = (libraryLayer: LibraryLayer, fields: LayerField[]) => {
     const key = layerKey(libraryLayer)
@@ -493,7 +695,9 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
     const fields = getLayerFields(resolved)
     const key = layerKey(libraryLayer)
     const canFilter = !!props.config?.showLayerFilters && libraryLayer.allowFiltering && !!getFilterableLayer(resolved.layer) && fields.length > 0
+    const canExport = (props.config?.showExportCsv ?? true) && !!getQueryableFeatureLayer(resolved.layer)
     const filterOpen = openFilterLayerKey === key
+    const exportOpen = openExportLayerKey === key
     const hasFilter = !!appliedFilters[key]
 
     return h('div', { key, className: 'mb-1' },
@@ -529,19 +733,30 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
           size: 'sm',
           type: hasFilter || filterOpen ? 'primary' : 'tertiary',
           title: defaultMessages.openFilter,
+          'aria-label': defaultMessages.openFilter,
           onClick: () => { setOpenFilterLayerKey(filterOpen ? '' : key) },
-          style: utilityButtonStyle
-        }, defaultMessages.filterButton),
+          style: iconButtonStyle
+        }, filterIcon),
         canZoom && h(Button, {
           size: 'sm',
           type: 'tertiary',
           disabled: !resolved.layer,
           title: defaultMessages.zoomToLayer,
+          'aria-label': defaultMessages.zoomToLayer,
           onClick: () => zoomToLayer(libraryLayer),
-          style: utilityButtonStyle
-        }, defaultMessages.zoomToLayer)
+          style: iconButtonStyle
+        }, zoomIcon),
+        canExport && h(Button, {
+          size: 'sm',
+          type: exportOpen ? 'primary' : 'tertiary',
+          title: defaultMessages.exportCsv,
+          'aria-label': defaultMessages.exportCsv,
+          onClick: () => { setOpenExportLayerKey(exportOpen ? '' : key) },
+          style: iconButtonStyle
+        }, exportIcon)
       ),
-      filterOpen && renderFilterPanel(libraryLayer, fields)
+      filterOpen && renderFilterPanel(libraryLayer, fields),
+      exportOpen && renderExportMenu(libraryLayer)
     )
   }
 
@@ -612,6 +827,10 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
       value: searchText,
       onChange: (event) => { setSearchText(event.target.value) }
     }),
+    exportStatus && h('div', {
+      className: 'small mb-2',
+      style: { color: exportStatus === defaultMessages.exportFailed ? 'var(--sys-color-error-main)' : 'var(--sys-color-text-secondary)' }
+    }, exportStatus),
     message
       ? h('div', { className: 'text-muted small' }, message)
       : visibleCategories.length > 0

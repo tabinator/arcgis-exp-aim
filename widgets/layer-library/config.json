@@ -3,6 +3,7 @@
   "selectionMode": "multiple",
   "showSearch": true,
   "showLayerFilters": true,
+  "showExportCsv": true,
   "showZoomToLayer": true,
   "showVisibilityToggle": true,
   "showLegend": false

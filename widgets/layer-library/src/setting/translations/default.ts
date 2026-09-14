@@ -20,6 +20,7 @@ export default {
   visibility: 'Visibility',
   zoom: 'Zoom to layer',
   filters: 'Layer filters',
+  exportCsv: 'Export CSV',
   legend: 'Legend placeholder',
   deleteCategory: 'Delete',
   moveUp: 'Up',
