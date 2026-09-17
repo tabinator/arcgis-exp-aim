@@ -5,6 +5,7 @@ import { JimuMapViewComponent, type JimuLayerView, type JimuMapView } from 'jimu
 import { JimuLayerViewSelector, MapWidgetSelector, SettingRow, SettingSection } from 'jimu-ui/advanced/setting-components'
 import type { CategorySelectionMode, IMConfig, LayerCategory, LibraryLayer } from '../config'
 import defaultMessages from './translations/default'
+import { docTextStyles, ensureDocFontLoaded } from '../shared/doc-text-style'
 
 const toMutableCategories = (categories): LayerCategory[] => {
   return (categories?.asMutable ? categories.asMutable({ deep: true }) : categories || []) as LayerCategory[]
@@ -58,6 +59,10 @@ const Setting = (props: AllWidgetSettingProps<IMConfig>) => {
   const categories = toMutableCategories(props.config?.categories)
   const selectedCategory = categories.find((category) => category.id === selectedCategoryId) || categories[0]
   const activeCategoryId = selectedCategory?.id || ''
+
+  React.useEffect(() => {
+    ensureDocFontLoaded()
+  }, [])
 
   React.useEffect(() => {
     if (!activeCategoryId) {
@@ -129,7 +134,7 @@ const Setting = (props: AllWidgetSettingProps<IMConfig>) => {
   const renderToggle = (label: string, checked: boolean, onChange: (event, checked: boolean) => void) => (
     h('label', { className: 'd-flex align-items-center w-100 mb-0' },
       h(Checkbox, { checked, onChange }),
-      h('span', { className: 'ml-2' }, label)
+      h('span', { className: 'ml-2', style: docTextStyles.body }, label)
     )
   )
 
@@ -196,8 +201,7 @@ const Setting = (props: AllWidgetSettingProps<IMConfig>) => {
               }
             }),
             h('span', {
-              className: 'text-muted small',
-              style: { flex: '0 0 auto' }
+              style: { ...docTextStyles.badge, flex: '0 0 auto' }
             }, `${category.layers.length} layers`)
           ),
           h('div', { className: 'd-flex align-items-center mt-1', style: { gap: 6 } },
@@ -205,17 +209,20 @@ const Setting = (props: AllWidgetSettingProps<IMConfig>) => {
               size: 'sm',
               type: 'tertiary',
               disabled: index === 0,
+              style: docTextStyles.button,
               onClick: () => { updateConfig(moveItem(categories, index, index - 1)) }
             }, defaultMessages.moveUp),
             h(Button, {
               size: 'sm',
               type: 'tertiary',
               disabled: index === categories.length - 1,
+              style: docTextStyles.button,
               onClick: () => { updateConfig(moveItem(categories, index, index + 1)) }
             }, defaultMessages.moveDown),
             h(Button, {
               size: 'sm',
               type: 'tertiary',
+              style: docTextStyles.button,
               onClick: () => { onDeleteCategory(category.id) }
             }, defaultMessages.deleteCategory)
           )
@@ -260,9 +267,9 @@ const Setting = (props: AllWidgetSettingProps<IMConfig>) => {
       ),
       h(SettingRow, null,
         !useMapWidgetId
-          ? h('div', { className: 'text-muted small' }, defaultMessages.noMapSelected)
+          ? h('div', { style: docTextStyles.muted }, defaultMessages.noMapSelected)
           : !activeCategoryId
-            ? h('div', { className: 'text-muted small' }, defaultMessages.noCategorySelected)
+            ? h('div', { style: docTextStyles.muted }, defaultMessages.noCategorySelected)
             : jimuMapView
               ? h(JimuLayerViewSelector, {
                 jimuMapViewId: jimuMapView.id,
@@ -272,7 +279,7 @@ const Setting = (props: AllWidgetSettingProps<IMConfig>) => {
                 autoHeight: true,
                 onChange: onLayerSelectionChange
               })
-              : h('div', { className: 'text-muted small' }, defaultMessages.layerSelectorHint)
+              : h('div', { style: docTextStyles.muted }, defaultMessages.layerSelectorHint)
       ),
       activeCategoryId && selectedCategory?.layers?.length > 0 && h(SettingRow, { label: defaultMessages.assignedLayers }),
       activeCategoryId && selectedCategory?.layers?.map((layer, index) => (
@@ -284,13 +291,14 @@ const Setting = (props: AllWidgetSettingProps<IMConfig>) => {
           h('span', {
             className: 'text-truncate',
             title: layer.title || layer.id,
-            style: { minWidth: 0 }
+            style: { ...docTextStyles.body, minWidth: 0 }
           }, layer.title || layer.id),
           h('span', { className: 'd-flex align-items-center', style: { gap: 4 } },
             h(Button, {
               size: 'sm',
               type: 'tertiary',
               disabled: index === 0,
+              style: docTextStyles.button,
               onClick: () => {
                 updateCategory(activeCategoryId, (category) => ({ ...category, layers: moveItem(category.layers, index, index - 1) }))
               }
@@ -299,6 +307,7 @@ const Setting = (props: AllWidgetSettingProps<IMConfig>) => {
               size: 'sm',
               type: 'tertiary',
               disabled: index === selectedCategory.layers.length - 1,
+              style: docTextStyles.button,
               onClick: () => {
                 updateCategory(activeCategoryId, (category) => ({ ...category, layers: moveItem(category.layers, index, index + 1) }))
               }
@@ -310,6 +319,7 @@ const Setting = (props: AllWidgetSettingProps<IMConfig>) => {
         h(Button, {
           size: 'sm',
           type: 'tertiary',
+          style: docTextStyles.button,
           onClick: () => { updateCategory(activeCategoryId, (category) => ({ ...category, layers: [] })) }
         }, defaultMessages.clearLayers)
       )

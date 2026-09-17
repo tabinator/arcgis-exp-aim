@@ -3,10 +3,12 @@ import { Button, Checkbox, Option, Select, TextInput } from 'jimu-ui'
 import { JimuMapViewComponent, type JimuLayerView, type JimuMapView } from 'jimu-arcgis'
 import type { IMConfig, LayerCategory, LibraryLayer } from '../config'
 import defaultMessages from './translations/default'
+import { docTextStyles, ensureDocFontLoaded } from '../shared/doc-text-style'
 
 type FilterOperator = 'equals' | 'notEquals' | 'contains' | 'startsWith' | 'anyOf' | 'greaterThan' | 'lessThan'
 type FilterJoin = 'AND' | 'OR'
 type ExportMode = 'filtered' | 'selected' | 'extent'
+type ExportFieldMode = 'all' | 'custom'
 
 interface LayerFilterExpression {
   id: string
@@ -28,10 +30,37 @@ interface DefinitionExpressionByKey {
   [key: string]: string
 }
 
+interface FilterCountByKey {
+  [key: string]: number
+}
+
+interface LayerVisibilityByKey {
+  [key: string]: boolean
+}
+
+interface ExportFieldModeByKey {
+  [key: string]: ExportFieldMode
+}
+
+interface ExportFieldsByKey {
+  [key: string]: string[]
+}
+
+interface ExportFieldSearchByKey {
+  [key: string]: string
+}
+
 interface LayerField {
   name: string
   alias?: string
   type?: string
+  domain?: {
+    type?: string
+    codedValues?: Array<{
+      name?: string
+      code?: string | number
+    }>
+  }
 }
 
 interface QueryableFeatureLayer {
@@ -40,6 +69,7 @@ interface QueryableFeatureLayer {
   objectIdField?: string
   title?: string
   createQuery?: () => __esri.Query
+  queryFeatureCount?: (query: __esri.Query | __esri.QueryProperties) => Promise<number>
   queryFeatures?: (query: __esri.Query | __esri.QueryProperties) => Promise<__esri.FeatureSet>
 }
 
@@ -81,11 +111,6 @@ const setLayerVisible = (jimuMapView: JimuMapView, libraryLayer: LibraryLayer, v
   }
 }
 
-const categoryContainsLayer = (category: LayerCategory, targetLayer: LibraryLayer) => {
-  const targetKey = layerKey(targetLayer)
-  return category.layers.some((layer) => layerKey(layer) === targetKey)
-}
-
 const getFilterableLayer = (layer?: __esri.Layer) => {
   if (!layer || layer.type !== 'feature') return null
   return layer as unknown as QueryableFeatureLayer
@@ -106,6 +131,26 @@ const isTextField = (field?: LayerField) => {
   return !field?.type || field.type === 'string'
 }
 
+const getFieldDomainValues = (field?: LayerField) => {
+  if (!field?.domain?.codedValues || field.domain.codedValues.length === 0) return []
+  return field.domain.codedValues
+    .filter((codedValue) => codedValue.code !== undefined && codedValue.code !== null)
+    .map((codedValue) => ({
+      label: codedValue.name || String(codedValue.code),
+      value: String(codedValue.code)
+    }))
+}
+
+const getFilterOperatorsForField = (field?: LayerField): FilterOperator[] => {
+  return getFieldDomainValues(field).length > 0
+    ? ['equals', 'notEquals', 'anyOf']
+    : ['equals', 'notEquals', 'contains', 'startsWith', 'anyOf', 'greaterThan', 'lessThan']
+}
+
+const parseFilterValues = (value: string) => {
+  return value.split(',').map((item) => item.trim()).filter(Boolean)
+}
+
 const escapeSqlValue = (value: string) => value.replace(/'/g, "''")
 
 const formatFilterValue = (value: string, field?: LayerField) => {
@@ -116,7 +161,7 @@ const formatFilterValue = (value: string, field?: LayerField) => {
 
 const buildFilterClause = (expression: LayerFilterExpression, fields: LayerField[]) => {
   const field = fields.find((candidate) => candidate.name === expression.field)
-  const values = expression.value.split(',').map((value) => value.trim()).filter(Boolean)
+  const values = parseFilterValues(expression.value)
   const fieldName = expression.field
 
   if (!fieldName || values.length === 0) return ''
@@ -176,7 +221,9 @@ const formatCsvValue = (value: unknown) => {
   return /[",\r\n]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text
 }
 
-const getCsvFields = (features: __esri.Graphic[], layerFields: LayerField[]) => {
+const getCsvFields = (features: __esri.Graphic[], layerFields: LayerField[], selectedFieldNames?: string[]) => {
+  if (selectedFieldNames) return selectedFieldNames.filter(Boolean)
+
   const configuredFields = layerFields.map((field) => field.name).filter(Boolean)
   if (configuredFields.length > 0) return configuredFields
 
@@ -187,8 +234,8 @@ const getCsvFields = (features: __esri.Graphic[], layerFields: LayerField[]) => 
   return Array.from(fieldNames)
 }
 
-const toCsv = (features: __esri.Graphic[], layerFields: LayerField[]) => {
-  const fields = getCsvFields(features, layerFields)
+const toCsv = (features: __esri.Graphic[], layerFields: LayerField[], selectedFieldNames?: string[]) => {
+  const fields = getCsvFields(features, layerFields, selectedFieldNames)
   const aliases = new Map(layerFields.map((field) => [field.name, field.alias || field.name]))
   const rows = [
     fields.map((field) => formatCsvValue(aliases.get(field) || field)).join(','),
@@ -209,6 +256,106 @@ const downloadCsv = (fileName: string, csv: string) => {
   link.click()
   document.body.removeChild(link)
   URL.revokeObjectURL(url)
+}
+
+const readStoredRecord = <T,>(storageKey: string, parseEntry: (value: unknown) => T | undefined): { [key: string]: T } => {
+  if (typeof window === 'undefined') return {}
+
+  try {
+    const saved = window.localStorage.getItem(storageKey)
+    const parsed = saved ? JSON.parse(saved) : {}
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return {}
+
+    return Object.entries(parsed).reduce<{ [key: string]: T }>((record, [key, value]) => {
+      const parsedValue = parseEntry(value)
+      if (parsedValue !== undefined) record[key] = parsedValue
+      return record
+    }, {})
+  } catch {
+    return {}
+  }
+}
+
+const writeStoredRecord = (storageKey: string, value: object) => {
+  if (typeof window === 'undefined') return
+
+  try {
+    window.localStorage.setItem(storageKey, JSON.stringify(value))
+  } catch {
+    // Ignore storage failures; widget state can fall back to its configured defaults.
+  }
+}
+
+const pruneRecordByKeys = <T,>(record: { [key: string]: T }, allowedKeys: Set<string>): { [key: string]: T } => {
+  let changed = false
+  const next = Object.entries(record).reduce<{ [key: string]: T }>((prunedRecord, [key, value]) => {
+    if (allowedKeys.has(key)) {
+      prunedRecord[key] = value
+    } else {
+      changed = true
+    }
+    return prunedRecord
+  }, {})
+
+  return changed ? next : record
+}
+
+const getExpandedCategoryStorageKey = (widgetId: string) => `layer-library:${widgetId}:expanded-categories`
+
+const readStoredExpandedCategoryIds = (widgetId: string) => {
+  if (typeof window === 'undefined') return []
+
+  try {
+    const saved = window.localStorage.getItem(getExpandedCategoryStorageKey(widgetId))
+    const parsed = saved ? JSON.parse(saved) : []
+    return Array.isArray(parsed) ? parsed.filter((id) => typeof id === 'string') : []
+  } catch {
+    return []
+  }
+}
+
+const writeStoredExpandedCategoryIds = (widgetId: string, categoryIds: string[]) => {
+  if (typeof window === 'undefined') return
+
+  try {
+    window.localStorage.setItem(getExpandedCategoryStorageKey(widgetId), JSON.stringify(categoryIds))
+  } catch {
+    // Ignore private browsing/storage quota failures; expanded state is only a convenience.
+  }
+}
+
+const getLayerVisibilityStorageKey = (widgetId: string) => `layer-library:${widgetId}:layer-visibility`
+
+const readStoredLayerVisibility = (widgetId: string): LayerVisibilityByKey => {
+  return readStoredRecord<boolean>(getLayerVisibilityStorageKey(widgetId), (value) => typeof value === 'boolean' ? value : undefined)
+}
+
+const writeStoredLayerVisibility = (widgetId: string, visibilityByKey: LayerVisibilityByKey) => {
+  writeStoredRecord(getLayerVisibilityStorageKey(widgetId), visibilityByKey)
+}
+
+const getExportFieldModeStorageKey = (widgetId: string) => `layer-library:${widgetId}:export-field-mode`
+
+const readStoredExportFieldMode = (widgetId: string): ExportFieldModeByKey => {
+  return readStoredRecord<ExportFieldMode>(getExportFieldModeStorageKey(widgetId), (value) => (
+    value === 'all' || value === 'custom' ? value : undefined
+  ))
+}
+
+const writeStoredExportFieldMode = (widgetId: string, modeByKey: ExportFieldModeByKey) => {
+  writeStoredRecord(getExportFieldModeStorageKey(widgetId), modeByKey)
+}
+
+const getExportFieldsStorageKey = (widgetId: string) => `layer-library:${widgetId}:export-fields`
+
+const readStoredExportFields = (widgetId: string): ExportFieldsByKey => {
+  return readStoredRecord<string[]>(getExportFieldsStorageKey(widgetId), (value) => {
+    return Array.isArray(value) ? value.filter((fieldName) => typeof fieldName === 'string') : undefined
+  })
+}
+
+const writeStoredExportFields = (widgetId: string, fieldsByKey: ExportFieldsByKey) => {
+  writeStoredRecord(getExportFieldsStorageKey(widgetId), fieldsByKey)
 }
 
 const createFilterExpression = (field = ''): LayerFilterExpression => ({
@@ -235,10 +382,9 @@ const subtleSurfaceStyle = {
 }
 
 const utilityButtonStyle = {
+  ...docTextStyles.button,
   height: 24,
   padding: '0 7px',
-  fontSize: 11,
-  lineHeight: '14px',
   whiteSpace: 'nowrap' as const
 }
 
@@ -252,12 +398,10 @@ const iconButtonStyle = {
 }
 
 const badgeStyle = {
+  ...docTextStyles.badge,
   border: '1px solid color-mix(in srgb, var(--sys-color-primary-main, #007ac2) 55%, transparent)',
-  borderRadius: 999,
   background: 'color-mix(in srgb, var(--sys-color-primary-main, #007ac2) 18%, transparent)',
-  color: 'var(--sys-color-primary-main, #007ac2)',
   fontSize: 10,
-  fontWeight: 600,
   lineHeight: '16px',
   padding: '0 6px',
   whiteSpace: 'nowrap' as const
@@ -266,14 +410,18 @@ const badgeStyle = {
 const Widget = (props: AllWidgetProps<IMConfig>) => {
   const h = React.createElement
   const [jimuMapView, setJimuMapView] = React.useState<JimuMapView>(null)
-  const [expandedCategoryIds, setExpandedCategoryIds] = React.useState<string[]>([])
-  const [activeCategoryIds, setActiveCategoryIds] = React.useState<string[]>([])
+  const [expandedCategoryIds, setExpandedCategoryIds] = React.useState<string[]>(() => readStoredExpandedCategoryIds(props.id))
   const [searchText, setSearchText] = React.useState('')
   const [openFilterLayerKey, setOpenFilterLayerKey] = React.useState('')
   const [openExportLayerKey, setOpenExportLayerKey] = React.useState('')
   const [exportStatus, setExportStatus] = React.useState('')
+  const [storedLayerVisibility, setStoredLayerVisibility] = React.useState<LayerVisibilityByKey>(() => readStoredLayerVisibility(props.id))
+  const [exportFieldModeByKey, setExportFieldModeByKey] = React.useState<ExportFieldModeByKey>(() => readStoredExportFieldMode(props.id))
+  const [exportFieldsByKey, setExportFieldsByKey] = React.useState<ExportFieldsByKey>(() => readStoredExportFields(props.id))
+  const [exportFieldSearchByKey, setExportFieldSearchByKey] = React.useState<ExportFieldSearchByKey>({})
   const [draftFilters, setDraftFilters] = React.useState<LayerFilterByKey>({})
   const [appliedFilters, setAppliedFilters] = React.useState<LayerFilterByKey>({})
+  const [filterCounts, setFilterCounts] = React.useState<FilterCountByKey>({})
   const originalDefinitionExpressions = React.useRef<DefinitionExpressionByKey>({})
 
   const useMapWidgetId = props.useMapWidgetIds?.[0]
@@ -284,10 +432,56 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
   const normalizedSearch = searchText.trim().toLowerCase()
 
   React.useEffect(() => {
+    ensureDocFontLoaded()
+  }, [])
+
+  React.useEffect(() => {
     const configuredIds = categories.map((category) => category.id)
+    const configuredLayerKeys = new Set(categories.flatMap((category) => category.layers.map(layerKey)))
+
     setExpandedCategoryIds((current) => current.filter((id) => configuredIds.includes(id)))
-    setActiveCategoryIds((current) => current.filter((id) => configuredIds.includes(id)))
+    setStoredLayerVisibility((current) => pruneRecordByKeys(current, configuredLayerKeys))
+    setExportFieldModeByKey((current) => pruneRecordByKeys(current, configuredLayerKeys))
+    setExportFieldsByKey((current) => pruneRecordByKeys(current, configuredLayerKeys))
+    setFilterCounts((current) => pruneRecordByKeys(current, configuredLayerKeys))
   }, [categories])
+
+  React.useEffect(() => {
+    writeStoredExpandedCategoryIds(props.id, expandedCategoryIds)
+  }, [expandedCategoryIds, props.id])
+
+  React.useEffect(() => {
+    writeStoredLayerVisibility(props.id, storedLayerVisibility)
+  }, [props.id, storedLayerVisibility])
+
+  React.useEffect(() => {
+    writeStoredExportFieldMode(props.id, exportFieldModeByKey)
+  }, [props.id, exportFieldModeByKey])
+
+  React.useEffect(() => {
+    writeStoredExportFields(props.id, exportFieldsByKey)
+  }, [props.id, exportFieldsByKey])
+
+  React.useEffect(() => {
+    if (!jimuMapView) return
+
+    categories.forEach((category) => {
+      category.layers.forEach((layer) => {
+        const key = layerKey(layer)
+        if (key in storedLayerVisibility) {
+          setLayerVisible(jimuMapView, layer, storedLayerVisibility[key])
+        }
+      })
+    })
+  }, [categories, jimuMapView, storedLayerVisibility])
+
+  const setStoredLayerVisible = (libraryLayer: LibraryLayer, visible: boolean) => {
+    if (jimuMapView) setLayerVisible(jimuMapView, libraryLayer, visible)
+    setStoredLayerVisibility((current) => ({
+      ...current,
+      [layerKey(libraryLayer)]: visible
+    }))
+  }
 
   const toggleExpanded = (categoryId: string) => {
     setExpandedCategoryIds((current) => (
@@ -297,39 +491,66 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
     ))
   }
 
-  const activateCategory = (category: LayerCategory, active: boolean) => {
-    if (!jimuMapView) return
-
-    if (selectionMode === 'single') {
-      categories.forEach((candidate) => {
-        candidate.layers.forEach((layer) => { setLayerVisible(jimuMapView, layer, false) })
-      })
-
-      if (active) {
-        category.layers.forEach((layer) => { setLayerVisible(jimuMapView, layer, layer.defaultVisible) })
-        setActiveCategoryIds([category.id])
-        setExpandedCategoryIds([category.id])
-      } else {
-        setActiveCategoryIds([])
-      }
-      return
-    }
-
-    const nextActiveCategoryIds = active
-      ? Array.from(new Set([...activeCategoryIds, category.id]))
-      : activeCategoryIds.filter((id) => id !== category.id)
-    const nextActiveCategories = categories.filter((candidate) => nextActiveCategoryIds.includes(candidate.id))
-
-    category.layers.forEach((layer) => {
-      const stillActiveElsewhere = nextActiveCategories.some((candidate) => candidate.id !== category.id && categoryContainsLayer(candidate, layer))
-      setLayerVisible(jimuMapView, layer, active ? layer.defaultVisible : stillActiveElsewhere)
-    })
-    setActiveCategoryIds(nextActiveCategoryIds)
+  const toggleLayer = (libraryLayer: LibraryLayer, visible: boolean) => {
+    setStoredLayerVisible(libraryLayer, visible)
   }
 
-  const toggleLayer = (libraryLayer: LibraryLayer, visible: boolean) => {
+  const setCategoryLayerVisibility = (category: LayerCategory, mode: 'show' | 'hide' | 'reset') => {
     if (!jimuMapView) return
-    setLayerVisible(jimuMapView, libraryLayer, visible)
+
+    if (selectionMode === 'single' && mode !== 'hide') {
+      categories.forEach((candidate) => {
+        candidate.layers.forEach((layer) => { setStoredLayerVisible(layer, false) })
+      })
+      setExpandedCategoryIds([category.id])
+    }
+
+    category.layers.forEach((layer) => {
+      const visible = mode === 'show'
+        ? true
+        : mode === 'hide'
+          ? false
+          : layer.defaultVisible
+      setStoredLayerVisible(layer, visible)
+    })
+  }
+
+  const getSelectedExportFieldNames = (key: string, fields: LayerField[]) => {
+    const fieldNames = fields.map((field) => field.name).filter(Boolean)
+    if ((exportFieldModeByKey[key] || 'all') === 'all') return undefined
+
+    const selectedFields = key in exportFieldsByKey ? exportFieldsByKey[key] : fieldNames
+    return selectedFields.filter((fieldName) => fieldNames.includes(fieldName))
+  }
+
+  const setExportFieldMode = (key: string, mode: ExportFieldMode) => {
+    setExportFieldModeByKey((current) => ({
+      ...current,
+      [key]: mode
+    }))
+  }
+
+  const setExportFieldSearch = (key: string, value: string) => {
+    setExportFieldSearchByKey((current) => ({
+      ...current,
+      [key]: value
+    }))
+  }
+
+  const setExportFields = (key: string, fieldNames: string[]) => {
+    setExportFieldsByKey((current) => ({
+      ...current,
+      [key]: fieldNames
+    }))
+  }
+
+  const toggleExportField = (key: string, fields: LayerField[], fieldName: string, checked: boolean) => {
+    const selectedFields = getSelectedExportFieldNames(key, fields) || []
+    const nextFields = checked
+      ? Array.from(new Set([...selectedFields, fieldName]))
+      : selectedFields.filter((selectedField) => selectedField !== fieldName)
+
+    setExportFields(key, nextFields)
   }
 
   const getDraftFilter = (libraryLayer: LibraryLayer, fields: LayerField[]) => {
@@ -363,6 +584,16 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
     })
   }
 
+  const updateDraftExpressionField = (key: string, expression: LayerFilterExpression, fieldName: string, fields: LayerField[]) => {
+    const field = fields.find((candidate) => candidate.name === fieldName)
+    const operators = getFilterOperatorsForField(field)
+    updateDraftExpression(key, expression.id, {
+      field: fieldName,
+      operator: operators.includes(expression.operator) ? expression.operator : 'equals',
+      value: ''
+    }, fields[0]?.name || '')
+  }
+
   const addDraftExpression = (key: string, fallbackField = '') => {
     setDraftFilters((current) => {
       const existing = current[key] || appliedFilters[key] || createLayerFilter(fallbackField)
@@ -390,7 +621,23 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
     })
   }
 
-  const applyLayerFilter = (libraryLayer: LibraryLayer, fields: LayerField[]) => {
+  const queryFilteredFeatureCount = async (featureLayer: QueryableFeatureLayer, where: string) => {
+    if (typeof featureLayer.queryFeatureCount !== 'function') return null
+
+    try {
+      const query = typeof featureLayer.createQuery === 'function'
+        ? featureLayer.createQuery()
+        : {} as __esri.QueryProperties
+
+      query.where = where || '1=1'
+      query.returnGeometry = false
+      return await featureLayer.queryFeatureCount(query)
+    } catch {
+      return null
+    }
+  }
+
+  const applyLayerFilter = async (libraryLayer: LibraryLayer, fields: LayerField[]) => {
     if (!jimuMapView) return
 
     const key = layerKey(libraryLayer)
@@ -405,9 +652,21 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
       originalDefinitionExpressions.current[key] = filterableLayer.definitionExpression || ''
     }
 
-    filterableLayer.definitionExpression = combineDefinitionExpressions(originalDefinitionExpressions.current[key], expression)
+    const nextDefinitionExpression = combineDefinitionExpressions(originalDefinitionExpressions.current[key], expression)
+    filterableLayer.definitionExpression = nextDefinitionExpression
     setAppliedFilters((current) => ({ ...current, [key]: filter }))
     setDraftFilters((current) => ({ ...current, [key]: filter }))
+
+    const count = await queryFilteredFeatureCount(filterableLayer, nextDefinitionExpression)
+    setFilterCounts((current) => {
+      const next = { ...current }
+      if (typeof count === 'number') {
+        next[key] = count
+      } else {
+        delete next[key]
+      }
+      return next
+    })
   }
 
   const clearLayerFilter = (libraryLayer: LibraryLayer) => {
@@ -427,6 +686,11 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
       return next
     })
     setDraftFilters((current) => {
+      const next = { ...current }
+      delete next[key]
+      return next
+    })
+    setFilterCounts((current) => {
       const next = { ...current }
       delete next[key]
       return next
@@ -463,6 +727,13 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
     if (!featureLayer) return
 
     try {
+      const layerFields = getLayerFields(resolved)
+      const selectedFieldNames = getSelectedExportFieldNames(layerKey(libraryLayer), layerFields)
+      if (selectedFieldNames && selectedFieldNames.length === 0) {
+        setExportStatus(defaultMessages.exportNoFields)
+        return
+      }
+
       const features = mode === 'selected'
         ? await ((resolved.jimuLayerView as unknown as SelectableLayerView)?.getSelectedFeatures?.() || Promise.resolve([]))
         : await queryLayerFeatures(featureLayer, mode)
@@ -472,7 +743,7 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
         return
       }
 
-      const csv = toCsv(features, getLayerFields(resolved))
+      const csv = toCsv(features, layerFields, selectedFieldNames)
       const modeLabel = mode === 'selected'
         ? defaultMessages.exportSelectedRecords
         : mode === 'extent'
@@ -557,15 +828,26 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
 
   const renderExportMenu = (libraryLayer: LibraryLayer) => {
     const resolved = jimuMapView ? resolveLayer(jimuMapView, libraryLayer) : libraryLayer as ResolvedLayer
+    const key = layerKey(libraryLayer)
+    const fields = getLayerFields(resolved)
+    const fieldNames = fields.map((field) => field.name).filter(Boolean)
+    const exportFieldMode = exportFieldModeByKey[key] || 'all'
+    const selectedFieldNames = getSelectedExportFieldNames(key, fields) || fieldNames
+    const fieldSearch = (exportFieldSearchByKey[key] || '').trim().toLowerCase()
+    const visibleFields = fields.filter((field) => {
+      if (!fieldSearch) return true
+      return `${field.alias || ''} ${field.name}`.toLowerCase().includes(fieldSearch)
+    })
     const canExportSelected = !!(resolved.jimuLayerView as unknown as SelectableLayerView)?.getSelectedFeatures
+    const exportDisabled = exportFieldMode === 'custom' && selectedFieldNames.length === 0
     const exportButton = (label: string, mode: ExportMode, disabled = false) => (
       h(Button, {
         size: 'sm',
         type: 'tertiary',
         className: 'w-100 text-left',
-        disabled,
+        disabled: disabled || exportDisabled,
         onClick: () => { exportLayer(libraryLayer, mode).catch(() => { setExportStatus(defaultMessages.exportFailed) }) },
-        style: { height: 26, padding: '0 8px', fontSize: 11, justifyContent: 'flex-start' }
+        style: { ...docTextStyles.button, height: 26, padding: '0 8px', justifyContent: 'flex-start' }
       }, label)
     )
 
@@ -576,12 +858,156 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
         borderRadius: 6
       }
     },
-      h('div', { className: 'small font-weight-bold mb-1' }, defaultMessages.exportCsv),
+      h('div', { className: 'mb-1', style: docTextStyles.sectionTitle }, defaultMessages.exportCsv),
+      h('div', { className: 'mb-2' },
+        h('div', { className: 'mb-1', style: docTextStyles.label }, defaultMessages.exportFields),
+        h(Select, {
+          size: 'sm',
+          className: 'w-100',
+          value: exportFieldMode,
+          onChange: (event) => { setExportFieldMode(key, event.target.value as ExportFieldMode) }
+        },
+          h(Option, { value: 'all' }, defaultMessages.exportAllFields),
+          h(Option, { value: 'custom' }, defaultMessages.exportCustomFields)
+        )
+      ),
+      exportFieldMode === 'custom' && h('div', { className: 'mb-2' },
+        h(TextInput, {
+          size: 'sm',
+          className: 'w-100 mb-1',
+          placeholder: defaultMessages.exportSearchFields,
+          value: exportFieldSearchByKey[key] || '',
+          onChange: (event) => { setExportFieldSearch(key, event.target.value) }
+        }),
+        h('div', { className: 'd-flex align-items-center mb-1', style: { gap: 6 } },
+          h(Button, {
+            size: 'sm',
+            type: 'tertiary',
+            style: utilityButtonStyle,
+            onClick: () => { setExportFields(key, fieldNames) }
+          }, defaultMessages.exportSelectAllFields),
+          h(Button, {
+            size: 'sm',
+            type: 'tertiary',
+            style: utilityButtonStyle,
+            onClick: () => { setExportFields(key, []) }
+          }, defaultMessages.exportClearFields),
+          h('span', { className: 'ml-auto', style: docTextStyles.muted }, `${selectedFieldNames.length}/${fieldNames.length}`)
+        ),
+        h('div', {
+          className: 'border',
+          style: {
+            ...subtleSurfaceStyle,
+            borderRadius: 4,
+            maxHeight: 154,
+            overflow: 'auto'
+          }
+        },
+          visibleFields.map((field) => {
+            const checked = selectedFieldNames.includes(field.name)
+            return h('label', {
+              key: field.name,
+              className: 'd-flex align-items-center mb-0 px-2 py-1',
+              title: field.name,
+              style: { gap: 6, minHeight: 28 }
+            },
+              h(Checkbox, {
+                checked,
+                onChange: (_, nextChecked: boolean) => { toggleExportField(key, fields, field.name, nextChecked) }
+              }),
+              h('span', {
+                className: 'text-truncate',
+                style: { ...docTextStyles.body, minWidth: 0 }
+              }, field.alias || field.name)
+            )
+          })
+        )
+      ),
       h('div', { className: 'd-flex flex-column', style: { gap: 4 } },
         exportButton(defaultMessages.exportFilteredRecords, 'filtered'),
         exportButton(defaultMessages.exportSelectedRecords, 'selected', !canExportSelected),
         exportButton(defaultMessages.exportVisibleExtent, 'extent', !jimuMapView?.view?.extent)
       )
+    )
+  }
+
+  const renderOperatorOption = (operator: FilterOperator) => {
+    const getOperatorLabel = () => {
+      switch (operator) {
+        case 'equals':
+          return defaultMessages.operatorEquals
+        case 'notEquals':
+          return defaultMessages.operatorNotEquals
+        case 'contains':
+          return defaultMessages.operatorContains
+        case 'startsWith':
+          return defaultMessages.operatorStartsWith
+        case 'anyOf':
+          return defaultMessages.operatorAnyOf
+        case 'greaterThan':
+          return defaultMessages.operatorGreaterThan
+        case 'lessThan':
+          return defaultMessages.operatorLessThan
+      }
+    }
+
+    return h(Option, { key: operator, value: operator }, getOperatorLabel())
+  }
+
+  const renderFilterValueControl = (key: string, expression: LayerFilterExpression, fields: LayerField[]) => {
+    const field = fields.find((candidate) => candidate.name === expression.field)
+    const domainValues = getFieldDomainValues(field)
+
+    if (domainValues.length === 0) {
+      return h(TextInput, {
+        size: 'sm',
+        className: 'w-100',
+        value: expression.value,
+        placeholder: expression.operator === 'anyOf' ? defaultMessages.filterValuesPlaceholder : defaultMessages.filterValuePlaceholder,
+        onChange: (event) => { updateDraftExpression(key, expression.id, { value: event.target.value }, fields[0]?.name || '') }
+      })
+    }
+
+    if (expression.operator !== 'anyOf') {
+      return h(Select, {
+        size: 'sm',
+        className: 'w-100',
+        value: expression.value,
+        onChange: (event) => { updateDraftExpression(key, expression.id, { value: event.target.value }, fields[0]?.name || '') }
+      },
+        h(Option, { value: '' }, defaultMessages.filterSelectValue),
+        domainValues.map((domainValue) => h(Option, { key: domainValue.value, value: domainValue.value }, domainValue.label))
+      )
+    }
+
+    const selectedValues = parseFilterValues(expression.value)
+    return h('div', {
+      className: 'border',
+      style: {
+        ...subtleSurfaceStyle,
+        borderRadius: 4,
+        maxHeight: 132,
+        overflow: 'auto'
+      }
+    },
+      domainValues.map((domainValue) => {
+          const checked = selectedValues.includes(domainValue.value)
+          const nextValues = checked
+            ? selectedValues.filter((value) => value !== domainValue.value)
+            : [...selectedValues, domainValue.value]
+
+          return h('label', {
+            key: domainValue.value,
+            className: 'd-flex align-items-center mb-0 px-2 py-1',
+            style: { gap: 6, minHeight: 28 }
+          },
+            h(Checkbox, {
+              checked,
+              onChange: () => { updateDraftExpression(key, expression.id, { value: nextValues.join(', ') }, fields[0]?.name || '') }
+            }),
+            h('span', { className: 'text-truncate', style: { ...docTextStyles.body, minWidth: 0 } }, domainValue.label)
+          )
+        })
     )
   }
 
@@ -599,7 +1025,7 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
       }
     },
       h('div', { className: 'd-flex align-items-center justify-content-between mb-2', style: { gap: 8 } },
-        h('strong', { className: 'small text-truncate' }, `${defaultMessages.filter}: ${libraryLayer.title || libraryLayer.id}`),
+        h('strong', { className: 'text-truncate', style: docTextStyles.sectionTitle }, `${defaultMessages.filter}: ${libraryLayer.title || libraryLayer.id}`),
         active && h('span', { style: badgeStyle }, defaultMessages.activeFilter)
       ),
       filter.expressions.map((expression) => (
@@ -617,7 +1043,7 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
               value: expression.field,
               className: 'flex-fill',
               style: { minWidth: 0 },
-              onChange: (event) => { updateDraftExpression(key, expression.id, { field: event.target.value }, fields[0]?.name || '') }
+              onChange: (event) => { updateDraftExpressionField(key, expression, event.target.value, fields) }
             },
               fields.map((field) => h(Option, { key: field.name, value: field.name }, field.alias || field.name))
             ),
@@ -625,15 +1051,9 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
               size: 'sm',
               value: expression.operator,
               style: { width: 112 },
-              onChange: (event) => { updateDraftExpression(key, expression.id, { operator: event.target.value as FilterOperator }, fields[0]?.name || '') }
+              onChange: (event) => { updateDraftExpression(key, expression.id, { operator: event.target.value as FilterOperator, value: '' }, fields[0]?.name || '') }
             },
-              h(Option, { value: 'equals' }, defaultMessages.operatorEquals),
-              h(Option, { value: 'notEquals' }, defaultMessages.operatorNotEquals),
-              h(Option, { value: 'contains' }, defaultMessages.operatorContains),
-              h(Option, { value: 'startsWith' }, defaultMessages.operatorStartsWith),
-              h(Option, { value: 'anyOf' }, defaultMessages.operatorAnyOf),
-              h(Option, { value: 'greaterThan' }, defaultMessages.operatorGreaterThan),
-              h(Option, { value: 'lessThan' }, defaultMessages.operatorLessThan)
+              getFilterOperatorsForField(fields.find((field) => field.name === expression.field)).map(renderOperatorOption)
             ),
             h(Button, {
               size: 'sm',
@@ -641,16 +1061,10 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
               disabled: filter.expressions.length === 1,
               title: defaultMessages.removeExpression,
               onClick: () => { removeDraftExpression(key, expression.id, fields[0]?.name || '') },
-              style: { width: 26, height: 26, padding: 0, fontSize: 13, flex: '0 0 auto' }
+              style: { ...docTextStyles.button, width: 26, height: 26, padding: 0, flex: '0 0 auto' }
             }, 'x')
           ),
-          h(TextInput, {
-            size: 'sm',
-            className: 'w-100',
-            value: expression.value,
-            placeholder: expression.operator === 'anyOf' ? defaultMessages.filterValuesPlaceholder : defaultMessages.filterValuePlaceholder,
-            onChange: (event) => { updateDraftExpression(key, expression.id, { value: event.target.value }, fields[0]?.name || '') }
-          })
+          renderFilterValueControl(key, expression, fields)
         )
       )),
       h('div', { className: 'd-flex align-items-center', style: { gap: 6 } },
@@ -681,8 +1095,8 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
           size: 'sm',
           type: 'primary',
           disabled: !filter.expressions.some((expression) => expression.field && expression.value.trim()),
-          onClick: () => { applyLayerFilter(libraryLayer, fields) },
-          style: { height: 28, padding: '0 10px', fontSize: 11, lineHeight: '14px', whiteSpace: 'nowrap' }
+          onClick: () => { void applyLayerFilter(libraryLayer, fields) },
+          style: { ...docTextStyles.button, height: 28, padding: '0 10px', whiteSpace: 'nowrap' }
         }, defaultMessages.applyFilter)
       )
     )
@@ -690,10 +1104,10 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
 
   const renderLayer = (libraryLayer: LibraryLayer) => {
     const resolved = jimuMapView ? resolveLayer(jimuMapView, libraryLayer) : libraryLayer as ResolvedLayer
-    const visible = resolved.layer?.visible
+    const key = layerKey(libraryLayer)
+    const visible = key in storedLayerVisibility ? storedLayerVisibility[key] : resolved.layer?.visible
     const canZoom = (props.config?.showZoomToLayer) && libraryLayer.allowZoom
     const fields = getLayerFields(resolved)
-    const key = layerKey(libraryLayer)
     const canFilter = !!props.config?.showLayerFilters && libraryLayer.allowFiltering && !!getFilterableLayer(resolved.layer) && fields.length > 0
     const canExport = (props.config?.showExportCsv ?? true) && !!getQueryableFeatureLayer(resolved.layer)
     const filterOpen = openFilterLayerKey === key
@@ -721,13 +1135,13 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
           h('span', {
             className: (props.config?.showVisibilityToggle) ? 'ml-2' : '',
             title: resolved.title,
-            style: { overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }
+            style: { ...docTextStyles.body, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }
           }, resolved.title),
           hasFilter && h('span', {
             className: 'ml-2',
             title: defaultMessages.activeFilter,
             style: badgeStyle
-          }, defaultMessages.filterBadge)
+          }, typeof filterCounts[key] === 'number' ? `${defaultMessages.filterBadge} (${filterCounts[key]})` : defaultMessages.filterBadge)
         ),
         canFilter && h(Button, {
           size: 'sm',
@@ -762,7 +1176,6 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
 
   const renderCategory = (category: LayerCategory) => {
     const expanded = expandedCategoryIds.includes(category.id) || !!normalizedSearch
-    const active = activeCategoryIds.includes(category.id)
 
     return h('div', {
       key: category.id,
@@ -777,17 +1190,37 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
           onClick: () => { toggleExpanded(category.id) },
           style: { width: 28, height: 28, padding: 0 }
         }, expanded ? 'v' : '>'),
-        h(Checkbox, {
-          checked: active,
-          disabled: !jimuMapView,
-          title: active ? defaultMessages.activeCategory : defaultMessages.inactiveCategory,
-          onChange: (_, checked: boolean) => { activateCategory(category, checked) }
-        }),
         h('div', { className: 'flex-fill', style: { minWidth: 0 } },
-          h('div', { className: 'font-weight-bold text-truncate' }, category.name),
-          category.description && h('div', { className: 'text-muted small text-truncate' }, category.description)
+          h('div', { className: 'text-truncate', style: docTextStyles.sectionTitle }, category.name),
+          category.description && h('div', { className: 'text-truncate', style: docTextStyles.muted }, category.description)
         ),
-        h('span', { className: 'text-muted small' }, category.layers.length),
+        h('span', { style: docTextStyles.badge }, category.layers.length),
+        h('div', { className: 'd-flex align-items-center', style: { gap: 4 } },
+          h(Button, {
+            size: 'sm',
+            type: 'tertiary',
+            disabled: !jimuMapView,
+            title: defaultMessages.showCategoryLayers,
+            onClick: () => { setCategoryLayerVisibility(category, 'show') },
+            style: utilityButtonStyle
+          }, defaultMessages.showCategoryLayers),
+          h(Button, {
+            size: 'sm',
+            type: 'tertiary',
+            disabled: !jimuMapView,
+            title: defaultMessages.hideCategoryLayers,
+            onClick: () => { setCategoryLayerVisibility(category, 'hide') },
+            style: utilityButtonStyle
+          }, defaultMessages.hideCategoryLayers),
+          h(Button, {
+            size: 'sm',
+            type: 'tertiary',
+            disabled: !jimuMapView,
+            title: defaultMessages.resetCategoryLayers,
+            onClick: () => { setCategoryLayerVisibility(category, 'reset') },
+            style: utilityButtonStyle
+          }, defaultMessages.resetCategoryLayers)
+        ),
         !!props.config?.showLayerFilters && category.layers.some((layer) => !!appliedFilters[layerKey(layer)]) && h(Button, {
           size: 'sm',
           type: 'tertiary',
@@ -810,15 +1243,18 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
 
   return h('div', {
     className: 'widget-layer-library jimu-widget p-3',
-    style: { height: '100%', overflow: 'auto' }
+    style: { ...docTextStyles.shell, height: '100%', overflow: 'auto' }
   },
     useMapWidgetId && h(JimuMapViewComponent, {
       useMapWidgetId,
       onActiveViewChange: setJimuMapView
     }),
     h('div', { className: 'd-flex align-items-center justify-content-between mb-2' },
-      h('h5', { className: 'mb-0' }, defaultMessages._widgetLabel),
-      h('span', { className: 'text-muted small' }, selectionMode === 'single' ? 'Single' : 'Multiple')
+      h('h5', { className: 'mb-0', style: docTextStyles.title },
+        'L A Y E R',
+        h('span', { 'aria-hidden': true, style: { display: 'inline-block', width: 8 } }),
+        'L I B R A R Y'
+      )
     ),
     (props.config?.showSearch) && categories.length > 0 && h(TextInput, {
       className: 'mb-2',
@@ -828,14 +1264,17 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
       onChange: (event) => { setSearchText(event.target.value) }
     }),
     exportStatus && h('div', {
-      className: 'small mb-2',
-      style: { color: exportStatus === defaultMessages.exportFailed ? 'var(--sys-color-error-main)' : 'var(--sys-color-text-secondary)' }
+      className: 'mb-2',
+      style: {
+        ...docTextStyles.muted,
+        color: exportStatus === defaultMessages.exportFailed ? 'var(--sys-color-error-main)' : 'var(--sys-color-text-secondary)'
+      }
     }, exportStatus),
     message
-      ? h('div', { className: 'text-muted small' }, message)
+      ? h('div', { style: docTextStyles.muted }, message)
       : visibleCategories.length > 0
         ? visibleCategories.map(renderCategory)
-        : h('div', { className: 'text-muted small' }, defaultMessages.noMatches)
+        : h('div', { style: docTextStyles.muted }, defaultMessages.noMatches)
   )
 }
 
