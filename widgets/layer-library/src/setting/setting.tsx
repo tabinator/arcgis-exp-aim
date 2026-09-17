@@ -53,6 +53,7 @@ const Setting = (props: AllWidgetSettingProps<IMConfig>) => {
   const [jimuMapView, setJimuMapView] = React.useState<JimuMapView>(null)
   const [selectedCategoryId, setSelectedCategoryId] = React.useState('')
   const [draftName, setDraftName] = React.useState('')
+  const [draftIcon, setDraftIcon] = React.useState('')
   const [draftDescription, setDraftDescription] = React.useState('')
 
   const useMapWidgetId = props.useMapWidgetIds?.[0]
@@ -99,6 +100,7 @@ const Setting = (props: AllWidgetSettingProps<IMConfig>) => {
     const category: LayerCategory = {
       id: `category-${Date.now()}`,
       name,
+      icon: draftIcon.trim(),
       description: draftDescription.trim(),
       layers: []
     }
@@ -106,6 +108,7 @@ const Setting = (props: AllWidgetSettingProps<IMConfig>) => {
     updateConfig([...categories, category])
     setSelectedCategoryId(category.id)
     setDraftName('')
+    setDraftIcon('')
     setDraftDescription('')
   }
 
@@ -162,6 +165,16 @@ const Setting = (props: AllWidgetSettingProps<IMConfig>) => {
           size: 'sm',
           value: draftName,
           onChange: (event) => { setDraftName(event.target.value) }
+        })
+      ),
+      h(SettingRow, { label: defaultMessages.categoryIcon }),
+      h(SettingRow, null,
+        h(TextInput, {
+          className: 'w-100',
+          size: 'sm',
+          value: draftIcon,
+          placeholder: defaultMessages.categoryIconPlaceholder,
+          onChange: (event) => { setDraftIcon(event.target.value) }
         })
       ),
       h(SettingRow, { label: defaultMessages.categoryDescription }),
@@ -251,6 +264,17 @@ const Setting = (props: AllWidgetSettingProps<IMConfig>) => {
           value: selectedCategory?.name || '',
           onChange: (event) => {
             updateCategory(activeCategoryId, (category) => ({ ...category, name: event.target.value }))
+          }
+        })
+      ),
+      activeCategoryId && h(SettingRow, null,
+        h(TextInput, {
+          className: 'w-100',
+          size: 'sm',
+          value: selectedCategory?.icon || '',
+          placeholder: defaultMessages.categoryIconPlaceholder,
+          onChange: (event) => {
+            updateCategory(activeCategoryId, (category) => ({ ...category, icon: event.target.value }))
           }
         })
       ),

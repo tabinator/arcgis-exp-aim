@@ -84,6 +84,24 @@ export const docTextStyles = {
     padding: '2px 8px',
     letterSpacing: 0
   },
+  categoryIcon: {
+    fontFamily: docFontFamily,
+    width: 28,
+    height: 28,
+    flex: '0 0 28px',
+    display: 'inline-flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    borderRadius: 5,
+    border: '1px solid color-mix(in srgb, var(--sys-color-primary-main, #007ac2) 22%, var(--sys-color-divider, rgba(127, 127, 127, 0.35)))',
+    background: 'color-mix(in srgb, var(--sys-color-surface-paper, transparent) 84%, var(--sys-color-primary-main, #007ac2) 16%)',
+    color: 'var(--sys-color-primary-main, #007ac2)',
+    fontSize: 14,
+    fontWeight: 800,
+    lineHeight: '16px',
+    letterSpacing: 0,
+    overflow: 'hidden'
+  },
   button: {
     fontFamily: docFontFamily,
     fontSize: 11,

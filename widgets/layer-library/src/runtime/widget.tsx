@@ -38,6 +38,11 @@ interface LayerVisibilityByKey {
   [key: string]: boolean
 }
 
+interface LayerVisibilityUpdate {
+  layer: LibraryLayer
+  visible: boolean
+}
+
 interface ExportFieldModeByKey {
   [key: string]: ExportFieldMode
 }
@@ -388,6 +393,15 @@ const utilityButtonStyle = {
   whiteSpace: 'nowrap' as const
 }
 
+const categoryActionButtonStyle = {
+  ...docTextStyles.button,
+  height: 22,
+  padding: '0 6px',
+  fontSize: 10,
+  lineHeight: '13px',
+  whiteSpace: 'nowrap' as const
+}
+
 const iconButtonStyle = {
   width: 28,
   height: 24,
@@ -475,12 +489,24 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
     })
   }, [categories, jimuMapView, storedLayerVisibility])
 
-  const setStoredLayerVisible = (libraryLayer: LibraryLayer, visible: boolean) => {
-    if (jimuMapView) setLayerVisible(jimuMapView, libraryLayer, visible)
+  const setStoredLayersVisible = (updates: LayerVisibilityUpdate[]) => {
+    if (updates.length === 0) return
+
+    updates.forEach(({ layer, visible }) => {
+      if (jimuMapView) setLayerVisible(jimuMapView, layer, visible)
+    })
+
     setStoredLayerVisibility((current) => ({
       ...current,
-      [layerKey(libraryLayer)]: visible
+      ...updates.reduce<LayerVisibilityByKey>((visibilityByKey, { layer, visible }) => {
+        visibilityByKey[layerKey(layer)] = visible
+        return visibilityByKey
+      }, {})
     }))
+  }
+
+  const setStoredLayerVisible = (libraryLayer: LibraryLayer, visible: boolean) => {
+    setStoredLayersVisible([{ layer: libraryLayer, visible }])
   }
 
   const toggleExpanded = (categoryId: string) => {
@@ -498,9 +524,11 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
   const setCategoryLayerVisibility = (category: LayerCategory, mode: 'show' | 'hide' | 'reset') => {
     if (!jimuMapView) return
 
+    const updates: LayerVisibilityUpdate[] = []
+
     if (selectionMode === 'single' && mode !== 'hide') {
       categories.forEach((candidate) => {
-        candidate.layers.forEach((layer) => { setStoredLayerVisible(layer, false) })
+        candidate.layers.forEach((layer) => { updates.push({ layer, visible: false }) })
       })
       setExpandedCategoryIds([category.id])
     }
@@ -511,8 +539,10 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
         : mode === 'hide'
           ? false
           : layer.defaultVisible
-      setStoredLayerVisible(layer, visible)
+      updates.push({ layer, visible })
     })
+
+    setStoredLayersVisible(updates)
   }
 
   const getSelectedExportFieldNames = (key: string, fields: LayerField[]) => {
@@ -775,17 +805,25 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
     }
   }
 
-  const matchesSearch = (category: LayerCategory, libraryLayer?: LibraryLayer) => {
+  const matchesSearch = React.useCallback((category: LayerCategory, libraryLayer?: LibraryLayer) => {
     if (!normalizedSearch) return true
     const categoryText = `${category.name} ${category.description || ''}`.toLowerCase()
     const layerText = `${libraryLayer?.title || ''} ${libraryLayer?.type || ''}`.toLowerCase()
     return categoryText.includes(normalizedSearch) || layerText.includes(normalizedSearch)
-  }
+  }, [normalizedSearch])
 
-  const visibleCategories = categories.map((category) => ({
-    ...category,
-    layers: category.layers.filter((layer) => matchesSearch(category, layer))
-  })).filter((category) => matchesSearch(category) || category.layers.length > 0)
+  const visibleCategories = React.useMemo(() => {
+    return categories.map((category) => ({
+      ...category,
+      layers: category.layers.filter((layer) => matchesSearch(category, layer))
+    })).filter((category) => matchesSearch(category) || category.layers.length > 0)
+  }, [categories, matchesSearch])
+
+  const getCategoryIconText = (category: LayerCategory) => {
+    const icon = category.icon?.trim()
+    if (icon) return icon
+    return (category.name.trim().charAt(0) || '?').toUpperCase()
+  }
 
   const renderSvgIcon = (title: string, paths: string[]) => (
     h('svg', {
@@ -1190,6 +1228,11 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
           onClick: () => { toggleExpanded(category.id) },
           style: { width: 28, height: 28, padding: 0 }
         }, expanded ? 'v' : '>'),
+        h('span', {
+          'aria-hidden': true,
+          title: category.icon ? `${category.name} icon` : `${category.name} initial`,
+          style: docTextStyles.categoryIcon
+        }, getCategoryIconText(category)),
         h('div', { className: 'flex-fill', style: { minWidth: 0 } },
           h('div', { className: 'text-truncate', style: docTextStyles.sectionTitle }, category.name),
           category.description && h('div', { className: 'text-truncate', style: docTextStyles.muted }, category.description)
@@ -1202,7 +1245,7 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
             disabled: !jimuMapView,
             title: defaultMessages.showCategoryLayers,
             onClick: () => { setCategoryLayerVisibility(category, 'show') },
-            style: utilityButtonStyle
+            style: categoryActionButtonStyle
           }, defaultMessages.showCategoryLayers),
           h(Button, {
             size: 'sm',
@@ -1210,7 +1253,7 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
             disabled: !jimuMapView,
             title: defaultMessages.hideCategoryLayers,
             onClick: () => { setCategoryLayerVisibility(category, 'hide') },
-            style: utilityButtonStyle
+            style: categoryActionButtonStyle
           }, defaultMessages.hideCategoryLayers),
           h(Button, {
             size: 'sm',
@@ -1218,7 +1261,7 @@ const Widget = (props: AllWidgetProps<IMConfig>) => {
             disabled: !jimuMapView,
             title: defaultMessages.resetCategoryLayers,
             onClick: () => { setCategoryLayerVisibility(category, 'reset') },
-            style: utilityButtonStyle
+            style: categoryActionButtonStyle
           }, defaultMessages.resetCategoryLayers)
         ),
         !!props.config?.showLayerFilters && category.layers.some((layer) => !!appliedFilters[layerKey(layer)]) && h(Button, {

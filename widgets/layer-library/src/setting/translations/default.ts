@@ -4,6 +4,8 @@ export default {
   categoriesSection: 'Categories',
   addCategory: 'Add Category',
   categoryName: 'Category name',
+  categoryIcon: 'Icon',
+  categoryIconPlaceholder: 'Emoji, glyph, or letter',
   categoryDescription: 'Description',
   selectCategory: 'Select category',
   editCategory: 'Edit category',
